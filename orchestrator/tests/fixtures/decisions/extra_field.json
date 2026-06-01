@@ -1,0 +1,11 @@
+{
+  "action": "open",
+  "market": "BTC",
+  "side": "long",
+  "sizeUsd": 3000,
+  "leverage": 1.5,
+  "rationale": "BTC breaking above key resistance with strong volume confirmation",
+  "confidence": 0.65,
+  "expectedHoldingPeriod": "medium",
+  "moonPhase": "waxing"
+}

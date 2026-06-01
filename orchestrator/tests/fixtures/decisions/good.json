@@ -1,0 +1,10 @@
+{
+  "action": "open",
+  "market": "ETH",
+  "side": "long",
+  "sizeUsd": 5000,
+  "leverage": 2,
+  "rationale": "momentum",
+  "confidence": 0.7,
+  "expectedHoldingPeriod": "short"
+}
