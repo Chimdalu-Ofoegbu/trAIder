@@ -1,7 +1,7 @@
 # trAIder — Operational Runbook
 
 **Version:** Phase 0 skeleton
-**Last updated:** 2026-06-01 (Plan 00-06)
+**Last updated:** 2026-06-01 (Plan 00-07)
 **Owner:** Operator
 
 > **Note:** This is a living document. Each phase fills in its own sections
@@ -18,7 +18,7 @@
 4. [Journal Recovery](#4-journal-recovery)
 5. [Session Start and Settlement](#5-session-start-and-settlement)
 6. [Demo-Day Minute-by-Minute Timetable](#6-demo-day-minute-by-minute-timetable)
-7. [Rate-Limit Applications (ORCH-09)](#7-rate-limit-applications-orch-09)
+7. [Provider Rate Limits — ACTIVE (no application required) (ORCH-09)](#7-provider-rate-limits--active-no-application-required-orch-09)
 8. [Judging Window (DEPLOY-04)](#8-judging-window-deploy-04)
 9. [Known Issues and Gotchas](#9-known-issues-and-gotchas)
 
@@ -259,84 +259,83 @@ ORDER BY created_at ASC;
 
 ---
 
-## 7. Rate-Limit Applications (ORCH-09)
+## 7. Provider Rate Limits — ACTIVE (no application required) (ORCH-09)
 
-> **Filled in by:** Plan 00-07 (D-18 — submit within 48h of Phase 0 start)
+> **Filled in by:** Plan 00-07 (Task 2 operator confirmation, 2026-06-01)
 >
-> **Status:** Justification drafted (Task 1). Awaiting operator submissions (Task 2).
+> **Status:** RESOLVED. All three providers are on spend-activated tiers, confirmed ACTIVE
+> as of 2026-06-01. No support tickets or 2–5 day approvals were required. ORCH-09 CLOSED.
 
-### D-18 Math Summary
+> **Model string reconciliation note (OpenAI):** The operator's active OpenAI model is
+> `gpt-5.5-2026-04-23`, which differs from `gpt-5.1` currently referenced in CLAUDE.md,
+> `orchestrator/prompts/system.md`, and RESEARCH.md. Reconciliation of the model string
+> across those files is required in a follow-up plan — it is OUT OF SCOPE for Plan 00-07
+> and those files are not touched here.
 
-- Decision cycle: 60 seconds per model
-- Session duration: 72 hours
-- Peak calls per model: 3 models × 1 call/60s × 3600s/hr = **~60 calls/hr** sustained;
-  accounting for retries and multi-turn requests, budget for **~90 calls/hr/model peak**
-- Apply for the tier above **~135 calls/hr per model** (90 + 50% headroom)
-- Submit within 48h of Phase 0 start (ASAP — Anthropic requires 2-5 business days)
+### Demo Sizing Rationale
 
-### Reusable Application Justification
+- Decision cadence: **60 seconds** per model
+- Demo session length: **3–4 hours** (sub-day by design; not a literal 72h run)
+- Cycles per model per demo run: ~180–240 (3h = 180 cycles; 4h = 240 cycles)
+- Binding constraint: **Gemini 3.1 Pro — 250 RPD daily cap**
+- Target run length: **~3 hours (~180 cycles)** to preserve retry margin under the 250 RPD cap
+- OpenAI daily cap (900K TPD) is also a binding cap at scale; 3–4h well within limit at ~180–240 cycles
+- D-18 headroom math (original): 90 calls/hr peak + 50% headroom = 135/hr target — now moot because all
+  tiers are already active at limits that comfortably cover the demo cadence
 
-> Copy-paste this text into each provider's rate-limit or tier-increase request form.
+### Confirmed Provider Limits (Active as of 2026-06-01)
 
-```
-Project: trAIder — AI Trading Performance Speculation Protocol
-Use case: 72-hour autonomous trading session, hackathon submission for Arbitrum Open
-  House (ETHGlobal London), three frontier LLMs (claude-opus-4-7, gpt-5.1,
-  gemini-3.1-pro-preview) executing crypto perpetuals trading decisions on identical
-  prompts with 60-second decision cycles.
-Request: Elevated rate limit / tier upgrade to support ~135 calls/hr per model
-  (90/hr sustained peak + 50% headroom for retries during a single 72-hour window).
-Timeline: Session is live June 2026. Approval needed before session start.
-Determinism note (Anthropic only): temperature parameter is intentionally omitted
-  (Claude Opus 4.7 adaptive sampling; IPFS-journaled replay is semantic-match, not
-  byte-exact).
-```
+#### Anthropic — `claude-opus-4-7`
 
-Model strings (exact — use these on the console forms):
+| Limit      | Value                      |
+| ---------- | -------------------------- |
+| RPM        | 50                         |
+| Input TPM  | 500,000                    |
+| Output TPM | 80,000                     |
+| Daily cap  | None observed on this tier |
 
-- Anthropic: `claude-opus-4-7`
-- OpenAI: `gpt-5.1`
-- Google: `gemini-3.1-pro-preview`
+**Status:** ACTIVE (spend-activated tier). No application required.
 
-### Per-Provider Checklist
+#### OpenAI — `gpt-5.5-2026-04-23`
 
-#### Anthropic
+| Limit              | Value   |
+| ------------------ | ------- |
+| TPM                | 500,000 |
+| RPM                | 500     |
+| TPD (daily tokens) | 900,000 |
 
-- [ ] **Submitted:** \_\_\_\_\_\_\_\_\_\_\_\_\_\_\_ (date, e.g. 2026-06-01)
-- [ ] **Confirmation ID / ticket:** \_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_
-- [ ] **Approved (estimated):** 2-5 business days after submission
-- [ ] **Approved (actual):** \_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_
+**Binding constraint for the demo:** 900K TPD daily token cap.
 
-**Where to submit:** Anthropic Console → Account → Rate Limits → Request Increase
+**Status:** ACTIVE (operator's own account). No application required.
 
-#### OpenAI
+**Model string note:** Active model is `gpt-5.5-2026-04-23`. CLAUDE.md / prompts /
+RESEARCH.md currently reference `gpt-5.1`. Reconciliation required in a follow-up plan.
 
-- [ ] **Submitted:** \_\_\_\_\_\_\_\_\_\_\_\_\_\_\_ (date)
-- [ ] **Confirmation ID / ticket:** \_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_
-- [ ] **Spend-gated tier auto-upgraded?** (yes / no) \_\_\_\_\_\_\_\_\_\_
-- [ ] **Manual increase requested?** (yes / no) \_\_\_\_\_\_\_\_\_\_
-- [ ] **Approved (actual):** \_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_
+#### Google — `gemini-3.1-pro-preview` (Paid Tier 1, activated via $15 deposit)
 
-**Where to submit:** platform.openai.com → Settings → Limits → Request Increase
+| Limit                | Value     |
+| -------------------- | --------- |
+| RPM                  | 25        |
+| TPM                  | 2,000,000 |
+| RPD (daily requests) | 250       |
 
-#### Google (Gemini)
+**Binding constraint for the demo:** 250 RPD daily request cap. Target ~3h demo run
+(~180 cycles) to preserve retry margin under this cap.
 
-- [ ] **Submitted:** \_\_\_\_\_\_\_\_\_\_\_\_\_\_\_ (date)
-- [ ] **Confirmation ID / ticket:** \_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_
-- [ ] **Paid tier enabled?** (yes / no) \_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_
-- [ ] **Quota increase requested?** (yes / no) \_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_
-- [ ] **Approved (actual):** \_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_
+**Emergency fallback:** Gemini 3.5 Flash (1,000 RPM, 2M TPM, 10K RPD) — use ONLY if
+retry pressure threatens the 250 RPD cap on Gemini 3.1 Pro. Fallback avoids disrupting
+the "three frontier LLMs" thesis; the orchestrator chose Gemini 3.1 Pro as primary to
+preserve that framing. Activate the fallback only under active pressure, not proactively.
 
-**Where to submit:** Google AI Studio → Settings → Billing & Quotas; or
-Google Cloud Console → APIs & Services → Gemini API → Quotas → Request Increase
+**Status:** ACTIVE. No application required.
 
 ---
 
 ## 8. Judging Window (DEPLOY-04)
 
-> **Filled in by:** Plan 00-07 (DEPLOY-04 — Phase 0 exit gate)
+> **Filled in by:** Plan 00-07 (Task 2 operator confirmation, 2026-06-01)
 >
-> **Status:** Event dates confirmed (public). Operator must select target window (Task 2).
+> **Status:** CONFIRMED. Session timing decided; DEPLOY-04 CLOSED.
 
 ### Confirmed Arbitrum Open House London Dates
 
@@ -347,41 +346,40 @@ Google Cloud Console → APIs & Services → Gemini API → Quotas → Request I
 
 **Source:** openhouse.arbitrum.io + Arbitrum blog (verified 2026-06-01)
 
-### Operator Decision Required
+### Operator Decision — CONFIRMED 2026-06-14
 
-The 72-hour live session must be timed to overlap with judging. Choose ONE:
+**Framing correction:** The 72-hour figure is the PROTOCOL's designed session length (per
+project.md), not the demo run duration. The DEMO is a sub-day session: 3–4 hours at
+60-second cadence, sized to stay under the tightest provider daily cap (Gemini 3.1 Pro
+250 RPD). A 3–4h @ 60s run = 180–240 cycles/model; targeting ~3h (~180 cycles) to
+preserve retry margin.
 
-- **Option A — Phase 1 review (post-submission):** Session starts shortly after
-  June 14 submission, during the review period. Judges can verify the live session
-  is running or review recordings + onchain data. Reverse-computed session start:
-  **~June 14–16, 2026** (exact timing TBD by operator).
+**Target window:** Phase 1 submission — **June 14, 2026 deadline**
 
-- **Option B — Phase 2 Founder House (Jul 10–12):** Session runs DURING the
-  Founder House event in London, providing a live on-screen demo. Requires team
-  selection into Phase 2. Reverse-computed session start: **~July 9, 2026** (start
-  72h before Founder House opens).
+**Demo session schedule:**
 
-### Record Your Selection Here (OPERATOR — fill in after Task 2)
+| Date                    | Event                                       |
+| ----------------------- | ------------------------------------------- |
+| June 8–9, 2026 (latest) | Run live demo session (3–4h, 60s cadence)   |
+| June 10–12, 2026        | Buffer — re-run if first attempt has issues |
+| June 14, 2026           | Hard submission deadline                    |
 
-```
-Target judging window:  [ ] Option A (post-Jun-14 review)
-                        [ ] Option B (Jul 10-12 Founder House)
+**Phase 2 (Founder House, Jul 10–12):** UPSIDE ONLY, contingent on team selection. If
+selected, a fresh live session can run in July. Phase 6 timing does NOT depend on reaching
+Phase 2. Do not anchor any Phase 6 deliverable on the Founder House window.
 
-If Option A:
-  Session start (target): ____-__-__ (YYYY-MM-DD)
-  Session end (target):   ____-__-__ (+72h)
+**Confirmed by:** 2026-06-14 (submission deadline; session scheduled June 8–9 latest)
 
-If Option B:
-  Session start (target): 2026-07-09 (recommended)
-  Session end (target):   2026-07-12
+### Session-Timing Math for Phase 6
 
-Confirmed by:        ____-__-__ (date operator made this decision)
-Blocker (if not confirmed): confirmed-by: ____-__-__ (date by which decision is needed)
-```
+Phase 6 session-timing plan inputs:
 
-> **Phase 0 exit gate:** This section satisfies DEPLOY-04 when EITHER a confirmed
-> window is recorded above OR a concrete "confirmed-by: \<date\>" blocker is logged
-> in STATE.md. Leaving it blank does NOT satisfy the gate.
+- Demo session length: 3–4 hours
+- Cadence: 60 seconds per cycle
+- Run date: **June 8–9 latest** (leaves buffer before deadline)
+- Hard deadline: **June 14, 2026**
+- Buffer window: June 10–12 (re-run capacity if first attempt fails)
+- Binding rate cap: Gemini 3.1 Pro 250 RPD → target ~3h (~180 cycles) per run
 
 ---
 
