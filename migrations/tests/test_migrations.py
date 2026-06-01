@@ -38,6 +38,29 @@ import pytest
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL", "")
 SKIP_REASON = ""
 
+
+def _build_probe_argv(url: str) -> list[str]:
+    """Build the subprocess argv list for the DB connection probe.
+
+    CR-04 fix: the URL is passed as a DISTINCT argv element (sys.argv[1]),
+    NOT interpolated into the -c code string.  A single quote, backslash, or
+    any shell metacharacter in the URL (legal in passwords/URI userinfo) is
+    therefore inert — it is never parsed as Python source.
+
+    The psycopg-compatible URL is the last element of the returned list so
+    callers can assert:  argv[-1] == cleaned_url   (never embedded in argv[1]).
+    """
+    # psycopg.connect accepts postgresql:// (not the +psycopg SQLAlchemy prefix)
+    psycopg_url = url.replace("postgresql+psycopg://", "postgresql://")
+    return [
+        sys.executable,
+        "-c",
+        # The URL is read from sys.argv[1] — never formatted into this string.
+        "import sys, psycopg; psycopg.connect(sys.argv[1]).close(); print('ok')",
+        psycopg_url,
+    ]
+
+
 if not TEST_DATABASE_URL:
     SKIP_REASON = (
         "No Postgres reachable: TEST_DATABASE_URL environment variable is not set. "
@@ -49,20 +72,10 @@ else:
     try:
         import psycopg  # noqa: F401 — probe import only
 
-        _probe_url = TEST_DATABASE_URL.replace("+psycopg", "", 1).replace(
-            "postgresql://", "", 1
-        )
-        # Quick connection probe
-        _conn_str = TEST_DATABASE_URL.replace("postgresql+psycopg://", "").replace(
-            "postgresql://", ""
-        )
-        # Use a subprocess probe to avoid import-time side effects
+        # Use a subprocess probe to avoid import-time side effects.
+        # CR-04: URL is passed via argv, not templated into the -c code string.
         _result = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                f"import psycopg; psycopg.connect('{TEST_DATABASE_URL.replace('postgresql+psycopg://', 'postgresql://')}').close(); print('ok')",
-            ],
+            _build_probe_argv(TEST_DATABASE_URL),
             capture_output=True,
             text=True,
             timeout=5,
@@ -83,6 +96,125 @@ else:
 _skip_if_no_db = pytest.mark.skipif(
     bool(SKIP_REASON), reason=SKIP_REASON or "no reason"
 )
+
+
+# ---------------------------------------------------------------------------
+# Injection-safety unit tests (CR-04 regression) — no DB required.
+# These tests run without a live Postgres instance and verify that the URL
+# is always passed as a distinct argv element, never embedded in code source.
+# ---------------------------------------------------------------------------
+
+
+class TestProbeArgvInjectionSafety:
+    """Regression tests for CR-04: ensure _build_probe_argv() is injection-safe.
+
+    These tests require NO live database — they exercise the helper function
+    directly and inspect the constructed argv list.  They must always PASS,
+    even in CI environments without Docker/Postgres.
+    """
+
+    def test_url_is_last_argv_element_not_in_code_string(self) -> None:
+        """The URL must appear as argv[-1], never concatenated into the -c code string."""
+        url = "postgresql+psycopg://user:pass@localhost:5432/testdb"
+        argv = _build_probe_argv(url)
+        code_string = argv[2]  # the -c argument
+        cleaned_url = argv[-1]
+
+        # The URL (or its cleaned form) must NOT appear inside the code string.
+        assert cleaned_url not in code_string, (
+            "URL was concatenated into the -c code string — injection possible! "
+            f"code_string={code_string!r}, url={cleaned_url!r}"
+        )
+        # The URL must be the last distinct argv element.
+        assert argv[-1] == "postgresql://user:pass@localhost:5432/testdb", (
+            f"Expected cleaned URL as last argv element, got: {argv[-1]!r}"
+        )
+
+    def test_single_quote_in_password_does_not_appear_in_code_string(self) -> None:
+        """A single quote in the password (legal in URI userinfo) must be inert.
+
+        Before the CR-04 fix the probe was built as:
+            f"...psycopg.connect('{url}')..."
+        A URL with a single quote would break out of the string literal and
+        execute arbitrary Python.  After the fix the quote is in argv[-1] only
+        and is never part of the code string that Python parses.
+
+        Key assertion: the URL (or any fragment of it containing a quote) must
+        not appear inside the -c code string.  The code string itself may have
+        incidental quotes (e.g. in print('ok')) but the URL fragment must not.
+        """
+        # Single quote in password — legal per RFC 3986 when percent-encoded,
+        # but drivers also accept literal quotes in DSN form.
+        url = "postgresql+psycopg://user:pa'ss'word@localhost:5432/testdb"
+        argv = _build_probe_argv(url)
+        code_string = argv[2]
+        cleaned_url = argv[-1]  # "postgresql://user:pa'ss'word@localhost:5432/testdb"
+
+        # The cleaned URL itself must NOT appear inside the code string.
+        assert cleaned_url not in code_string, (
+            "Cleaned URL was embedded in the -c code string — injection possible! "
+            f"code_string={code_string!r}, url={cleaned_url!r}"
+        )
+        # The password fragment containing the quote must not appear in the code string.
+        assert "pa'ss'word" not in code_string, (
+            "Password fragment with single quote leaked into the -c code string — "
+            f"would cause SyntaxError or code injection.  code_string={code_string!r}"
+        )
+        # The URL (with the quote intact) must be the last argv element.
+        assert "pa'ss'word" in argv[-1], (
+            "Password with single quote was mangled or dropped from argv"
+        )
+
+    def test_shell_metacharacters_in_url_do_not_appear_in_code_string(self) -> None:
+        """URL-derived content must not be present in the -c code string.
+
+        The code string is a fixed constant; the URL is entirely in argv[-1].
+        Even if the URL contains characters that the code string also uses
+        (e.g. semicolons as statement separators), the URL *as a whole* must
+        not be present in the code string — it must only appear in argv[-1].
+        """
+        url = r"postgresql+psycopg://user:p\;a()ss@localhost:5432/testdb"
+        argv = _build_probe_argv(url)
+        code_string = argv[2]
+        cleaned_url = argv[-1]
+
+        # The full cleaned URL must NOT appear in the code string.
+        assert cleaned_url not in code_string, (
+            f"URL was embedded in the -c code string: {code_string!r}"
+        )
+        # The host:port and user:password fragments must not appear in code.
+        assert "localhost:5432" not in code_string, (
+            "URL host:port leaked into the -c code string"
+        )
+        assert r"p\;a()ss" not in code_string, (
+            "URL password fragment leaked into the -c code string"
+        )
+
+    def test_url_scheme_prefix_stripped_for_psycopg(self) -> None:
+        """postgresql+psycopg:// prefix must be replaced with postgresql:// for psycopg."""
+        url = "postgresql+psycopg://migrator_user:migrator_pass@localhost:5432/traider_test"
+        argv = _build_probe_argv(url)
+        cleaned = argv[-1]
+
+        assert cleaned.startswith("postgresql://"), (
+            f"Expected argv[-1] to start with 'postgresql://', got: {cleaned!r}"
+        )
+        assert "+psycopg" not in cleaned, (
+            f"'+psycopg' SQLAlchemy prefix was not stripped: {cleaned!r}"
+        )
+
+    def test_plain_postgresql_url_passthrough(self) -> None:
+        """A URL without the +psycopg prefix must be passed through unchanged."""
+        url = "postgresql://migrator_user:pass@localhost:5432/traider_test"
+        argv = _build_probe_argv(url)
+        assert argv[-1] == url
+
+    def test_argv_length_is_four(self) -> None:
+        """Returned argv must have exactly 4 elements: executable, -c, code, url."""
+        url = "postgresql+psycopg://user:pass@localhost:5432/db"
+        argv = _build_probe_argv(url)
+        assert len(argv) == 4, f"Expected 4 argv elements, got {len(argv)}: {argv}"
+        assert argv[1] == "-c", f"argv[1] must be '-c', got {argv[1]!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -150,11 +282,18 @@ def migrated_db(db_url):
 # ---------------------------------------------------------------------------
 # Tests — all gated by _skip_if_no_db
 # ---------------------------------------------------------------------------
+# NOTE: TestUpgradeHead and TestDowngradeBase are the Docker-gated authoritative
+# checks.  They require a live Postgres reachable at TEST_DATABASE_URL.  Without
+# Docker/Postgres they SKIP cleanly — they do NOT fail.  Run `make up` first.
+# ---------------------------------------------------------------------------
 
 
 @_skip_if_no_db
 class TestUpgradeHead:
-    """Assert schema state after `alembic upgrade head`."""
+    """Assert schema state after `alembic upgrade head`.
+
+    Requires a live Postgres instance (Docker).  Skips cleanly without one.
+    """
 
     def test_orchestrator_schema_exists(self, migrated_db):
         """orchestrator schema must exist after upgrade."""
@@ -448,6 +587,8 @@ class TestDowngradeBase:
     NOTE: The migrated_db fixture runs upgrade head THEN downgrade base as teardown.
     These tests verify the downgrade by inspecting state AFTER the fixture tears down.
     We use a separate fixture that runs downgrade independently.
+
+    Requires a live Postgres instance (Docker).  Skips cleanly without one.
     """
 
     @pytest.fixture(autouse=True)
