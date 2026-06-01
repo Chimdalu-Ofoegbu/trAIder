@@ -1,0 +1,7 @@
+# frontend/.gitattributes
+#
+# Mark generated files so GitHub linguist excludes them from language stats
+# and diffs are less noisy in code review (D-27).
+
+# Generated TypeScript types from backend Pydantic OpenAPI schema export (IFACE-04)
+types/api.ts linguist-generated=true
