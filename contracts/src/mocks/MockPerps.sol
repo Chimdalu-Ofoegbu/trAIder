@@ -455,7 +455,10 @@ contract MockPerps is IPerpsAdapter, Ownable {
         address feed = feeds[marketKey];
         require(feed != address(0), "MockPerps: no feed for market");
 
-        (, int256 answer,, uint256 updatedAt,) = _latestRoundData(feed);
+        (uint80 roundId, int256 answer,, uint256 updatedAt, uint80 answeredInRound) = _latestRoundData(feed);
+        // CR-03: canonical Chainlink stale-round guards (in addition to MAX_STALENESS check)
+        require(updatedAt != 0, "MockPerps: round not complete");
+        require(answeredInRound >= roundId, "MockPerps: stale round");
         // Staleness check: revert if price is older than MAX_STALENESS (D-03)
         // slither-disable-next-line timestamp
         require(block.timestamp - updatedAt <= MAX_STALENESS, "MockPerps: stale price");

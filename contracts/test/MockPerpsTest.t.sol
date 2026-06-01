@@ -514,6 +514,81 @@ contract MockPerpsTest is Test {
     }
 
     // =========================================================================
+    // Test 5b: CR-03 stale-round guards (answeredInRound + updatedAt == 0)
+    // =========================================================================
+
+    /// @notice (CR-03-a) Proves positionValueUSDC reverts with "MockPerps: stale round"
+    ///         when answeredInRound < roundId — the canonical Chainlink carried-answer guard.
+    ///         Uses setStaleRound to inject answeredInRound = roundId - 1.
+    function test_StaleRound_AnsweredInRoundLtRoundId_Reverts() public {
+        // Open a position with a fresh price so positionValueUSDC loop executes
+        ethFeed.setPrice(ETH_PRICE_8DEC);
+        vm.prank(vault);
+        bytes32 openKey = perps.openLong("ETH", 1_000 * 1e30, 10_000, 0);
+        vm.roll(block.number + 1);
+        perps.executeOrder(openKey);
+
+        // Force a stale-round scenario: answeredInRound < roundId (carried-over answer)
+        // ethFeed.roundId was incremented by setPrice() → now some value R.
+        // We set roundId = R+1, answeredInRound = R (i.e., < roundId) with a fresh updatedAt.
+        uint80 currentRoundId = ethFeed.roundId();
+        ethFeed.setStaleRound(
+            currentRoundId + 1, // new roundId
+            ETH_PRICE_8DEC, // answer
+            block.timestamp, // updatedAt fresh (not stale by time)
+            currentRoundId // answeredInRound < new roundId → stale round
+        );
+
+        // Should revert with the stale-round guard, not the time-staleness guard
+        vm.expectRevert("MockPerps: stale round");
+        perps.positionValueUSDC(vault);
+    }
+
+    /// @notice (CR-03-b) Proves positionValueUSDC reverts with "MockPerps: round not complete"
+    ///         when updatedAt == 0 — indicates a round that has never received an answer.
+    function test_StaleRound_UpdatedAtZero_Reverts() public {
+        // Open a position so positionValueUSDC loop executes
+        ethFeed.setPrice(ETH_PRICE_8DEC);
+        vm.prank(vault);
+        bytes32 openKey = perps.openLong("ETH", 1_000 * 1e30, 10_000, 0);
+        vm.roll(block.number + 1);
+        perps.executeOrder(openKey);
+
+        // Force updatedAt = 0 (round never completed) — answeredInRound matches roundId
+        uint80 currentRoundId = ethFeed.roundId();
+        ethFeed.setStaleRound(
+            currentRoundId + 1, // new roundId
+            ETH_PRICE_8DEC, // answer
+            0, // updatedAt = 0 → round not complete
+            currentRoundId + 1 // answeredInRound == roundId (valid on that axis)
+        );
+
+        // Should revert with the round-not-complete guard
+        vm.expectRevert("MockPerps: round not complete");
+        perps.positionValueUSDC(vault);
+    }
+
+    /// @notice (CR-03-c) Proves the existing fresh-price path still returns a value after
+    ///         CR-03 guards are added — regression check that valid data passes all guards.
+    function test_StaleRound_FreshValidRound_StillReturnsValue() public {
+        // Open a position
+        ethFeed.setPrice(ETH_PRICE_8DEC);
+        vm.prank(vault);
+        bytes32 openKey = perps.openLong("ETH", 1_000 * 1e30, 10_000, 0);
+        vm.roll(block.number + 1);
+        perps.executeOrder(openKey);
+
+        // Ensure feed is in a fully-valid state: updatedAt fresh, answeredInRound == roundId
+        ethFeed.clearStaleRound();
+        ethFeed.setPrice(ETH_PRICE_8DEC); // resets updatedAt to block.timestamp
+
+        // Should NOT revert — all guards pass
+        uint256 value = perps.positionValueUSDC(vault);
+        // collateral = 1000e6, pnl = 0 (price unchanged), value = collateral
+        assertEq(value, 1_000 * 1e6, "fresh valid round should return collateral (no pnl)");
+    }
+
+    // =========================================================================
     // Test 6: Unsupported market
     // =========================================================================
 

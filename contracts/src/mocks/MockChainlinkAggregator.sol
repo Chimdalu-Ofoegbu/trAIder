@@ -38,26 +38,6 @@ contract MockChainlinkAggregator {
     }
 
     // =========================================================================
-    // AggregatorV3Interface shape — latestRoundData
-    // =========================================================================
-
-    /// @notice Returns the latest price data in standard Chainlink shape.
-    /// @dev Only `answer` and `updatedAt` are meaningful in test context; the other
-    ///      fields are returned as deterministic placeholder values.
-    /// @return _roundId The current round identifier (monotonically incremented on set).
-    /// @return _answer Price answer in 8-decimal USD.
-    /// @return startedAt Round start timestamp (mirrors updatedAt in mock).
-    /// @return _updatedAt Timestamp of last price update. Set old to trigger staleness revert.
-    /// @return answeredInRound Same as roundId — no delayed-answer semantics in mock.
-    function latestRoundData()
-        external
-        view
-        returns (uint80 _roundId, int256 _answer, uint256 startedAt, uint256 _updatedAt, uint80 answeredInRound)
-    {
-        return (roundId, answer, updatedAt, updatedAt, roundId);
-    }
-
-    // =========================================================================
     // Test helpers — setters
     // =========================================================================
 
@@ -77,5 +57,65 @@ contract MockChainlinkAggregator {
         answer = _answer;
         updatedAt = _updatedAt;
         roundId++;
+    }
+
+    // =========================================================================
+    // CR-03 test helpers — stale-round simulation
+    // =========================================================================
+
+    /// @notice Overrides ALL round data fields to simulate a stale or incomplete round.
+    /// @dev Use this to exercise the CR-03 guards in MockPerps._markPrice:
+    ///      - Set answeredInRound < roundId to trigger "MockPerps: stale round"
+    ///      - Set updatedAt = 0 to trigger "MockPerps: round not complete"
+    ///      Default state (set by setPrice / setPriceAt / constructor) keeps
+    ///      updatedAt != 0 and answeredInRound == roundId so existing tests pass.
+    /// @param _roundId The round identifier to publish.
+    /// @param _answer Price in 8-decimal format.
+    /// @param _updatedAt Round completion timestamp (0 = incomplete round).
+    /// @param _answeredInRound The round in which the answer was computed.
+    ///        Set < _roundId to simulate a carried-over stale answer.
+    function setStaleRound(uint80 _roundId, int256 _answer, uint256 _updatedAt, uint80 _answeredInRound) external {
+        roundId = _roundId;
+        answer = _answer;
+        updatedAt = _updatedAt;
+        _answeredInRoundOverride = _answeredInRound;
+        _staleRoundActive = true;
+    }
+
+    /// @notice Resets stale-round override back to normal (answeredInRound == roundId).
+    function clearStaleRound() external {
+        _staleRoundActive = false;
+    }
+
+    // =========================================================================
+    // Internal — stale-round override storage
+    // =========================================================================
+
+    /// @dev When _staleRoundActive is true, latestRoundData returns _answeredInRoundOverride
+    ///      instead of roundId, allowing tests to trigger the answeredInRound < roundId path.
+    bool private _staleRoundActive;
+    uint80 private _answeredInRoundOverride;
+
+    /// @notice Returns the latest price data in standard Chainlink shape.
+    /// @dev Only `answer` and `updatedAt` are meaningful in normal test context; the other
+    ///      fields are returned as deterministic placeholder values. When `_staleRoundActive`
+    ///      is true (set via setStaleRound), `answeredInRound` returns `_answeredInRoundOverride`
+    ///      instead of `roundId` so tests can exercise the CR-03 stale-round guards.
+    /// @return _roundId The current round identifier.
+    /// @return _answer Price answer in 8-decimal USD.
+    /// @return startedAt Round start timestamp (mirrors updatedAt in mock).
+    /// @return _updatedAt Timestamp of last price update. Set old to trigger staleness revert.
+    /// @return answeredInRound The round in which the answer was computed.
+    ///         Normally equals roundId; set < roundId via setStaleRound to trigger stale-round revert.
+    function latestRoundData()
+        external
+        view
+        returns (uint80 _roundId, int256 _answer, uint256 startedAt, uint256 _updatedAt, uint80 answeredInRound)
+    {
+        _roundId = roundId;
+        _answer = answer;
+        startedAt = updatedAt;
+        _updatedAt = updatedAt;
+        answeredInRound = _staleRoundActive ? _answeredInRoundOverride : roundId;
     }
 }
