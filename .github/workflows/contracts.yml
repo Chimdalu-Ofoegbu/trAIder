@@ -1,0 +1,106 @@
+# =============================================================================
+# contracts.yml — Solidity CI (D-47 / D-33 / D-51)
+#
+# Triggered: on push/PR touching contracts/**
+# Pipeline: forge fmt --check → forge build → forge test → forge coverage → slither
+#
+# Third-party Actions pinned to full commit SHA (D-51, T-0-supplychain).
+# Concurrency cancel per branch (D-47).
+# Coverage profile (via_ir=false) avoids foundry-rs/foundry#6592 (D-28).
+# Slither high-severity gate (D-33) — fail on HIGH, report medium/low/info non-blocking.
+# =============================================================================
+
+name: Contracts
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "contracts/**"
+      - ".github/workflows/contracts.yml"
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "contracts/**"
+      - ".github/workflows/contracts.yml"
+
+# Cancel in-progress runs for the same workflow + branch (D-47)
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FOUNDRY_PROFILE: default
+
+jobs:
+  contracts:
+    name: Format → Build → Test → Coverage → Slither
+    runs-on: ubuntu-latest
+    steps:
+      # ── Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: recursive
+
+      # ── Foundry toolchain ─────────────────────────────────────────────────
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@de808b1eae699c7d4a07eaac985c9196ec354b6b # v1.2.1
+        with:
+          version: stable
+
+      # ── Cache Foundry build artifacts ────────────────────────────────────
+      - name: Cache Foundry artifacts
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a338de8e # v4.2.0
+        with:
+          path: |
+            contracts/out
+            contracts/cache
+          key: foundry-${{ runner.os }}-${{ hashFiles('contracts/foundry.toml', 'contracts/foundry.lock') }}
+          restore-keys: |
+            foundry-${{ runner.os }}-
+
+      # ── Step 1: Format check ──────────────────────────────────────────────
+      # Fails if any Solidity file is not formatted per foundry.toml fmt config.
+      # Run `forge fmt` locally to fix before committing.
+      - name: forge fmt --check
+        run: forge fmt --check
+        working-directory: contracts
+
+      # ── Step 2: Build ──────────────────────────────────────────────────────
+      - name: forge build
+        run: forge build --sizes
+        working-directory: contracts
+
+      # ── Step 3: Test (default profile — via_ir=true, optimizer enabled) ──
+      # Sets a reproducible fuzz seed for CI (D-31).
+      - name: forge test
+        run: forge test -vvv
+        working-directory: contracts
+        env:
+          FOUNDRY_FUZZ_SEED: "0xdeadbeef"
+          FOUNDRY_FUZZ_RUNS: "512"
+
+      # ── Step 4: Coverage (coverage profile — via_ir=false, foundry#6592) ─
+      # Coverage profile defined in foundry.toml [profile.coverage].
+      # Floor check: Phase 0 has minimal logic; floor is informational.
+      # Phase 1 will raise the floor to match 90% target (TEST-01).
+      - name: forge coverage
+        run: |
+          FOUNDRY_PROFILE=coverage forge coverage --report summary 2>&1 | tee coverage-report.txt
+          echo ""
+          echo "=== Coverage Summary (informational — floor enforced in Phase 1+) ==="
+          cat coverage-report.txt
+        working-directory: contracts
+
+      # ── Step 5: Slither static analysis (D-33 — high-severity gate) ──────
+      # slither.config.json sets fail_on=high. Medium/low/informational are
+      # reported in the job log but do NOT fail the build.
+      # Suppressions require // slither-disable-next-line + written justification.
+      - name: Install Slither
+        run: pip install slither-analyzer
+
+      - name: Run Slither
+        run: slither . --config-file slither.config.json
+        working-directory: contracts
+        continue-on-error: false # fail CI on high-severity findings (D-33)

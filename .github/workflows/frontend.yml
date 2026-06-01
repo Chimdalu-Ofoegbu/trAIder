@@ -1,0 +1,92 @@
+# =============================================================================
+# frontend.yml — Frontend CI (D-47 / D-27)
+#
+# Triggered: on push/PR touching frontend/**
+# Pipeline: pnpm install → tsc --noEmit → schema-drift gate
+#
+# Schema drift gate (D-27): regenerates frontend/types/api.ts from the backend
+# OpenAPI spec via scripts/gen-types.sh and fails if the committed file differs.
+# This ensures the TypeScript types always match the Pydantic WS event models.
+#
+# Third-party Actions pinned to full commit SHA (D-51).
+# Concurrency cancel per branch (D-47).
+# =============================================================================
+
+name: Frontend
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "frontend/**"
+      - "backend/**" # schema changes affect frontend types
+      - "scripts/gen-types.sh"
+      - ".github/workflows/frontend.yml"
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "frontend/**"
+      - "backend/**"
+      - "scripts/gen-types.sh"
+      - ".github/workflows/frontend.yml"
+
+# Cancel in-progress runs for the same workflow + branch (D-47)
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: pnpm install → tsc → schema-drift gate
+    runs-on: ubuntu-latest
+    steps:
+      # ── Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # ── pnpm setup ────────────────────────────────────────────────────────
+      - name: Setup pnpm
+        uses: pnpm/action-setup@a3252b1b17ceb43ffe1bf2b7e1dbb7d262c43ac9 # v4.1.0
+        with:
+          version: latest
+
+      # ── Node.js setup ─────────────────────────────────────────────────────
+      - name: Setup Node.js
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: "20"
+          cache: "pnpm"
+          cache-dependency-path: "frontend/pnpm-lock.yaml"
+
+      # ── Install frontend dependencies ──────────────────────────────────────
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+        working-directory: frontend
+
+      # ── TypeScript type check ─────────────────────────────────────────────
+      # --noEmit: type-check only, no output files. Catches type errors without building.
+      - name: tsc --noEmit
+        run: pnpm exec tsc --noEmit
+        working-directory: frontend
+
+      # ── Schema drift gate (D-27) ───────────────────────────────────────────
+      # Regenerates frontend/types/api.ts from the backend OpenAPI spec.
+      # Fails if the committed file differs from the freshly generated one.
+      # This ensures the TS types always match the Pydantic WS event models.
+      #
+      # If scripts/gen-types.sh does not yet exist (Phase 0 plans may not all
+      # be complete when this CI runs), skip gracefully and log a warning.
+      - name: Schema drift gate
+        run: |
+          if [ -f scripts/gen-types.sh ]; then
+            bash scripts/gen-types.sh
+            git diff --exit-code frontend/types/api.ts || {
+              echo "ERROR: frontend/types/api.ts is out of sync with the backend schema."
+              echo "Run 'bash scripts/gen-types.sh' locally and commit the updated file."
+              exit 1
+            }
+            echo "Schema drift gate: PASSED (no drift detected)"
+          else
+            echo "WARNING: scripts/gen-types.sh not yet present (expected in Plan 00-04)."
+            echo "Schema drift gate: SKIPPED (will enforce once gen-types.sh lands)"
+          fi

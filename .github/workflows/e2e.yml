@@ -1,0 +1,120 @@
+# =============================================================================
+# e2e.yml — End-to-end integration test (D-47)
+#
+# Triggered: push to main, PRs touching multiple services, PRs labeled "e2e"
+# Pipeline: brings up dev stack (Postgres + Redis + anvil) → runs mock-cycle
+#           integration test (from Plan 00-09 mock harness)
+#
+# Guard: the full e2e stack requires Docker (Postgres, Redis, anvil container).
+# Phase 0 Plan 09 (docker-compose dev stack) must land before this fully runs.
+# Until then, the job is structured but gated by availability checks.
+#
+# Third-party Actions pinned to full commit SHA (D-51).
+# Concurrency cancel per branch (D-47).
+# =============================================================================
+
+name: E2E
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+    types: [labeled]
+  # Manual trigger for testing
+  workflow_dispatch:
+
+# Cancel in-progress runs for the same workflow + branch (D-47)
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: Dev stack + mock-cycle integration test
+    runs-on: ubuntu-latest
+    # Run on: push to main, or PRs labeled 'e2e', or manual dispatch
+    if: |
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && github.event.label.name == 'e2e')
+    steps:
+      # ── Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: recursive
+
+      # ── Install Foundry (for anvil in the dev stack) ──────────────────────
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@de808b1eae699c7d4a07eaac985c9196ec354b6b # v1.2.1
+        with:
+          version: stable
+
+      # ── Install uv ────────────────────────────────────────────────────────
+      - name: Install uv
+        uses: astral-sh/setup-uv@e5ac0c14b5e41c1a8e42c5d5e9ebb9a5a9cf0a3b # v5.4.0
+        with:
+          version: "latest"
+
+      # ── Install Python 3.12 ────────────────────────────────────────────────
+      - name: Install Python 3.12
+        run: uv python install 3.12
+
+      # ── Start Postgres + Redis via Docker Compose ──────────────────────────
+      # docker-compose.yml (from Plan 00-09) brings up postgres:16 + redis:7.
+      # Guard: if docker-compose.yml does not yet exist, skip with warning.
+      - name: Start dev services (Postgres + Redis)
+        run: |
+          if [ -f docker-compose.yml ]; then
+            docker compose up -d postgres redis
+            echo "Waiting for services to be healthy..."
+            timeout 60 bash -c 'until docker compose ps postgres | grep -q "healthy"; do sleep 2; done'
+            timeout 60 bash -c 'until docker compose ps redis | grep -q "healthy"; do sleep 2; done'
+            echo "Services ready."
+          else
+            echo "WARNING: docker-compose.yml not yet present (expected in Plan 00-09)."
+            echo "E2E stack setup: SKIPPED"
+          fi
+
+      # ── Run Alembic migrations ─────────────────────────────────────────────
+      - name: Run migrations
+        run: |
+          if [ -f docker-compose.yml ] && [ -f orchestrator/pyproject.toml ]; then
+            cd orchestrator
+            uv sync --frozen
+            uv run alembic upgrade head
+          else
+            echo "Migrations: SKIPPED (prerequisite not yet available)"
+          fi
+        env:
+          DATABASE_URL: postgresql+asyncpg://traider:traider@localhost:5432/traider
+
+      # ── Run mock-cycle integration test ───────────────────────────────────
+      # Plan 00-09 (mock harness) delivers the test that exercises:
+      # - MockPerps trade execution (scripted fixture timeline)
+      # - Journal entry state machine
+      # - NAV snapshot writes
+      # - WebSocket event emission
+      # Guard: skip if the mock harness tests don't yet exist.
+      - name: Mock-cycle integration test
+        run: |
+          if [ -f orchestrator/tests/integration/test_mock_cycle.py ]; then
+            cd orchestrator
+            uv run pytest tests/integration/test_mock_cycle.py -v --tb=short
+          else
+            echo "WARNING: tests/integration/test_mock_cycle.py not yet present (expected in Plan 00-09)."
+            echo "Mock-cycle integration test: SKIPPED"
+          fi
+        env:
+          DATABASE_URL: postgresql+asyncpg://traider:traider@localhost:5432/traider
+          REDIS_URL: redis://localhost:6379
+          PERPS_VENUE: mock
+
+      # ── Teardown dev services ──────────────────────────────────────────────
+      - name: Tear down services
+        if: always()
+        run: |
+          if [ -f docker-compose.yml ]; then
+            docker compose down -v
+          fi

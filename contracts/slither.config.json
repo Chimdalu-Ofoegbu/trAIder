@@ -1,0 +1,23 @@
+{
+  "_comment_purpose": "Slither static analysis config (D-33 / T-0-staticgate). High-severity CI gate — see contracts.yml Step 5.",
+  "_comment_suppressions": "Suppressions require // slither-disable-next-line <detector> + written justification in the same line comment. NO blanket disables.",
+
+  "filter_paths": "lib",
+
+  "compile_force_framework": "foundry",
+
+  "detectors_to_exclude": [
+    "naming-convention",
+    "solc-version",
+    "low-level-calls",
+    "divide-before-multiply"
+  ],
+
+  "_comment_fail_on": "HIGH = fail CI on high-severity findings. Medium/low/informational are reported in job log but non-blocking (D-33).",
+  "fail_on": "high",
+
+  "_comment_exclude_informational": "Informational findings are noise in Phase 0 — suppress but still print in log.",
+  "exclude_informational": false,
+  "exclude_low": false,
+  "exclude_medium": false
+}

@@ -1,0 +1,137 @@
+# =============================================================================
+# python.yml — Python CI for orchestrator, backend, migrations (D-47)
+#
+# Triggered: on push/PR touching orchestrator/**, backend/**, migrations/**
+# Pipeline: single uv venv → ruff check → uv run pytest (orchestrator + backend)
+#           Migration integration tests gated on Postgres service availability.
+#
+# Third-party Actions pinned to full commit SHA (D-51).
+# Concurrency cancel per branch (D-47).
+# =============================================================================
+
+name: Python
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "orchestrator/**"
+      - "backend/**"
+      - "migrations/**"
+      - ".github/workflows/python.yml"
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "orchestrator/**"
+      - "backend/**"
+      - "migrations/**"
+      - ".github/workflows/python.yml"
+
+# Cancel in-progress runs for the same workflow + branch (D-47)
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: ruff → pytest (orchestrator + backend + migrations)
+    runs-on: ubuntu-latest
+
+    # Postgres service for migration integration tests (Plan 00-03)
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: traider
+          POSTGRES_PASSWORD: traider
+          POSTGRES_DB: traider
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      # ── Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # ── Install uv ────────────────────────────────────────────────────────
+      # uv is used for reproducible Python installs (uv.lock committed).
+      # actions/setup-python is NOT used — uv manages the interpreter.
+      - name: Install uv
+        uses: astral-sh/setup-uv@e5ac0c14b5e41c1a8e42c5d5e9ebb9a5a9cf0a3b # v5.4.0
+        with:
+          version: "latest"
+
+      # ── Cache uv environments ─────────────────────────────────────────────
+      - name: Cache uv
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a338de8e # v4.2.0
+        with:
+          path: |
+            ~/.cache/uv
+            orchestrator/.venv
+            backend/.venv
+          key: uv-${{ runner.os }}-${{ hashFiles('orchestrator/uv.lock', 'backend/uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-
+
+      # ── Install Python 3.12 ────────────────────────────────────────────────
+      - name: Install Python 3.12
+        run: uv python install 3.12
+
+      # ── Install orchestrator dependencies ─────────────────────────────────
+      - name: Install orchestrator deps
+        run: uv sync --frozen
+        working-directory: orchestrator
+
+      # ── Install backend dependencies ──────────────────────────────────────
+      - name: Install backend deps
+        run: uv sync --frozen
+        working-directory: backend
+
+      # ── ruff lint + format check (orchestrator) ───────────────────────────
+      - name: ruff check orchestrator
+        run: uv run ruff check .
+        working-directory: orchestrator
+
+      - name: ruff format check orchestrator
+        run: uv run ruff format --check .
+        working-directory: orchestrator
+
+      # ── ruff lint + format check (backend) ───────────────────────────────
+      - name: ruff check backend
+        run: uv run ruff check .
+        working-directory: backend
+
+      - name: ruff format check backend
+        run: uv run ruff format --check .
+        working-directory: backend
+
+      # ── pytest orchestrator ────────────────────────────────────────────────
+      - name: pytest orchestrator
+        run: uv run pytest -v --tb=short
+        working-directory: orchestrator
+        env:
+          DATABASE_URL: postgresql+asyncpg://traider:traider@localhost:5432/traider
+
+      # ── pytest backend ─────────────────────────────────────────────────────
+      - name: pytest backend
+        run: uv run pytest -v --tb=short
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql+asyncpg://traider:traider@localhost:5432/traider
+
+      # ── Migration integration tests ───────────────────────────────────────
+      # Requires Postgres service (above). Runs alembic upgrade head + tests.
+      # Phase 0 migrations: 0001 (schema/indexes/triggers) + 0002 (roles/grants).
+      - name: Run migration tests
+        run: |
+          cd migrations
+          uv run --directory ../orchestrator alembic upgrade head
+          uv run --directory ../orchestrator pytest tests/ -v --tb=short
+        env:
+          DATABASE_URL: postgresql+asyncpg://traider:traider@localhost:5432/traider
+          SQLALCHEMY_DATABASE_URL: postgresql+asyncpg://traider:traider@localhost:5432/traider
