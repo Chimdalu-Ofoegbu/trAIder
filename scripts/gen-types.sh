@@ -88,6 +88,39 @@ if [ ! -f "${OUTPUT_TS}" ]; then
     exit 1
 fi
 
+# Step 2b: Run prettier on the generated file so it matches what the pre-commit hook
+# produces on commit. Without this, git diff --cached --exit-code sees indentation
+# differences (openapi-typescript: 4-space; prettier: 2-space), causing false drift
+# failures on every run even when the schema has not changed.
+info "Running prettier on generated file..."
+cd "${FRONTEND_DIR}"
+# Resolve prettier binary in priority order:
+#   1. frontend/node_modules/.bin/prettier (if installed as devDep)
+#   2. pre-commit hook's venv (common on developer machines)
+#   3. npx fallback (always works if node is available)
+PRETTIER_BIN=""
+if [ -x "node_modules/.bin/prettier" ]; then
+    PRETTIER_BIN="node_modules/.bin/prettier"
+elif command -v prettier &>/dev/null; then
+    PRETTIER_BIN="prettier"
+else
+    # Find pre-commit venv prettier (installed by mirrors-prettier hook)
+    # Path varies per OS but is predictable on Windows/Linux.
+    PC_PRETTIER=$(find "${HOME}/.cache/pre-commit" -name prettier -type f 2>/dev/null | head -1)
+    if [ -n "${PC_PRETTIER}" ] && [ -x "${PC_PRETTIER}" ]; then
+        PRETTIER_BIN="${PC_PRETTIER}"
+    fi
+fi
+
+if [ -n "${PRETTIER_BIN}" ]; then
+    "${PRETTIER_BIN}" --write "${OUTPUT_TS}"
+else
+    # npx fallback (downloads if not cached — slower but always works)
+    info "prettier not found locally; using npx fallback..."
+    npx --yes prettier@3.3.3 --write "${OUTPUT_TS}"
+fi
+cd "${REPO_ROOT}"
+
 info "Generated: ${OUTPUT_TS}"
 
 # ---------------------------------------------------------------------------
