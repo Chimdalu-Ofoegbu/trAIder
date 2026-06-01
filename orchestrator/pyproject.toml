@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "orchestrator"
+version = "0.1.0"
+description = "trAIder orchestrator + verifier — autonomous LLM trading loop"
+requires-python = ">=3.11,<3.13"
+
+# Phase 0 dependencies: mock harness + schema validation (no live LLM in Phase 0, D-14)
+dependencies = [
+    "pydantic>=2.13",
+    "web3>=7.16",
+    "pytest>=8.0",
+    "pytest-asyncio>=1.4",
+    "ruff>=0.15",
+    "httpx>=0.28",
+]
+
+# Phase 2 provider SDKs — uncomment when live LLM loop lands (D-14)
+# NOTE: pin floors verified against PyPI on 2026-06-01 (see 00-RESEARCH.md Standard Stack)
+# "anthropic>=0.105",         # Claude Opus 4.7 — NO temperature param (400 error)
+# "openai>=2.38",             # GPT-5.1 — use reasoning_effort="none" for speed
+# "google-genai>=2.7",        # Gemini 3.1 Pro — from google import genai (NOT google-generativeai)
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=1.4",
+    "ruff>=0.15",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/orchestrator"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP"]
+ignore = ["E501"]
