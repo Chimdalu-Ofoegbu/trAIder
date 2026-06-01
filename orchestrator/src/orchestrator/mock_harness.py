@@ -326,15 +326,6 @@ async def run_cycle(
         )
         return {"status": "ok", "action": "close", "skipped": True}
 
-    # Parse orderKey from transaction logs using the IPerpsAdapter OrderCreated event
-    # MockPerps does not emit OrderCreated — the orderKey is returned by openLong/openShort.
-    # We recover it by calling the function's return value via eth_call first, but since
-    # we already submitted the tx, re-derive from the pending order by scanning events.
-    # Simpler approach: call getOrderKey via the contract's state (not available as view).
-    # Use transact() + receipt approach: orderKey is in the pending order created at
-    # block `create_block` by caller `vault`. Re-derive via keccak(vault, block, nonce-1).
-    # For the harness, we read it from the OrderExecuted event after executeOrder().
-
     # ── Step 6: Store pending journal row (before rolling blocks) ────────────
     # Placeholder order_key — replaced with the real key after OrderExecuted.
     # Using tx_hash as a surrogate until OrderExecuted is observed (D-02 semantics).
@@ -356,49 +347,15 @@ async def run_cycle(
         for _ in range(execution_delay + 1):
             await web3.provider.make_request("evm_mine", [])
 
-    # Find the pending order created in this transaction block by enumerating
-    # OrderExecuted events after calling executeOrder on the pendingOrders mapping.
-    # Since we don't have the orderKey yet, scan pendingOrders via event logs.
-    # The orderKey is returned as tx return value — use eth_call to get it.
-    # Alternative: parse the tx receipt's input data (not reliable for orderKey).
-    # Best approach for the mock harness: use a dedicated helper that calls
-    # getOrderKeyForBlock() — but MockPerps doesn't expose this as a view.
-    # Fallback: scan the OrderExecuted events emitted in a known block range.
-
-    # Actually, the cleanest approach for the harness:
-    # 1. Get the latest pending order by scanning contract state.
-    # 2. The nonce is incremented twice per openLong (positionKey + orderKey).
-    # Since _nonce is private, we instead discover the orderKey by watching
-    # OrderExecuted after we call executeOrder for all pending orders in that vault.
-
-    # Harness strategy: call executeOrder by iterating over known pending orders.
-    # We track pending orders by querying OrderCreated-equivalent — but MockPerps
-    # doesn't emit OrderCreated. Instead we use the _nonce-based key derivation
-    # that the contract uses: keccak256(abi.encodePacked(msg.sender, block.number, nonce)).
-    # The nonce for the orderKey is (nonce at position creation + 1).
-    # We recover orderKey via brute-force search over the last few keys.
-
-    # Simplified approach for Phase 0: use getOrderKey by calling tryExecuteOrder
-    # with a low-level scan, or — even simpler — use the events.
-    # MockPerps emits OrderExecuted(orderKey, vault, positionKey) after executeOrder().
-    # We call executeOrder for all orders we might have created by trying to execute
-    # the key derived from: keccak256(vault_address, create_block, _nonce-1).
-
-    # Since we can't read _nonce from outside (it's private), we use the eth_call
-    # pattern: build the orderKey from (vault, create_block, nonce_guess) and try.
-    # Simpler for harness: call executeOrder on the last known pending order key.
-    # We achieve this by calling a helper that returns pending order keys for a vault.
-
-    # PRAGMATIC APPROACH: Call executeOrder on all possible keys by using
-    # OpenLong's return value through a static call pattern.
-    # Since web3.py transact() doesn't return the function return value (only tx hash),
-    # we use eth_call to get the orderKey, then transact.
-    #
-    # Re-derive using eth_call simulation:
-    order_key_bytes = await _get_order_key_for_tx(web3, mock_perps, vault, tx_hash)
-    if order_key_bytes is None:
-        logger.error("Cycle %d: could not recover orderKey from tx %s", cycle, tx_hash)
-        return {"status": "error", "error": "orderKey not recoverable"}
+    # Recover orderKey from the OrderCreated event emitted in the open tx receipt (CR-01).
+    # MockPerps emits OrderCreated(orderKey, positionKey, vault) in _openPosition and
+    # closePosition — parsing the receipt is deterministic and cycle-safe (no stale-nonce risk).
+    open_receipt = await web3.eth.get_transaction_receipt(tx_hash)
+    created_events = mock_perps.events.OrderCreated().process_receipt(open_receipt)
+    if not created_events:
+        logger.error("Cycle %d: OrderCreated event not found in receipt %s", cycle, tx_hash)
+        return {"status": "error", "error": "OrderCreated event not found in open tx receipt"}
+    order_key_bytes = created_events[0]["args"]["orderKey"]
 
     order_key_hex = "0x" + order_key_bytes.hex()
 
@@ -482,71 +439,6 @@ async def run_cycle(
         "block_number": exec_block,
         "trade_hash": trade_hash,
     }
-
-
-# ---------------------------------------------------------------------------
-# _get_order_key_for_tx — recover orderKey from a completed transaction
-# ---------------------------------------------------------------------------
-
-
-async def _get_order_key_for_tx(
-    web3: Any,
-    mock_perps: Any,
-    vault: str,
-    tx_hash: Any,
-) -> bytes | None:
-    """Recover the orderKey generated by an openLong/openShort transaction.
-
-    Strategy: The MockPerps._freshKey() function uses:
-        keccak256(abi.encodePacked(msg.sender, block.number, _nonce++))
-
-    Each call to _openPosition generates TWO keys (positionKey + orderKey), so
-    the orderKey is at nonce = (nonce at call start + 1).
-
-    Since _nonce is private, we use the eth_call pattern:
-      - Re-encode openLong/openShort as a simulated call at the SAME block
-      - This is not directly possible after the fact.
-
-    Alternative: scan the pendingOrders mapping for the vault's latest order.
-    Since MockPerps doesn't provide an enumerator, we brute-force using the
-    keccak256 derivation with nonce candidates from 0 to some max.
-
-    Practical shortcut for Phase 0 harness: read the pending order using
-    the 'pending_orders' mapping by trying keys derived from:
-      keccak256(abi.encodePacked(vault, receipt.blockNumber, nonce))
-    for nonce in range(0, MAX_NONCE_SEARCH).
-
-    Returns:
-        bytes32 orderKey if found; None if not found within MAX_NONCE_SEARCH.
-    """
-    from web3 import Web3
-
-    receipt = await web3.eth.get_transaction_receipt(tx_hash)
-    create_block = receipt["blockNumber"]
-
-    # Brute-force: try nonce=0 to 99 (realistic for Phase 0 tests)
-    MAX_NONCE_SEARCH = 100
-    for nonce_guess in range(MAX_NONCE_SEARCH):
-        # keccak256(abi.encodePacked(msg.sender, block.number, _nonce))
-        packed = (
-            bytes.fromhex(vault[2:].lower().zfill(40))  # address (20 bytes)
-            + create_block.to_bytes(32, "big")  # uint256 block.number (32 bytes)
-            + nonce_guess.to_bytes(32, "big")  # uint256 _nonce (32 bytes)
-        )
-        candidate_key = Web3.keccak(packed)
-
-        # Check if this is a valid orderKey in the pendingOrders mapping
-        try:
-            pending_order = await mock_perps.functions.pendingOrders(candidate_key).call()
-            # pendingOrders returns (positionKey, executeAfterBlock, vault, isClose, executed)
-            order_vault = pending_order[2]
-            is_executed = pending_order[4]
-            if order_vault.lower() == vault.lower() and not is_executed:
-                return candidate_key
-        except Exception:  # noqa: BLE001
-            continue
-
-    return None
 
 
 # ---------------------------------------------------------------------------

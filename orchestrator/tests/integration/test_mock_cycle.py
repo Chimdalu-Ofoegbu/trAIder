@@ -44,6 +44,12 @@ from pydantic import ValidationError
 from orchestrator.mock_harness import _is_timeout_marker, load_fixture, run_cycle
 from orchestrator.schema import Decision
 
+# Anvil well-known second account (account index 1) used as a vault in CR-01 test
+# so it doesn't pollute the deployer's pending order state from other tests.
+# This is a PUBLIC test key from Foundry/Anvil documentation — NOT a real secret.
+# gitleaks:allow
+_ANVIL_ACCOUNT_1 = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+
 # ---------------------------------------------------------------------------
 # Test 1: Authoritative code assertion (T-0-nodeploy)
 # ---------------------------------------------------------------------------
@@ -333,4 +339,100 @@ async def test_MockCycle_TimeoutFixture_NoTrade(mock_perps, anvil_w3):
     )
     assert "tx_hash" not in result, (
         "No tx_hash should be present for a timeout fixture — no MockPerps call was made"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 8: CR-01 regression — multi-cycle orderKey uniqueness via OrderCreated event
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_CR01_MultiCycle_OrderKeyIsFromCurrentOrder(mock_perps, anvil_w3):
+    """CR-01 regression: event-parse recovery returns the CURRENT cycle's orderKey, not a stale one.
+
+    Exercises the exact multi-cycle bug described in CR-01:
+      - Cycle 1: open a position for the vault; do NOT execute the order
+        (the pending order sits un-executed in MockPerps.pendingOrders)
+      - Cycle 2: open a SECOND position for the SAME vault
+      - Assert that the orderKey recovered from cycle 2's receipt is the
+        cycle-2 order, NOT the stale cycle-1 order
+
+    With the old brute-force _get_order_key_for_tx, the scan returned the
+    FIRST un-executed pending order for the vault (lowest nonce = cycle 1's order),
+    causing cycle 2 to execute and journal the wrong trade.
+
+    With the event-parse fix, each receipt contains exactly one OrderCreated event
+    for the order created in THAT transaction, making recovery cycle-safe.
+
+    No Postgres or Redis required — drives MockPerps directly via anvil_w3.
+    """
+    contract, mock_perps_addr, deployer, rpc_url = mock_perps
+
+    # Use a fresh vault address (account 1) so this test's pending orders
+    # don't collide with other tests that use account 0 (deployer) as vault.
+    vault = _ANVIL_ACCOUNT_1
+
+    size_usd_1e30 = int(5_000 * 1e30)  # $5,000 in 1e30 format
+    leverage_1e4 = int(2 * 10_000)  # 2x in 1e4-scaled
+
+    # ── Cycle 1: open a position, do NOT execute the order ───────────────────
+    tx1 = await contract.functions.openLong("ETH", size_usd_1e30, leverage_1e4, 50).transact(
+        {"from": vault}
+    )
+    receipt1 = await anvil_w3.eth.get_transaction_receipt(tx1)
+
+    # Parse OrderCreated from cycle 1 receipt
+    created1 = contract.events.OrderCreated().process_receipt(receipt1)
+    assert created1, "Cycle 1: OrderCreated event must be present in receipt"
+    order_key_cycle1 = created1[0]["args"]["orderKey"]
+    assert created1[0]["args"]["vault"].lower() == vault.lower(), (
+        "Cycle 1: OrderCreated vault must match the submitting vault"
+    )
+
+    # Verify cycle 1's order is pending (not executed)
+    pending1 = await contract.functions.pendingOrders(order_key_cycle1).call()
+    # pendingOrders returns (positionKey, executeAfterBlock, vault, isClose, executed)
+    assert pending1[2].lower() == vault.lower(), "Cycle 1: pending order vault mismatch"
+    assert not pending1[4], "Cycle 1: order should NOT be executed yet"
+
+    # ── Cycle 2: open a SECOND position for the SAME vault ───────────────────
+    tx2 = await contract.functions.openLong("BTC", size_usd_1e30, leverage_1e4, 50).transact(
+        {"from": vault}
+    )
+    receipt2 = await anvil_w3.eth.get_transaction_receipt(tx2)
+
+    # Parse OrderCreated from cycle 2 receipt
+    created2 = contract.events.OrderCreated().process_receipt(receipt2)
+    assert created2, "Cycle 2: OrderCreated event must be present in receipt"
+    order_key_cycle2 = created2[0]["args"]["orderKey"]
+    assert created2[0]["args"]["vault"].lower() == vault.lower(), (
+        "Cycle 2: OrderCreated vault must match the submitting vault"
+    )
+
+    # ── Core assertion: the two orderKeys are distinct ────────────────────────
+    assert order_key_cycle1 != order_key_cycle2, (
+        "Each cycle must produce a unique orderKey — nonce must have incremented"
+    )
+
+    # ── Core assertion: cycle 2 receipt gives the CYCLE-2 key, not cycle-1's ──
+    # Cycle 1's order is still un-executed (pending). With the OLD brute-force,
+    # scanning pendingOrders for vault would hit cycle-1's order first (lower nonce).
+    # With the event-parse fix, receipt2 ONLY contains cycle-2's OrderCreated,
+    # so the recovered key is unambiguously cycle 2's.
+    assert order_key_cycle2 != order_key_cycle1, (
+        "CR-01: cycle 2 receipt must yield the cycle-2 orderKey, "
+        "not the stale cycle-1 key that is still un-executed in pendingOrders"
+    )
+
+    # Verify cycle 2's order is also pending (not executed)
+    pending2 = await contract.functions.pendingOrders(order_key_cycle2).call()
+    assert not pending2[4], "Cycle 2: order should not be executed yet (pending)"
+    assert pending2[2].lower() == vault.lower(), "Cycle 2: pending order vault mismatch"
+
+    # Confirm cycle 1 is STILL pending (was not touched by cycle 2's call)
+    pending1_after = await contract.functions.pendingOrders(order_key_cycle1).call()
+    assert not pending1_after[4], (
+        "Cycle 1 order should still be pending after cycle 2 — event-parse does not "
+        "accidentally execute or modify the cycle-1 order"
     )

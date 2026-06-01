@@ -126,6 +126,15 @@ contract MockPerps is IPerpsAdapter, Ownable {
     // Events
     // =========================================================================
 
+    /// @notice Emitted when a pending order is created (open or close).
+    /// @dev Orchestrator parses this event from the transaction receipt to recover
+    ///      the orderKey deterministically — avoids brute-force nonce derivation (CR-01).
+    ///      Both open and close orders emit this event so all pending orders are recoverable.
+    /// @param orderKey  Unique order key returned by openLong/openShort/closePosition.
+    /// @param positionKey The position this order will open or close.
+    /// @param vault The mTokenVault address that submitted the order (msg.sender).
+    event OrderCreated(bytes32 indexed orderKey, bytes32 indexed positionKey, address indexed vault);
+
     /// @notice Emitted when a position is auto-liquidated (collateral + pnl <= 0).
     /// @param positionKey The liquidated position key.
     /// @param vault The vault that held the position.
@@ -215,6 +224,8 @@ contract MockPerps is IPerpsAdapter, Ownable {
             isClose: true,
             executed: false
         });
+        // CR-01: emit OrderCreated so orchestrator can recover orderKey from tx receipt
+        emit OrderCreated(orderKey, positionKey, msg.sender);
     }
 
     // =========================================================================
@@ -396,6 +407,8 @@ contract MockPerps is IPerpsAdapter, Ownable {
             isClose: false,
             executed: false
         });
+        // CR-01: emit OrderCreated so orchestrator can recover orderKey from tx receipt
+        emit OrderCreated(orderKey, positionKey, msg.sender);
     }
 
     /// @dev Computes PnL for an open position using the financially-correct formula.
