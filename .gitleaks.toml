@@ -1,0 +1,125 @@
+# =============================================================================
+# .gitleaks.toml — trAIder secret-scanning rules (SEC-01 / D-70 / T-0-secret)
+#
+# Extended ruleset on top of gitleaks defaults, specifically covering the
+# secret types relevant to this project:
+#   - Ethereum/EVM private keys (0x + 64 hex chars)
+#   - LLM API keys (Anthropic, OpenAI, Google)
+#   - General high-entropy secrets assigned to key-like variable names
+#
+# Suppressions: add `# gitleaks:allow` to the END of a line to suppress a
+# specific finding. Use sparingly and document WHY (SEC-01 audit trail).
+# .gitleaks.toml allowlists below cover test fixtures and .env.example.
+#
+# References:
+#   D-70: pre-commit + CI gitleaks hooks
+#   T-0-secret: committed secrets threat in the STRIDE register
+#   SEC-01: key separation + secret-scanning mitigation
+# =============================================================================
+
+title = "trAIder gitleaks config"
+
+# ---------------------------------------------------------------------------
+# Rule: Ethereum / EVM private key (0x + 64 hex chars)
+# Matches the exact format that `cast wallet new` produces.
+# D-17: four runtime EOAs are the primary secret type in this repo.
+# ---------------------------------------------------------------------------
+[[rules]]
+id = "ethereum-private-key"
+description = "Ethereum / EVM private key (0x + 64 hex characters)"
+regex = '''(?i)(private[_-]?key|priv[_-]?key|eth[_-]?key|evm[_-]?key|wallet[_-]?key)\s*[=:]\s*["']?0x[0-9a-fA-F]{64}["']?'''
+keywords = ["private_key", "privkey", "eth_key", "evm_key", "wallet_key", "private-key"]
+tags = ["key", "ethereum", "secret"]
+
+# Bare hex private key without 0x prefix (64 chars, assigned to key var)
+[[rules]]
+id = "ethereum-private-key-bare"
+description = "Bare EVM private key (64 hex chars assigned to key variable)"
+regex = '''(?i)(private[_-]?key|priv[_-]?key|eth[_-]?key|deployer[_-]?key|operator[_-]?key|gas[_-]?key)\s*[=:]\s*["']?[0-9a-fA-F]{64}["']?'''
+keywords = ["private_key", "privkey", "deployer_key", "operator_key", "gas_key"]
+tags = ["key", "ethereum", "secret"]
+
+# EVM private key assigned to env-var-style ALLCAPS names
+[[rules]]
+id = "ethereum-private-key-env"
+description = "EVM private key in environment variable style (ALLCAPS=0x...)"
+regex = '''(?i)(DEPLOYER_PRIVATE_KEY|OPERATOR_TRADE_PRIVATE_KEY|OPERATOR_JOURNAL_PRIVATE_KEY|GAS_PRIVATE_KEY)\s*[=:]\s*["']?0x[0-9a-fA-F]{64}["']?'''
+keywords = ["DEPLOYER_PRIVATE_KEY", "OPERATOR_TRADE_PRIVATE_KEY", "OPERATOR_JOURNAL_PRIVATE_KEY", "GAS_PRIVATE_KEY"]
+tags = ["key", "ethereum", "secret", "env"]
+
+# ---------------------------------------------------------------------------
+# Rule: Anthropic API key
+# Format: sk-ant-api03-<base64-like string>
+# ---------------------------------------------------------------------------
+[[rules]]
+id = "anthropic-api-key"
+description = "Anthropic API key"
+regex = '''sk-ant-api\d{2}-[A-Za-z0-9\-_]{95}'''
+keywords = ["sk-ant"]
+tags = ["key", "anthropic", "api", "secret"]
+
+# ---------------------------------------------------------------------------
+# Rule: OpenAI API key
+# Format: sk-proj-... or sk-... (OpenAI key formats)
+# ---------------------------------------------------------------------------
+[[rules]]
+id = "openai-api-key"
+description = "OpenAI API key"
+regex = '''sk-(?:proj-)?[A-Za-z0-9_\-]{32,}'''
+keywords = ["sk-proj-", "OPENAI_API_KEY"]
+tags = ["key", "openai", "api", "secret"]
+
+# ---------------------------------------------------------------------------
+# Rule: Google AI API key
+# Format: AIza followed by 35 chars
+# ---------------------------------------------------------------------------
+[[rules]]
+id = "google-api-key"
+description = "Google AI / GCP API key"
+regex = '''AIza[0-9A-Za-z\-_]{35}'''
+keywords = ["AIza", "GOOGLE_AI_API_KEY"]
+tags = ["key", "google", "api", "secret"]
+
+# ---------------------------------------------------------------------------
+# Rule: Pinata JWT
+# Format: JWT (three base64url segments separated by dots)
+# ---------------------------------------------------------------------------
+[[rules]]
+id = "pinata-jwt"
+description = "Pinata JWT token"
+regex = '''(?i)(pinata[_-]?jwt|PINATA_JWT)\s*[=:]\s*["']?[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+["']?'''
+keywords = ["PINATA_JWT", "pinata_jwt"]
+tags = ["key", "pinata", "jwt", "secret"]
+
+# ---------------------------------------------------------------------------
+# Allowlist: paths and patterns that are explicitly safe to have key-like
+# content (test fixtures, schema documentation, generated examples).
+# ---------------------------------------------------------------------------
+[allowlist]
+description = "Paths and patterns safe to contain key-like content"
+
+# .env.example contains ONLY empty placeholder assignments (no real values)
+paths = [
+    '''.env\.example$''',
+    '''scripts/test-gitleaks-blocks-secret\.sh$''',
+    '''\.gitleaks\.toml$''',
+    '''docs/KEY-TOPOLOGY\.md$''',
+]
+
+# Patterns that are always safe (empty assignments, placeholder text)
+regexes = [
+    # Empty env var assignments (VARNAME=   or   VARNAME="")
+    '''[A-Z_]+=\s*$''',
+    '''[A-Z_]+=""\s*$''',
+    # Placeholder text
+    '''your[_-]?key[_-]?here''',
+    '''<your[_-]?key>''',
+    '''PLACEHOLDER''',
+    # Test fixture markers
+    '''gitleaks:allow''',
+    # Cast wallet example addresses (40-char hex without 64-char private key)
+    # These are address-length (40 hex), not key-length (64 hex)
+]
+
+# Commits containing only documentation or test fixtures (use commit hash)
+commits = []
