@@ -48,14 +48,24 @@ else:
     # Probe the DB connection before collecting any tests
     try:
         import psycopg  # noqa: F401 — probe import only
-        _probe_url = TEST_DATABASE_URL.replace("+psycopg", "", 1).replace("postgresql://", "", 1)
+
+        _probe_url = TEST_DATABASE_URL.replace("+psycopg", "", 1).replace(
+            "postgresql://", "", 1
+        )
         # Quick connection probe
-        _conn_str = TEST_DATABASE_URL.replace("postgresql+psycopg://", "").replace("postgresql://", "")
+        _conn_str = TEST_DATABASE_URL.replace("postgresql+psycopg://", "").replace(
+            "postgresql://", ""
+        )
         # Use a subprocess probe to avoid import-time side effects
         _result = subprocess.run(
-            [sys.executable, "-c",
-             f"import psycopg; psycopg.connect('{TEST_DATABASE_URL.replace('postgresql+psycopg://', 'postgresql://')}').close(); print('ok')"],
-            capture_output=True, text=True, timeout=5,
+            [
+                sys.executable,
+                "-c",
+                f"import psycopg; psycopg.connect('{TEST_DATABASE_URL.replace('postgresql+psycopg://', 'postgresql://')}').close(); print('ok')",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         if _result.returncode != 0:
             SKIP_REASON = (
@@ -70,7 +80,9 @@ else:
     except Exception as e:  # noqa: BLE001
         SKIP_REASON = f"No Postgres reachable: {e}"
 
-_skip_if_no_db = pytest.mark.skipif(bool(SKIP_REASON), reason=SKIP_REASON or "no reason")
+_skip_if_no_db = pytest.mark.skipif(
+    bool(SKIP_REASON), reason=SKIP_REASON or "no reason"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +127,7 @@ def _get_connection(db_url: str):
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(scope="module")
 def db_url() -> str:
     """Resolved TEST_DATABASE_URL (already guarded by skip mark)."""
@@ -137,6 +150,7 @@ def migrated_db(db_url):
 # ---------------------------------------------------------------------------
 # Tests — all gated by _skip_if_no_db
 # ---------------------------------------------------------------------------
+
 
 @_skip_if_no_db
 class TestUpgradeHead:
@@ -163,10 +177,18 @@ class TestUpgradeHead:
     def test_no_traider_tables_in_public(self, migrated_db):
         """No trAIder application tables must land in the public schema (T-0-schema-leak)."""
         known_traider_tables = {
-            "sessions", "vaults", "positions", "trades", "journal_entries",
-            "model_decisions", "nav_snapshots", "journal_state_log",
-            "model_status_log", "event_log",
-            "websocket_sessions", "verifier_replay_log",
+            "sessions",
+            "vaults",
+            "positions",
+            "trades",
+            "journal_entries",
+            "model_decisions",
+            "nav_snapshots",
+            "journal_state_log",
+            "model_status_log",
+            "event_log",
+            "websocket_sessions",
+            "verifier_replay_log",
         }
         with _get_connection(migrated_db) as conn:
             rows = conn.execute(
@@ -225,8 +247,13 @@ class TestUpgradeHead:
     def test_journal_state_enum_values(self, migrated_db):
         """journal_state ENUM must contain all 7 states (D-21)."""
         expected = {
-            "pending_pin", "pinned_primary", "pinned_backup",
-            "signed", "submitted", "recorded", "failed",
+            "pending_pin",
+            "pinned_primary",
+            "pinned_backup",
+            "signed",
+            "submitted",
+            "recorded",
+            "failed",
         }
         with _get_connection(migrated_db) as conn:
             rows = conn.execute(
@@ -255,7 +282,9 @@ class TestUpgradeHead:
                   AND indexname = 'ix_nav_brin'
                 """
             ).fetchone()
-        assert result is not None, "BRIN index ix_nav_brin not found on orchestrator.nav_snapshots"
+        assert result is not None, (
+            "BRIN index ix_nav_brin not found on orchestrator.nav_snapshots"
+        )
         assert "brin" in result[1].lower(), (
             f"ix_nav_brin is not a BRIN index: {result[1]}"
         )
@@ -272,7 +301,9 @@ class TestUpgradeHead:
                   AND indexname = 'ix_trades_brin'
                 """
             ).fetchone()
-        assert result is not None, "BRIN index ix_trades_brin not found on orchestrator.trades"
+        assert result is not None, (
+            "BRIN index ix_trades_brin not found on orchestrator.trades"
+        )
         assert "brin" in result[1].lower(), (
             f"ix_trades_brin is not a BRIN index: {result[1]}"
         )
@@ -289,7 +320,9 @@ class TestUpgradeHead:
                   AND indexname = 'ix_trades_hash'
                 """
             ).fetchone()
-        assert result is not None, "B-tree index ix_trades_hash not found on orchestrator.trades"
+        assert result is not None, (
+            "B-tree index ix_trades_hash not found on orchestrator.trades"
+        )
 
     def test_dashboard_model_state_is_materialized_view(self, migrated_db):
         """backend.dashboard_model_state must be a MATERIALIZED VIEW."""
@@ -302,7 +335,9 @@ class TestUpgradeHead:
                   AND matviewname = 'dashboard_model_state'
                 """
             ).fetchone()
-        assert result is not None, "backend.dashboard_model_state is not a materialized view"
+        assert result is not None, (
+            "backend.dashboard_model_state is not a materialized view"
+        )
 
     def test_dashboard_session_state_is_materialized_view(self, migrated_db):
         """backend.dashboard_session_state must be a MATERIALIZED VIEW."""
@@ -315,7 +350,9 @@ class TestUpgradeHead:
                   AND matviewname = 'dashboard_session_state'
                 """
             ).fetchone()
-        assert result is not None, "backend.dashboard_session_state is not a materialized view"
+        assert result is not None, (
+            "backend.dashboard_session_state is not a materialized view"
+        )
 
     def test_nav_refresh_trigger_exists(self, migrated_db):
         """trg_refresh_model_state trigger must exist on orchestrator.nav_snapshots."""
@@ -371,9 +408,16 @@ class TestUpgradeHead:
     def test_all_orchestrator_tables_exist(self, migrated_db):
         """All 10 orchestrator.* tables must exist after upgrade."""
         expected_tables = {
-            "sessions", "vaults", "positions", "trades", "journal_entries",
-            "model_decisions", "nav_snapshots", "journal_state_log",
-            "model_status_log", "event_log",
+            "sessions",
+            "vaults",
+            "positions",
+            "trades",
+            "journal_entries",
+            "model_decisions",
+            "nav_snapshots",
+            "journal_state_log",
+            "model_status_log",
+            "event_log",
         }
         with _get_connection(migrated_db) as conn:
             rows = conn.execute(
@@ -416,9 +460,16 @@ class TestDowngradeBase:
     def test_orchestrator_tables_gone_after_downgrade(self, db_url):
         """All orchestrator.* tables must be gone after downgrade base."""
         traider_tables = {
-            "sessions", "vaults", "positions", "trades", "journal_entries",
-            "model_decisions", "nav_snapshots", "journal_state_log",
-            "model_status_log", "event_log",
+            "sessions",
+            "vaults",
+            "positions",
+            "trades",
+            "journal_entries",
+            "model_decisions",
+            "nav_snapshots",
+            "journal_state_log",
+            "model_status_log",
+            "event_log",
         }
         with _get_connection(db_url) as conn:
             rows = conn.execute(
@@ -461,8 +512,7 @@ class TestDowngradeBase:
         """Materialized views must not exist after downgrade base."""
         with _get_connection(db_url) as conn:
             rows = conn.execute(
-                "SELECT matviewname FROM pg_matviews "
-                "WHERE schemaname = 'backend'"
+                "SELECT matviewname FROM pg_matviews WHERE schemaname = 'backend'"
             ).fetchall()
         remaining = {r[0] for r in rows}
         assert not remaining, (

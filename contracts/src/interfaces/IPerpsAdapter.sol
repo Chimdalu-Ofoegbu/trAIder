@@ -39,11 +39,7 @@ interface IPerpsAdapter {
     /// @param vault The mTokenVault address that initiated the order.
     /// @param positionKey The on-chain position identifier after fill (venue-specific
     ///        encoding; used by closePosition on the next cycle).
-    event OrderExecuted(
-        bytes32 indexed orderKey,
-        address indexed vault,
-        bytes32 positionKey
-    );
+    event OrderExecuted(bytes32 indexed orderKey, address indexed vault, bytes32 positionKey);
 
     /// @notice Emitted when a keeper (or mock) cancels a pending order.
     /// @dev Orchestrator marks the pending order as cancelled and does NOT publish
@@ -52,11 +48,7 @@ interface IPerpsAdapter {
     /// @param vault The mTokenVault address that initiated the order.
     /// @param reason Human-readable cancellation reason (e.g., "insufficient margin",
     ///        "slippage exceeded", "keeper timeout").
-    event OrderCancelled(
-        bytes32 indexed orderKey,
-        address indexed vault,
-        string reason
-    );
+    event OrderCancelled(bytes32 indexed orderKey, address indexed vault, string reason);
 
     // =========================================================================
     // Order creation — returns orderKey for async tracking (D-01 / D-02)
@@ -78,12 +70,9 @@ interface IPerpsAdapter {
     /// @param slippageBps Acceptable slippage in basis points (e.g., 30 = 0.3%).
     /// @return orderKey Unique order identifier. Subscribe to OrderExecuted /
     ///         OrderCancelled events filtered by this key to determine fill status.
-    function openLong(
-        string calldata market,
-        uint256 sizeUsd,
-        uint256 leverage,
-        uint256 slippageBps
-    ) external returns (bytes32 orderKey);
+    function openLong(string calldata market, uint256 sizeUsd, uint256 leverage, uint256 slippageBps)
+        external
+        returns (bytes32 orderKey);
 
     /// @notice Opens a short perpetual position for the calling vault.
     /// @dev See openLong NatSpec — identical params, opposite direction.
@@ -93,12 +82,9 @@ interface IPerpsAdapter {
     /// @param leverage Leverage multiplier in 1e4-scaled basis points. Max 3x (VAULT-04).
     /// @param slippageBps Acceptable slippage in basis points.
     /// @return orderKey Unique order identifier for async event tracking.
-    function openShort(
-        string calldata market,
-        uint256 sizeUsd,
-        uint256 leverage,
-        uint256 slippageBps
-    ) external returns (bytes32 orderKey);
+    function openShort(string calldata market, uint256 sizeUsd, uint256 leverage, uint256 slippageBps)
+        external
+        returns (bytes32 orderKey);
 
     /// @notice Closes (partially or fully) an existing perpetual position.
     /// @dev positionKey is the value emitted in the OrderExecuted event from the
@@ -110,10 +96,7 @@ interface IPerpsAdapter {
     /// @param positionKey The position identifier from the prior OrderExecuted event.
     /// @param sizeUsd USD amount to close, 1e30-scaled. Pass full position size to close entirely.
     /// @return orderKey Unique order identifier for async event tracking.
-    function closePosition(
-        bytes32 positionKey,
-        uint256 sizeUsd
-    ) external returns (bytes32 orderKey);
+    function closePosition(bytes32 positionKey, uint256 sizeUsd) external returns (bytes32 orderKey);
 
     // =========================================================================
     // Position value (NAV feed) — Chainlink-priced, venue-agnostic (D-03)

@@ -118,9 +118,7 @@ def upgrade() -> None:
     # orchestrator.nav_snapshots which triggers the backend refresh, but must
     # not be able to directly read or write backend tables.
     op.execute("REVOKE ALL ON SCHEMA backend FROM orchestrator_user")
-    op.execute(
-        "REVOKE ALL ON ALL TABLES IN SCHEMA backend FROM orchestrator_user"
-    )
+    op.execute("REVOKE ALL ON ALL TABLES IN SCHEMA backend FROM orchestrator_user")
 
     # -----------------------------------------------------------------------
     # Grants for backend_user
@@ -131,12 +129,8 @@ def upgrade() -> None:
 
     # orchestrator schema: usage + SELECT only (read truth, cannot mutate)
     op.execute("GRANT USAGE ON SCHEMA orchestrator TO backend_user")
-    op.execute(
-        "GRANT SELECT ON ALL TABLES IN SCHEMA orchestrator TO backend_user"
-    )
-    op.execute(
-        "GRANT SELECT ON ALL SEQUENCES IN SCHEMA orchestrator TO backend_user"
-    )
+    op.execute("GRANT SELECT ON ALL TABLES IN SCHEMA orchestrator TO backend_user")
+    op.execute("GRANT SELECT ON ALL SEQUENCES IN SCHEMA orchestrator TO backend_user")
     op.execute(
         "ALTER DEFAULT PRIVILEGES IN SCHEMA orchestrator "
         "GRANT SELECT ON TABLES TO backend_user"
@@ -152,9 +146,7 @@ def upgrade() -> None:
         "GRANT SELECT, INSERT, UPDATE, DELETE "
         "ON ALL TABLES IN SCHEMA backend TO backend_user"
     )
-    op.execute(
-        "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA backend TO backend_user"
-    )
+    op.execute("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA backend TO backend_user")
     op.execute(
         "ALTER DEFAULT PRIVILEGES IN SCHEMA backend "
         "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO backend_user"
@@ -229,9 +221,7 @@ def downgrade() -> None:
     op.execute(
         "REVOKE ALL ON ALL SEQUENCES IN SCHEMA orchestrator FROM orchestrator_user"
     )
-    op.execute(
-        "REVOKE ALL ON ALL TABLES IN SCHEMA orchestrator FROM orchestrator_user"
-    )
+    op.execute("REVOKE ALL ON ALL TABLES IN SCHEMA orchestrator FROM orchestrator_user")
     op.execute("REVOKE USAGE ON SCHEMA orchestrator FROM orchestrator_user")
     op.execute("REVOKE CONNECT ON DATABASE traider FROM orchestrator_user")
 

@@ -1,0 +1,142 @@
+# =============================================================================
+# .pre-commit-config.yaml — trAIder pre-commit hooks (D-70 / SEC-01)
+#
+# Hooks:
+#   - gitleaks: blocks committed secrets (pre-commit AND pre-push stages)
+#   - ruff: Python format + lint (orchestrator/, backend/, migrations/)
+#   - forge fmt: Solidity formatter check (contracts/)
+#   - prettier: TS / JSON / MD / YAML formatter check (frontend/, docs/, etc.)
+#
+# CI mirrors these same checks (defense in depth, D-70 / D-48).
+# Local hooks catch issues before push; CI catches issues before merge.
+#
+# Install hooks:
+#   pre-commit install                          # commit-stage hooks
+#   pre-commit install --hook-type pre-push    # push-stage gitleaks
+#
+# Run all hooks manually:
+#   pre-commit run --all-files
+#
+# References:
+#   D-70: pre-commit framework spec
+#   T-0-secret: gitleaks at commit + push is the primary T-0-secret mitigation
+#   D-33: forge fmt check is part of the contracts CI pipeline
+# =============================================================================
+
+# Minimum pre-commit version required
+minimum_pre_commit_version: "3.0.0"
+
+# Default stages for hooks that don't specify (commit)
+default_stages: [pre-commit]
+
+repos:
+
+  # ---------------------------------------------------------------------------
+  # gitleaks — secret scanning at commit AND push (D-70, T-0-secret)
+  # Using a local hook to invoke the project-installed gitleaks binary with
+  # the project-specific .gitleaks.toml config (Ethereum keys, LLM API keys).
+  # Runs at BOTH pre-commit and pre-push stages (defense in depth).
+  # ---------------------------------------------------------------------------
+  - repo: local
+    hooks:
+      - id: gitleaks-commit
+        name: gitleaks (detect secrets at commit)
+        language: system
+        entry: gitleaks
+        args:
+          - protect
+          - --staged
+          - --config=.gitleaks.toml
+          - --redact
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: gitleaks-push
+        name: gitleaks (detect secrets at push)
+        language: system
+        entry: gitleaks
+        args:
+          - protect
+          - --config=.gitleaks.toml
+          - --redact
+        pass_filenames: false
+        stages: [pre-push]
+
+  # ---------------------------------------------------------------------------
+  # ruff — Python format + lint for orchestrator, backend, migrations
+  # Using the pre-commit mirror repo which bundles its own ruff binary.
+  # Scoped to Python files only.
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    # Pin to full commit SHA (D-51 — third-party hooks pinned to SHA)
+    # ruff-pre-commit v0.11.13 (2025-06-01)
+    rev: v0.11.13
+    hooks:
+      - id: ruff
+        name: ruff lint (Python)
+        args: [--fix]
+        types_or: [python, pyi]
+        files: ^(orchestrator|backend|migrations)/
+
+      - id: ruff-format
+        name: ruff format (Python)
+        types_or: [python, pyi]
+        files: ^(orchestrator|backend|migrations)/
+
+  # ---------------------------------------------------------------------------
+  # forge fmt — Solidity formatter check (contracts/)
+  # Using a local hook because forge is installed via foundryup (not pip/npm).
+  # Runs forge fmt --check so it fails if any Solidity file is unformatted;
+  # run `forge fmt` manually to fix before committing.
+  # ---------------------------------------------------------------------------
+  - repo: local
+    hooks:
+      - id: forge-fmt
+        name: forge fmt (Solidity format check)
+        language: system
+        entry: bash
+        args:
+          - -c
+          - |
+            cd contracts && forge fmt --check
+        pass_filenames: false
+        files: ^contracts/.*\.sol$
+        types: [file]
+
+  # ---------------------------------------------------------------------------
+  # prettier — TS / JSON / MD / YAML formatting
+  # Using the pre-commit mirror for prettier. Scoped to frontend + docs + root.
+  # Formats TS/TSX, JSON, Markdown, YAML files.
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/pre-commit/mirrors-prettier
+    # Pin to full commit SHA (D-51)
+    # mirrors-prettier v4.0.0-alpha.8 (covers prettier 3.x)
+    rev: v4.0.0-alpha.8
+    hooks:
+      - id: prettier
+        name: prettier (TS/JSON/MD/YAML)
+        additional_dependencies:
+          - prettier@3.3.3
+        types_or: [javascript, jsx, ts, tsx, json, yaml, markdown]
+        files: ^(frontend|docs|\.github)/|^(README|CLAUDE)
+
+  # ---------------------------------------------------------------------------
+  # General file hygiene (trailing whitespace, EOF newline, merge conflicts)
+  # Using the official pre-commit hooks repo.
+  # ---------------------------------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    # Pin to full commit SHA (D-51)
+    # pre-commit-hooks v5.0.0
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^contracts/lib/  # OZ library files (not ours to fix)
+      - id: end-of-file-fixer
+        exclude: ^contracts/lib/
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=500]
+      - id: check-yaml
+        exclude: ^\.github/workflows/  # GH Actions YAML has its own schema
+      - id: check-json
+        exclude: ^frontend/  # frontend JSON handled by prettier

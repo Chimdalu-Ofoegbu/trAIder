@@ -44,6 +44,7 @@ target_metadata = None
 # We do NOT commit credentials into alembic.ini; sqlalchemy.url is left blank there.
 # ---------------------------------------------------------------------------
 
+
 def get_database_url() -> str:
     """Read DATABASE_URL from the environment.
 
@@ -88,6 +89,7 @@ def _ensure_schemas(connection) -> None:
 # Used in CI / pre-commit to audit the DDL (`alembic upgrade head --sql`).
 # ---------------------------------------------------------------------------
 
+
 def run_migrations_offline() -> None:
     """Run migrations in 'offline' mode (--sql flag).
 
@@ -112,6 +114,7 @@ def run_migrations_offline() -> None:
 # ---------------------------------------------------------------------------
 # Online mode — runs against a live DB connection.
 # ---------------------------------------------------------------------------
+
 
 def run_migrations_online() -> None:
     """Run migrations in 'online' mode against a real Postgres connection."""

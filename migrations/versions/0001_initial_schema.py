@@ -63,17 +63,30 @@ def upgrade() -> None:
     # -----------------------------------------------------------------------
     op.create_table(
         "sessions",
-        sa.Column("id", sa.UUID(as_uuid=True), primary_key=True, server_default=sa.text("gen_random_uuid()")),
+        sa.Column(
+            "id",
+            sa.UUID(as_uuid=True),
+            primary_key=True,
+            server_default=sa.text("gen_random_uuid()"),
+        ),
         sa.Column("session_key", sa.Text(), nullable=False, unique=True),
         sa.Column("started_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("ended_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("duration_seconds", sa.Integer(), nullable=True),
         sa.Column("state", sa.Text(), nullable=False, server_default="pending"),
         sa.Column("fork_block_number", sa.BigInteger(), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False,
-                  server_default=sa.text("NOW()")),
-        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False,
-                  server_default=sa.text("NOW()")),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.text("NOW()"),
+        ),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.text("NOW()"),
+        ),
         schema="orchestrator",
     )
 
@@ -82,17 +95,37 @@ def upgrade() -> None:
     # -----------------------------------------------------------------------
     op.create_table(
         "vaults",
-        sa.Column("id", sa.UUID(as_uuid=True), primary_key=True, server_default=sa.text("gen_random_uuid()")),
-        sa.Column("session_id", sa.UUID(as_uuid=True), sa.ForeignKey("orchestrator.sessions.id"), nullable=False),
+        sa.Column(
+            "id",
+            sa.UUID(as_uuid=True),
+            primary_key=True,
+            server_default=sa.text("gen_random_uuid()"),
+        ),
+        sa.Column(
+            "session_id",
+            sa.UUID(as_uuid=True),
+            sa.ForeignKey("orchestrator.sessions.id"),
+            nullable=False,
+        ),
         sa.Column("vault_address", sa.Text(), nullable=False),
         sa.Column("model_name", sa.Text(), nullable=False),
         sa.Column("model_provider", sa.Text(), nullable=False),
         sa.Column("initial_usdc", sa.Numeric(precision=36, scale=18), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False,
-                  server_default=sa.text("NOW()")),
-        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False,
-                  server_default=sa.text("NOW()")),
-        sa.UniqueConstraint("session_id", "vault_address", name="uq_vaults_session_addr"),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.text("NOW()"),
+        ),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.text("NOW()"),
+        ),
+        sa.UniqueConstraint(
+            "session_id", "vault_address", name="uq_vaults_session_addr"
+        ),
         schema="orchestrator",
     )
 
@@ -101,21 +134,38 @@ def upgrade() -> None:
     # -----------------------------------------------------------------------
     op.create_table(
         "positions",
-        sa.Column("id", sa.UUID(as_uuid=True), primary_key=True, server_default=sa.text("gen_random_uuid()")),
+        sa.Column(
+            "id",
+            sa.UUID(as_uuid=True),
+            primary_key=True,
+            server_default=sa.text("gen_random_uuid()"),
+        ),
         sa.Column("vault_address", sa.Text(), nullable=False, index=True),
         sa.Column("market", sa.Text(), nullable=False),
         sa.Column("side", sa.Text(), nullable=False),
         sa.Column("size_usdc", sa.Numeric(precision=36, scale=18), nullable=False),
-        sa.Column("collateral_usdc", sa.Numeric(precision=36, scale=18), nullable=False),
+        sa.Column(
+            "collateral_usdc", sa.Numeric(precision=36, scale=18), nullable=False
+        ),
         sa.Column("entry_price", sa.Numeric(precision=36, scale=18), nullable=False),
         sa.Column("leverage", sa.Numeric(precision=10, scale=4), nullable=False),
-        sa.Column("is_open", sa.Boolean(), nullable=False, server_default=sa.text("true")),
+        sa.Column(
+            "is_open", sa.Boolean(), nullable=False, server_default=sa.text("true")
+        ),
         sa.Column("position_key", sa.Text(), nullable=True),
-        sa.Column("opened_at", sa.DateTime(timezone=True), nullable=False,
-                  server_default=sa.text("NOW()")),
+        sa.Column(
+            "opened_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.text("NOW()"),
+        ),
         sa.Column("closed_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False,
-                  server_default=sa.text("NOW()")),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.text("NOW()"),
+        ),
         schema="orchestrator",
     )
 
@@ -124,9 +174,19 @@ def upgrade() -> None:
     # -----------------------------------------------------------------------
     op.create_table(
         "trades",
-        sa.Column("id", sa.UUID(as_uuid=True), primary_key=True, server_default=sa.text("gen_random_uuid()")),
+        sa.Column(
+            "id",
+            sa.UUID(as_uuid=True),
+            primary_key=True,
+            server_default=sa.text("gen_random_uuid()"),
+        ),
         sa.Column("vault_address", sa.Text(), nullable=False),
-        sa.Column("session_id", sa.UUID(as_uuid=True), sa.ForeignKey("orchestrator.sessions.id"), nullable=False),
+        sa.Column(
+            "session_id",
+            sa.UUID(as_uuid=True),
+            sa.ForeignKey("orchestrator.sessions.id"),
+            nullable=False,
+        ),
         sa.Column("trade_hash", sa.Text(), nullable=False),
         sa.Column("order_key", sa.Text(), nullable=True),
         sa.Column("market", sa.Text(), nullable=False),
@@ -138,8 +198,12 @@ def upgrade() -> None:
         sa.Column("onchain_tx", sa.Text(), nullable=True),
         sa.Column("block_number", sa.BigInteger(), nullable=True),
         sa.Column("block_timestamp", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False,
-                  server_default=sa.text("NOW()")),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.text("NOW()"),
+        ),
         schema="orchestrator",
     )
 
@@ -187,9 +251,19 @@ def upgrade() -> None:
     # -----------------------------------------------------------------------
     op.create_table(
         "model_decisions",
-        sa.Column("id", sa.UUID(as_uuid=True), primary_key=True, server_default=sa.text("gen_random_uuid()")),
+        sa.Column(
+            "id",
+            sa.UUID(as_uuid=True),
+            primary_key=True,
+            server_default=sa.text("gen_random_uuid()"),
+        ),
         sa.Column("vault_address", sa.Text(), nullable=False, index=True),
-        sa.Column("session_id", sa.UUID(as_uuid=True), sa.ForeignKey("orchestrator.sessions.id"), nullable=False),
+        sa.Column(
+            "session_id",
+            sa.UUID(as_uuid=True),
+            sa.ForeignKey("orchestrator.sessions.id"),
+            nullable=False,
+        ),
         sa.Column("cycle_number", sa.Integer(), nullable=False),
         sa.Column("model_name", sa.Text(), nullable=False),
         sa.Column("raw_request", sa.dialects.postgresql.JSONB(), nullable=True),
@@ -199,8 +273,12 @@ def upgrade() -> None:
         sa.Column("response_latency_ms", sa.Integer(), nullable=True),
         sa.Column("validation_status", sa.Text(), nullable=True),
         sa.Column("validation_error", sa.Text(), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False,
-                  server_default=sa.text("NOW()")),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.text("NOW()"),
+        ),
         schema="orchestrator",
     )
 
@@ -210,19 +288,43 @@ def upgrade() -> None:
     # -----------------------------------------------------------------------
     op.create_table(
         "nav_snapshots",
-        sa.Column("id", sa.UUID(as_uuid=True), primary_key=True, server_default=sa.text("gen_random_uuid()")),
+        sa.Column(
+            "id",
+            sa.UUID(as_uuid=True),
+            primary_key=True,
+            server_default=sa.text("gen_random_uuid()"),
+        ),
         sa.Column("vault_address", sa.Text(), nullable=False),
-        sa.Column("session_id", sa.UUID(as_uuid=True), sa.ForeignKey("orchestrator.sessions.id"), nullable=False),
-        sa.Column("nav_per_token_1e18", sa.Numeric(precision=36, scale=0), nullable=False),
-        sa.Column("total_assets_usdc", sa.Numeric(precision=36, scale=18), nullable=False),
+        sa.Column(
+            "session_id",
+            sa.UUID(as_uuid=True),
+            sa.ForeignKey("orchestrator.sessions.id"),
+            nullable=False,
+        ),
+        sa.Column(
+            "nav_per_token_1e18", sa.Numeric(precision=36, scale=0), nullable=False
+        ),
+        sa.Column(
+            "total_assets_usdc", sa.Numeric(precision=36, scale=18), nullable=False
+        ),
         sa.Column("total_supply", sa.Numeric(precision=36, scale=0), nullable=True),
-        sa.Column("chainlink_eth_price", sa.Numeric(precision=36, scale=18), nullable=True),
-        sa.Column("chainlink_btc_price", sa.Numeric(precision=36, scale=18), nullable=True),
-        sa.Column("chainlink_sol_price", sa.Numeric(precision=36, scale=18), nullable=True),
+        sa.Column(
+            "chainlink_eth_price", sa.Numeric(precision=36, scale=18), nullable=True
+        ),
+        sa.Column(
+            "chainlink_btc_price", sa.Numeric(precision=36, scale=18), nullable=True
+        ),
+        sa.Column(
+            "chainlink_sol_price", sa.Numeric(precision=36, scale=18), nullable=True
+        ),
         sa.Column("block_number", sa.BigInteger(), nullable=True),
         sa.Column("block_timestamp", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False,
-                  server_default=sa.text("NOW()")),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.text("NOW()"),
+        ),
         schema="orchestrator",
     )
 
@@ -250,14 +352,28 @@ def upgrade() -> None:
     # -----------------------------------------------------------------------
     op.create_table(
         "model_status_log",
-        sa.Column("id", sa.UUID(as_uuid=True), primary_key=True, server_default=sa.text("gen_random_uuid()")),
+        sa.Column(
+            "id",
+            sa.UUID(as_uuid=True),
+            primary_key=True,
+            server_default=sa.text("gen_random_uuid()"),
+        ),
         sa.Column("vault_address", sa.Text(), nullable=False, index=True),
-        sa.Column("session_id", sa.UUID(as_uuid=True), sa.ForeignKey("orchestrator.sessions.id"), nullable=False),
+        sa.Column(
+            "session_id",
+            sa.UUID(as_uuid=True),
+            sa.ForeignKey("orchestrator.sessions.id"),
+            nullable=False,
+        ),
         sa.Column("status", sa.Text(), nullable=False),
         sa.Column("reason", sa.Text(), nullable=True),
         sa.Column("cycle_number", sa.Integer(), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False,
-                  server_default=sa.text("NOW()")),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.text("NOW()"),
+        ),
         schema="orchestrator",
     )
 
@@ -266,15 +382,24 @@ def upgrade() -> None:
     # -----------------------------------------------------------------------
     op.create_table(
         "event_log",
-        sa.Column("id", sa.UUID(as_uuid=True), primary_key=True, server_default=sa.text("gen_random_uuid()")),
+        sa.Column(
+            "id",
+            sa.UUID(as_uuid=True),
+            primary_key=True,
+            server_default=sa.text("gen_random_uuid()"),
+        ),
         sa.Column("event_type", sa.Text(), nullable=False),
         sa.Column("severity", sa.Text(), nullable=False, server_default="INFO"),
         sa.Column("source", sa.Text(), nullable=True),
         sa.Column("vault_address", sa.Text(), nullable=True),
         sa.Column("session_id", sa.UUID(as_uuid=True), nullable=True),
         sa.Column("payload", sa.dialects.postgresql.JSONB(), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False,
-                  server_default=sa.text("NOW()")),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.text("NOW()"),
+        ),
         schema="orchestrator",
     )
 
@@ -290,22 +415,29 @@ def upgrade() -> None:
         "CREATE INDEX ix_trades_brin ON orchestrator.trades "
         "USING BRIN (vault_address, block_timestamp)"
     )
-    op.execute(
-        "CREATE INDEX ix_trades_hash ON orchestrator.trades (trade_hash)"
-    )
+    op.execute("CREATE INDEX ix_trades_hash ON orchestrator.trades (trade_hash)")
 
     # -----------------------------------------------------------------------
     # 13. backend.websocket_sessions -- active WebSocket connections (ephemeral)
     # -----------------------------------------------------------------------
     op.create_table(
         "websocket_sessions",
-        sa.Column("id", sa.UUID(as_uuid=True), primary_key=True, server_default=sa.text("gen_random_uuid()")),
+        sa.Column(
+            "id",
+            sa.UUID(as_uuid=True),
+            primary_key=True,
+            server_default=sa.text("gen_random_uuid()"),
+        ),
         sa.Column("connection_id", sa.Text(), nullable=False, unique=True),
         sa.Column("channel", sa.Text(), nullable=False),
         sa.Column("wallet_address", sa.Text(), nullable=True),
         sa.Column("last_seq", sa.BigInteger(), nullable=False, server_default="0"),
-        sa.Column("connected_at", sa.DateTime(timezone=True), nullable=False,
-                  server_default=sa.text("NOW()")),
+        sa.Column(
+            "connected_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.text("NOW()"),
+        ),
         sa.Column("last_ping_at", sa.DateTime(timezone=True), nullable=True),
         schema="backend",
     )
@@ -315,10 +447,19 @@ def upgrade() -> None:
     # -----------------------------------------------------------------------
     op.create_table(
         "verifier_replay_log",
-        sa.Column("id", sa.UUID(as_uuid=True), primary_key=True, server_default=sa.text("gen_random_uuid()")),
+        sa.Column(
+            "id",
+            sa.UUID(as_uuid=True),
+            primary_key=True,
+            server_default=sa.text("gen_random_uuid()"),
+        ),
         sa.Column("journal_entry_id", sa.UUID(as_uuid=True), nullable=False),
-        sa.Column("replayed_at", sa.DateTime(timezone=True), nullable=False,
-                  server_default=sa.text("NOW()")),
+        sa.Column(
+            "replayed_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.text("NOW()"),
+        ),
         sa.Column("verdict", sa.Text(), nullable=False),
         sa.Column("original_cid", sa.Text(), nullable=True),
         sa.Column("replayed_response", sa.dialects.postgresql.JSONB(), nullable=True),
@@ -425,17 +566,11 @@ def downgrade() -> None:
     )
 
     # 17. Drop trigger function
-    op.execute(
-        "DROP FUNCTION IF EXISTS backend.refresh_model_state()"
-    )
+    op.execute("DROP FUNCTION IF EXISTS backend.refresh_model_state()")
 
     # 15-16. Drop materialized views
-    op.execute(
-        "DROP MATERIALIZED VIEW IF EXISTS backend.dashboard_model_state"
-    )
-    op.execute(
-        "DROP MATERIALIZED VIEW IF EXISTS backend.dashboard_session_state"
-    )
+    op.execute("DROP MATERIALIZED VIEW IF EXISTS backend.dashboard_model_state")
+    op.execute("DROP MATERIALIZED VIEW IF EXISTS backend.dashboard_session_state")
 
     # 14. Drop backend tables
     op.drop_table("verifier_replay_log", schema="backend")

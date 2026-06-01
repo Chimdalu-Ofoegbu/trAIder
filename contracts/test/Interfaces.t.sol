@@ -28,99 +28,160 @@ contract _VaultStub is IMTokenVault {
     // -------------------------------------------------------------------------
     // IERC20Metadata
     // -------------------------------------------------------------------------
-    function name() external pure returns (string memory) { return ""; }
-    function symbol() external pure returns (string memory) { return ""; }
-    function decimals() external pure returns (uint8) { return 18; }
+    function name() external pure returns (string memory) {
+        return "";
+    }
+
+    function symbol() external pure returns (string memory) {
+        return "";
+    }
+
+    function decimals() external pure returns (uint8) {
+        return 18;
+    }
 
     // -------------------------------------------------------------------------
     // IERC20
     // -------------------------------------------------------------------------
-    function totalSupply() external pure returns (uint256) { return 0; }
-    function balanceOf(address) external pure returns (uint256) { return 0; }
-    function allowance(address, address) external pure returns (uint256) { return 0; }
-    function approve(address, uint256) external pure returns (bool) { return false; }
-    function transfer(address, uint256) external pure returns (bool) { return false; }
-    function transferFrom(address, address, uint256) external pure returns (bool) { return false; }
+    function totalSupply() external pure returns (uint256) {
+        return 0;
+    }
+
+    function balanceOf(address) external pure returns (uint256) {
+        return 0;
+    }
+
+    function allowance(address, address) external pure returns (uint256) {
+        return 0;
+    }
+
+    function approve(address, uint256) external pure returns (bool) {
+        return false;
+    }
+
+    function transfer(address, uint256) external pure returns (bool) {
+        return false;
+    }
+
+    function transferFrom(address, address, uint256) external pure returns (bool) {
+        return false;
+    }
 
     // -------------------------------------------------------------------------
     // IERC4626 — asset info
     // -------------------------------------------------------------------------
-    function asset() external pure returns (address) { return address(0); }
-    function totalAssets() external pure returns (uint256) { return 0; }
+    function asset() external pure returns (address) {
+        return address(0);
+    }
+
+    function totalAssets() external pure returns (uint256) {
+        return 0;
+    }
 
     // -------------------------------------------------------------------------
     // IERC4626 — conversion
     // -------------------------------------------------------------------------
-    function convertToShares(uint256) external pure returns (uint256) { return 0; }
-    function convertToAssets(uint256) external pure returns (uint256) { return 0; }
+    function convertToShares(uint256) external pure returns (uint256) {
+        return 0;
+    }
+
+    function convertToAssets(uint256) external pure returns (uint256) {
+        return 0;
+    }
 
     // -------------------------------------------------------------------------
     // IERC4626 — deposit
     // -------------------------------------------------------------------------
-    function maxDeposit(address) external pure returns (uint256) { return 0; }
-    function previewDeposit(uint256) external pure returns (uint256) { return 0; }
-    function deposit(uint256, address) external pure returns (uint256) { return 0; }
+    function maxDeposit(address) external pure returns (uint256) {
+        return 0;
+    }
+
+    function previewDeposit(uint256) external pure returns (uint256) {
+        return 0;
+    }
+
+    function deposit(uint256, address) external pure returns (uint256) {
+        return 0;
+    }
 
     // -------------------------------------------------------------------------
     // IERC4626 — mint
     // -------------------------------------------------------------------------
-    function maxMint(address) external pure returns (uint256) { return 0; }
-    function previewMint(uint256) external pure returns (uint256) { return 0; }
-    function mint(uint256, address) external pure returns (uint256) { return 0; }
+    function maxMint(address) external pure returns (uint256) {
+        return 0;
+    }
+
+    function previewMint(uint256) external pure returns (uint256) {
+        return 0;
+    }
+
+    function mint(uint256, address) external pure returns (uint256) {
+        return 0;
+    }
 
     // -------------------------------------------------------------------------
     // IERC4626 — withdraw
     // -------------------------------------------------------------------------
-    function maxWithdraw(address) external pure returns (uint256) { return 0; }
-    function previewWithdraw(uint256) external pure returns (uint256) { return 0; }
-    function withdraw(uint256, address, address) external pure returns (uint256) { return 0; }
+    function maxWithdraw(address) external pure returns (uint256) {
+        return 0;
+    }
+
+    function previewWithdraw(uint256) external pure returns (uint256) {
+        return 0;
+    }
+
+    function withdraw(uint256, address, address) external pure returns (uint256) {
+        return 0;
+    }
 
     // -------------------------------------------------------------------------
     // IERC4626 — redeem
     // -------------------------------------------------------------------------
-    function maxRedeem(address) external pure returns (uint256) { return 0; }
-    function previewRedeem(uint256) external pure returns (uint256) { return 0; }
-    function redeem(uint256, address, address) external pure returns (uint256) { return 0; }
+    function maxRedeem(address) external pure returns (uint256) {
+        return 0;
+    }
+
+    function previewRedeem(uint256) external pure returns (uint256) {
+        return 0;
+    }
+
+    function redeem(uint256, address, address) external pure returns (uint256) {
+        return 0;
+    }
 
     // -------------------------------------------------------------------------
     // IMTokenVault — trAIder extensions
     // -------------------------------------------------------------------------
-    function nav() external pure returns (uint256) { return 0; }
+    function nav() external pure returns (uint256) {
+        return 0;
+    }
 
     function getStats() external pure returns (IPerformanceOracle.VaultStats memory stats) {
         // Return zero-value struct — compile proof only.
         return stats;
     }
 
-    function startSession(uint256) external pure { revert("stub"); }
-    function endSession() external pure { revert("stub"); }
+    function startSession(uint256) external pure {
+        revert("stub");
+    }
+
+    function endSession() external pure {
+        revert("stub");
+    }
 }
 
 /// @dev Minimal perps adapter stub — implements every method required by
 ///      IPerpsAdapter. All bodies return zero values or revert. COMPILE PROOF only.
 contract _PerpsStub is IPerpsAdapter {
-    function openLong(
-        string calldata,
-        uint256,
-        uint256,
-        uint256
-    ) external pure returns (bytes32) {
+    function openLong(string calldata, uint256, uint256, uint256) external pure returns (bytes32) {
         return bytes32(0);
     }
 
-    function openShort(
-        string calldata,
-        uint256,
-        uint256,
-        uint256
-    ) external pure returns (bytes32) {
+    function openShort(string calldata, uint256, uint256, uint256) external pure returns (bytes32) {
         return bytes32(0);
     }
 
-    function closePosition(
-        bytes32,
-        uint256
-    ) external pure returns (bytes32) {
+    function closePosition(bytes32, uint256) external pure returns (bytes32) {
         return bytes32(0);
     }
 
