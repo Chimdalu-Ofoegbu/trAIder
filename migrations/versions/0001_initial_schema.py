@@ -1,4 +1,4 @@
-"""Initial schema — orchestrator.* + backend.* tables, journal_state ENUM,
+"""Initial schema -- orchestrator.* + backend.* tables, journal_state ENUM,
 BRIN/B-tree indexes, materialized views, and NAV refresh trigger.
 
 Revision ID: 0001
@@ -7,7 +7,7 @@ Create Date: 2026-06-01 00:00:00.000000
 
 Design decisions implemented here (D-19 / D-20 / D-21 / D-22):
   - Every op carries explicit schema= ("orchestrator" or "backend").
-  - BRIN indexes, materialized views, ENUMs, triggers → op.execute() (hand-written).
+  - BRIN indexes, materialized views, ENUMs, triggers -> op.execute() (hand-written).
   - journal_entries is the three-phase-commit state machine (D-21).
   - UNIQUE(vault_address, order_key) is the idempotency key for journal recovery.
   - CRITICAL (D-21): `submitted` state persists onchain_tx BEFORE broadcast.
@@ -16,9 +16,12 @@ Design decisions implemented here (D-19 / D-20 / D-21 / D-22):
     (not regular views) because backend reads them repeatedly per WS tick.
   - The trigger on orchestrator.nav_snapshots refreshes dashboard_model_state
     on every insert, keeping the WS snapshot current.
+  - Tables that reference orchestrator.journal_state ENUM use raw op.execute()
+    DDL to avoid SQLAlchemy sa.Enum emitting a spurious CREATE TYPE in offline
+    (--sql) mode even when create_type=False is set.
 
 downgrade() reverses in dependency order:
-  trigger → function → mat-views → backend tables → orchestrator tables → ENUM
+  trigger -> function -> mat-views -> backend tables -> orchestrator tables -> ENUM
 """
 
 from typing import Sequence, Union
@@ -35,11 +38,11 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     # -----------------------------------------------------------------------
-    # 1. journal_state ENUM — must be created BEFORE journal_entries table.
+    # 1. journal_state ENUM -- must be created BEFORE journal_entries table.
     #    Seven states for the three-phase-commit state machine (D-21):
-    #      pending_pin  → pinned_primary → pinned_backup → signed
-    #                   → submitted → recorded (terminal)
-    #                              ↘ failed    (terminal)
+    #      pending_pin  -> pinned_primary -> pinned_backup -> signed
+    #                   -> submitted -> recorded (terminal)
+    #                              -> failed    (terminal)
     # -----------------------------------------------------------------------
     op.execute(
         """
@@ -56,7 +59,7 @@ def upgrade() -> None:
     )
 
     # -----------------------------------------------------------------------
-    # 2. orchestrator.sessions — top-level 72-hour trading session
+    # 2. orchestrator.sessions -- top-level 72-hour trading session
     # -----------------------------------------------------------------------
     op.create_table(
         "sessions",
@@ -75,7 +78,7 @@ def upgrade() -> None:
     )
 
     # -----------------------------------------------------------------------
-    # 3. orchestrator.vaults — per-model ERC-4626 vault
+    # 3. orchestrator.vaults -- per-model ERC-4626 vault
     # -----------------------------------------------------------------------
     op.create_table(
         "vaults",
@@ -94,7 +97,7 @@ def upgrade() -> None:
     )
 
     # -----------------------------------------------------------------------
-    # 4. orchestrator.positions — open perpetual positions per vault
+    # 4. orchestrator.positions -- open perpetual positions per vault
     # -----------------------------------------------------------------------
     op.create_table(
         "positions",
@@ -117,7 +120,7 @@ def upgrade() -> None:
     )
 
     # -----------------------------------------------------------------------
-    # 5. orchestrator.trades — executed trades (immutable, append-only)
+    # 5. orchestrator.trades -- executed trades (immutable, append-only)
     # -----------------------------------------------------------------------
     op.create_table(
         "trades",
@@ -141,60 +144,46 @@ def upgrade() -> None:
     )
 
     # -----------------------------------------------------------------------
-    # 6. orchestrator.journal_entries — three-phase-commit state machine (D-21)
+    # 6. orchestrator.journal_entries -- three-phase-commit state machine (D-21)
     #
     #    CRITICAL: `submitted` state must persist onchain_tx BEFORE broadcast.
     #    Recovery: query chain for tx status before resubmit.
     #    Never blindly resubmit a `submitted` entry (risk of double-execution).
     #
     #    Idempotency key: UNIQUE(vault_address, order_key)
+    #
+    #    Using raw op.execute() to reference orchestrator.journal_state ENUM
+    #    directly. SQLAlchemy sa.Enum(create_type=False) still emits CREATE TYPE
+    #    in offline (--sql) mode; raw DDL avoids that spurious statement.
     # -----------------------------------------------------------------------
-    op.create_table(
-        "journal_entries",
-        sa.Column("id", sa.UUID(as_uuid=True), primary_key=True, server_default=sa.text("gen_random_uuid()")),
-        sa.Column("vault_address", sa.Text(), nullable=False),
-        sa.Column("order_key", sa.Text(), nullable=False),
-        sa.Column("trade_hash", sa.Text(), nullable=True),
-        # state uses the journal_state ENUM type in the orchestrator schema
-        sa.Column(
-            "state",
-            sa.Enum(
-                "pending_pin",
-                "pinned_primary",
-                "pinned_backup",
-                "signed",
-                "submitted",
-                "recorded",
-                "failed",
-                name="journal_state",
-                schema="orchestrator",
-                create_type=False,  # already created above via op.execute
-            ),
-            nullable=False,
-            server_default="pending_pin",
-        ),
-        sa.Column("raw_request", sa.dialects.postgresql.JSONB(), nullable=True),
-        sa.Column("raw_response", sa.dialects.postgresql.JSONB(), nullable=True),
-        sa.Column("canonical_decision", sa.dialects.postgresql.JSONB(), nullable=True),
-        sa.Column("pinata_cid", sa.Text(), nullable=True),
-        sa.Column("web3_storage_cid", sa.Text(), nullable=True),
-        sa.Column("operator_sig", sa.Text(), nullable=True),
-        # CRITICAL (D-21): onchain_tx must be persisted BEFORE broadcast.
+    op.execute(
+        """
+        CREATE TABLE orchestrator.journal_entries (
+            id                  UUID DEFAULT gen_random_uuid() NOT NULL PRIMARY KEY,
+            vault_address       TEXT NOT NULL,
+            order_key           TEXT NOT NULL,
+            trade_hash          TEXT,
+            state               orchestrator.journal_state NOT NULL DEFAULT 'pending_pin',
+            raw_request         JSONB,
+            raw_response        JSONB,
+            canonical_decision  JSONB,
+            pinata_cid          TEXT,
+            web3_storage_cid    TEXT,
+            operator_sig        TEXT,
+            onchain_tx          TEXT,
+            attempt_count       SMALLINT NOT NULL DEFAULT 0,
+            last_error          TEXT,
+            created_at          TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
+            updated_at          TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
+            CONSTRAINT uq_journal_vault_order UNIQUE (vault_address, order_key)
+        )
+        """
+        # CRITICAL (D-21): `submitted` state must persist onchain_tx BEFORE broadcast.
         # On recovery: query chain for this tx before resubmitting.
-        sa.Column("onchain_tx", sa.Text(), nullable=True),
-        sa.Column("attempt_count", sa.SmallInteger(), nullable=False, server_default="0"),
-        sa.Column("last_error", sa.Text(), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False,
-                  server_default=sa.text("NOW()")),
-        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False,
-                  server_default=sa.text("NOW()")),
-        # Idempotency constraint — prevents duplicate submissions on restart.
-        sa.UniqueConstraint("vault_address", "order_key", name="uq_journal_vault_order"),
-        schema="orchestrator",
     )
 
     # -----------------------------------------------------------------------
-    # 7. orchestrator.model_decisions — raw LLM decision payloads per cycle
+    # 7. orchestrator.model_decisions -- raw LLM decision payloads per cycle
     # -----------------------------------------------------------------------
     op.create_table(
         "model_decisions",
@@ -216,7 +205,7 @@ def upgrade() -> None:
     )
 
     # -----------------------------------------------------------------------
-    # 8. orchestrator.nav_snapshots — NAV time-series (append-only, D-20)
+    # 8. orchestrator.nav_snapshots -- NAV time-series (append-only, D-20)
     #    BRIN index on (vault_address, block_timestamp) added below.
     # -----------------------------------------------------------------------
     op.create_table(
@@ -238,40 +227,26 @@ def upgrade() -> None:
     )
 
     # -----------------------------------------------------------------------
-    # 9. orchestrator.journal_state_log — append-only transition history (debug-only)
+    # 9. orchestrator.journal_state_log -- append-only transition history (debug-only)
     #    NOT a source of truth; used only for debugging state machine transitions.
+    #    Uses op.execute to reference orchestrator.journal_state ENUM directly.
     # -----------------------------------------------------------------------
-    op.create_table(
-        "journal_state_log",
-        sa.Column("id", sa.UUID(as_uuid=True), primary_key=True, server_default=sa.text("gen_random_uuid()")),
-        sa.Column("journal_entry_id", sa.UUID(as_uuid=True),
-                  sa.ForeignKey("orchestrator.journal_entries.id"), nullable=False),
-        sa.Column(
-            "from_state",
-            sa.Enum(
-                "pending_pin", "pinned_primary", "pinned_backup", "signed",
-                "submitted", "recorded", "failed",
-                name="journal_state", schema="orchestrator", create_type=False,
-            ),
-            nullable=True,
-        ),
-        sa.Column(
-            "to_state",
-            sa.Enum(
-                "pending_pin", "pinned_primary", "pinned_backup", "signed",
-                "submitted", "recorded", "failed",
-                name="journal_state", schema="orchestrator", create_type=False,
-            ),
-            nullable=False,
-        ),
-        sa.Column("transitioned_at", sa.DateTime(timezone=True), nullable=False,
-                  server_default=sa.text("NOW()")),
-        sa.Column("note", sa.Text(), nullable=True),
-        schema="orchestrator",
+    op.execute(
+        """
+        CREATE TABLE orchestrator.journal_state_log (
+            id              UUID DEFAULT gen_random_uuid() NOT NULL PRIMARY KEY,
+            journal_entry_id UUID NOT NULL
+                REFERENCES orchestrator.journal_entries (id),
+            from_state      orchestrator.journal_state,
+            to_state        orchestrator.journal_state NOT NULL,
+            transitioned_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
+            note            TEXT
+        )
+        """
     )
 
     # -----------------------------------------------------------------------
-    # 10. orchestrator.model_status_log — paused/malformed model state (ORCH-06)
+    # 10. orchestrator.model_status_log -- paused/malformed model state (ORCH-06)
     # -----------------------------------------------------------------------
     op.create_table(
         "model_status_log",
@@ -287,7 +262,7 @@ def upgrade() -> None:
     )
 
     # -----------------------------------------------------------------------
-    # 11. orchestrator.event_log — structured operational logs (D-69)
+    # 11. orchestrator.event_log -- structured operational logs (D-69)
     # -----------------------------------------------------------------------
     op.create_table(
         "event_log",
@@ -304,7 +279,7 @@ def upgrade() -> None:
     )
 
     # -----------------------------------------------------------------------
-    # 12. BRIN indexes (D-20) — cheap range scans on append-only time-series.
+    # 12. BRIN indexes (D-20) -- cheap range scans on append-only time-series.
     #     B-tree on trades(trade_hash) for journal lookups.
     # -----------------------------------------------------------------------
     op.execute(
@@ -320,7 +295,7 @@ def upgrade() -> None:
     )
 
     # -----------------------------------------------------------------------
-    # 13. backend.websocket_sessions — active WebSocket connections (ephemeral)
+    # 13. backend.websocket_sessions -- active WebSocket connections (ephemeral)
     # -----------------------------------------------------------------------
     op.create_table(
         "websocket_sessions",
@@ -336,7 +311,7 @@ def upgrade() -> None:
     )
 
     # -----------------------------------------------------------------------
-    # 14. backend.verifier_replay_log — verifier CLI replay results
+    # 14. backend.verifier_replay_log -- verifier CLI replay results
     # -----------------------------------------------------------------------
     op.create_table(
         "verifier_replay_log",
@@ -352,7 +327,7 @@ def upgrade() -> None:
     )
 
     # -----------------------------------------------------------------------
-    # 15. backend.dashboard_model_state — MATERIALIZED VIEW
+    # 15. backend.dashboard_model_state -- MATERIALIZED VIEW
     #     Updated by the refresh trigger on orchestrator.nav_snapshots.
     #     Phase 0: minimal SELECT covering the data the WS CurrentState snapshot needs.
     #     Phase 5 enriches with position/trade aggregates.
@@ -386,7 +361,7 @@ def upgrade() -> None:
     )
 
     # -----------------------------------------------------------------------
-    # 16. backend.dashboard_session_state — MATERIALIZED VIEW
+    # 16. backend.dashboard_session_state -- MATERIALIZED VIEW
     #     Session-level aggregates for the Coliseum header row.
     # -----------------------------------------------------------------------
     op.execute(
@@ -407,7 +382,7 @@ def upgrade() -> None:
     )
 
     # -----------------------------------------------------------------------
-    # 17. backend.refresh_model_state() — trigger function that refreshes the
+    # 17. backend.refresh_model_state() -- trigger function that refreshes the
     #     dashboard_model_state mat-view whenever a NAV snapshot is inserted.
     #     Non-concurrent refresh is fine for Phase 0 (no UNIQUE index on the
     #     mat-view to enable CONCURRENTLY; add one in Phase 5 if needed).
@@ -428,7 +403,7 @@ def upgrade() -> None:
 
     # -----------------------------------------------------------------------
     # 18. Trigger: AFTER INSERT on orchestrator.nav_snapshots
-    #     → calls backend.refresh_model_state()
+    #     -> calls backend.refresh_model_state()
     # -----------------------------------------------------------------------
     op.execute(
         """
@@ -442,7 +417,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     # Reverse in strict dependency order:
-    # trigger → function → mat-views → backend tables → orchestrator tables → ENUM
+    # trigger -> function -> mat-views -> backend tables -> orchestrator tables -> ENUM
 
     # 18. Drop trigger
     op.execute(
@@ -466,16 +441,13 @@ def downgrade() -> None:
     op.drop_table("verifier_replay_log", schema="backend")
     op.drop_table("websocket_sessions", schema="backend")
 
-    # 12. Drop indexes (dropped implicitly when tables are dropped, but listed for clarity)
-    # orchestrator.trades and orchestrator.nav_snapshots indexes are dropped with tables below.
-
     # 11. Drop orchestrator tables in reverse FK order
     op.drop_table("event_log", schema="orchestrator")
     op.drop_table("model_status_log", schema="orchestrator")
-    op.drop_table("journal_state_log", schema="orchestrator")
+    op.execute("DROP TABLE IF EXISTS orchestrator.journal_state_log")
     op.drop_table("nav_snapshots", schema="orchestrator")
     op.drop_table("model_decisions", schema="orchestrator")
-    op.drop_table("journal_entries", schema="orchestrator")
+    op.execute("DROP TABLE IF EXISTS orchestrator.journal_entries")
     op.drop_table("trades", schema="orchestrator")
     op.drop_table("positions", schema="orchestrator")
     op.drop_table("vaults", schema="orchestrator")
