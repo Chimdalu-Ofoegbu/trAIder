@@ -18,7 +18,9 @@
 4. [Journal Recovery](#4-journal-recovery)
 5. [Session Start and Settlement](#5-session-start-and-settlement)
 6. [Demo-Day Minute-by-Minute Timetable](#6-demo-day-minute-by-minute-timetable)
-7. [Known Issues and Gotchas](#7-known-issues-and-gotchas)
+7. [Rate-Limit Applications (ORCH-09)](#7-rate-limit-applications-orch-09)
+8. [Judging Window (DEPLOY-04)](#8-judging-window-deploy-04)
+9. [Known Issues and Gotchas](#9-known-issues-and-gotchas)
 
 ---
 
@@ -257,13 +259,139 @@ ORDER BY created_at ASC;
 
 ---
 
-## 7. Known Issues and Gotchas
+## 7. Rate-Limit Applications (ORCH-09)
+
+> **Filled in by:** Plan 00-07 (D-18 — submit within 48h of Phase 0 start)
+>
+> **Status:** Justification drafted (Task 1). Awaiting operator submissions (Task 2).
+
+### D-18 Math Summary
+
+- Decision cycle: 60 seconds per model
+- Session duration: 72 hours
+- Peak calls per model: 3 models × 1 call/60s × 3600s/hr = **~60 calls/hr** sustained;
+  accounting for retries and multi-turn requests, budget for **~90 calls/hr/model peak**
+- Apply for the tier above **~135 calls/hr per model** (90 + 50% headroom)
+- Submit within 48h of Phase 0 start (ASAP — Anthropic requires 2-5 business days)
+
+### Reusable Application Justification
+
+> Copy-paste this text into each provider's rate-limit or tier-increase request form.
+
+```
+Project: trAIder — AI Trading Performance Speculation Protocol
+Use case: 72-hour autonomous trading session, hackathon submission for Arbitrum Open
+  House (ETHGlobal London), three frontier LLMs (claude-opus-4-7, gpt-5.1,
+  gemini-3.1-pro-preview) executing crypto perpetuals trading decisions on identical
+  prompts with 60-second decision cycles.
+Request: Elevated rate limit / tier upgrade to support ~135 calls/hr per model
+  (90/hr sustained peak + 50% headroom for retries during a single 72-hour window).
+Timeline: Session is live June 2026. Approval needed before session start.
+Determinism note (Anthropic only): temperature parameter is intentionally omitted
+  (Claude Opus 4.7 adaptive sampling; IPFS-journaled replay is semantic-match, not
+  byte-exact).
+```
+
+Model strings (exact — use these on the console forms):
+
+- Anthropic: `claude-opus-4-7`
+- OpenAI: `gpt-5.1`
+- Google: `gemini-3.1-pro-preview`
+
+### Per-Provider Checklist
+
+#### Anthropic
+
+- [ ] **Submitted:** \_\_\_\_\_\_\_\_\_\_\_\_\_\_\_ (date, e.g. 2026-06-01)
+- [ ] **Confirmation ID / ticket:** \_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_
+- [ ] **Approved (estimated):** 2-5 business days after submission
+- [ ] **Approved (actual):** \_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_
+
+**Where to submit:** Anthropic Console → Account → Rate Limits → Request Increase
+
+#### OpenAI
+
+- [ ] **Submitted:** \_\_\_\_\_\_\_\_\_\_\_\_\_\_\_ (date)
+- [ ] **Confirmation ID / ticket:** \_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_
+- [ ] **Spend-gated tier auto-upgraded?** (yes / no) \_\_\_\_\_\_\_\_\_\_
+- [ ] **Manual increase requested?** (yes / no) \_\_\_\_\_\_\_\_\_\_
+- [ ] **Approved (actual):** \_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_
+
+**Where to submit:** platform.openai.com → Settings → Limits → Request Increase
+
+#### Google (Gemini)
+
+- [ ] **Submitted:** \_\_\_\_\_\_\_\_\_\_\_\_\_\_\_ (date)
+- [ ] **Confirmation ID / ticket:** \_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_
+- [ ] **Paid tier enabled?** (yes / no) \_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_
+- [ ] **Quota increase requested?** (yes / no) \_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_
+- [ ] **Approved (actual):** \_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_\_
+
+**Where to submit:** Google AI Studio → Settings → Billing & Quotas; or
+Google Cloud Console → APIs & Services → Gemini API → Quotas → Request Increase
+
+---
+
+## 8. Judging Window (DEPLOY-04)
+
+> **Filled in by:** Plan 00-07 (DEPLOY-04 — Phase 0 exit gate)
+>
+> **Status:** Event dates confirmed (public). Operator must select target window (Task 2).
+
+### Confirmed Arbitrum Open House London Dates
+
+| Phase   | Description                         | Dates                  |
+| ------- | ----------------------------------- | ---------------------- |
+| Phase 1 | Buildathon (submission window)      | May 25 – June 14, 2026 |
+| Phase 2 | Founder House (selected teams only) | July 10–12, 2026       |
+
+**Source:** openhouse.arbitrum.io + Arbitrum blog (verified 2026-06-01)
+
+### Operator Decision Required
+
+The 72-hour live session must be timed to overlap with judging. Choose ONE:
+
+- **Option A — Phase 1 review (post-submission):** Session starts shortly after
+  June 14 submission, during the review period. Judges can verify the live session
+  is running or review recordings + onchain data. Reverse-computed session start:
+  **~June 14–16, 2026** (exact timing TBD by operator).
+
+- **Option B — Phase 2 Founder House (Jul 10–12):** Session runs DURING the
+  Founder House event in London, providing a live on-screen demo. Requires team
+  selection into Phase 2. Reverse-computed session start: **~July 9, 2026** (start
+  72h before Founder House opens).
+
+### Record Your Selection Here (OPERATOR — fill in after Task 2)
+
+```
+Target judging window:  [ ] Option A (post-Jun-14 review)
+                        [ ] Option B (Jul 10-12 Founder House)
+
+If Option A:
+  Session start (target): ____-__-__ (YYYY-MM-DD)
+  Session end (target):   ____-__-__ (+72h)
+
+If Option B:
+  Session start (target): 2026-07-09 (recommended)
+  Session end (target):   2026-07-12
+
+Confirmed by:        ____-__-__ (date operator made this decision)
+Blocker (if not confirmed): confirmed-by: ____-__-__ (date by which decision is needed)
+```
+
+> **Phase 0 exit gate:** This section satisfies DEPLOY-04 when EITHER a confirmed
+> window is recorded above OR a concrete "confirmed-by: \<date\>" blocker is logged
+> in STATE.md. Leaving it blank does NOT satisfy the gate.
+
+---
+
+## 9. Known Issues and Gotchas
 
 > **Append-only log.** Add new issues in reverse chronological order (newest first).
 > Never delete or edit existing entries — update by adding a new entry.
 >
 > **Note:** ORCH-09 rate-limit confirmations and DEPLOY-04 judging window confirmations
-> will be recorded in this section as they are resolved.
+> are now tracked in sections 7 and 8 above.
 
 ---
 
