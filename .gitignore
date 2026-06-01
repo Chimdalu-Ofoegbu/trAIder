@@ -1,0 +1,74 @@
+# =============================================================================
+# trAIder — root .gitignore
+# CRITICAL: this file must be in the FIRST git commit so no .env.* is ever
+# tracked (SEC-01 / Pitfall 5). .gitignore precedes any key file.
+# =============================================================================
+
+# ── Secrets (NEVER commit) ───────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+.env.local
+.env.deployer
+.env.operator-trade
+.env.operator-journal
+.env.gas
+
+# ── Foundry / Contracts ──────────────────────────────────────────────────────
+contracts/out/
+contracts/cache/
+contracts/.cache/
+broadcast/*/31337/
+broadcast/*/421614/
+# keep lib/ submodules but ignore any cached downloads
+contracts/lib/.cache/
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.venv/
+venv/
+.venv*/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+
+# ── Node / Frontend ──────────────────────────────────────────────────────────
+node_modules/
+.next/
+out/
+frontend/.next/
+frontend/out/
+frontend/node_modules/
+.turbo/
+*.tsbuildinfo
+
+# ── OS / Editor ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── Logs / Temp ──────────────────────────────────────────────────────────────
+*.log
+*.tmp
+*.temp
+tmp/
+
+# ── Docker ───────────────────────────────────────────────────────────────────
+# docker volumes and local state — never tracked
+.docker/
