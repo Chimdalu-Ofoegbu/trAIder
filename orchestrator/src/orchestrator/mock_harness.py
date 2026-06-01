@@ -292,7 +292,8 @@ async def run_cycle(
         return {"status": "ok", "action": "hold"}
 
     # ── Step 5: Submit to MockPerps ───────────────────────────────────────────
-    deployer = web3.eth.accounts[0]
+    accounts = await web3.eth.accounts
+    deployer = accounts[0]
     size_usd_1e30 = int(decision.sizeUsd * 1e30)
     leverage_1e4 = int(decision.leverage * 10_000)
     slippage_bps = 50  # 0.5% slippage — ignored by mock
@@ -337,7 +338,8 @@ async def run_cycle(
     # ── Step 6: Store pending journal row (before rolling blocks) ────────────
     # Placeholder order_key — replaced with the real key after OrderExecuted.
     # Using tx_hash as a surrogate until OrderExecuted is observed (D-02 semantics).
-    pending_order_key = tx_hash.hex() if hasattr(tx_hash, "hex") else str(tx_hash)
+    raw_tx = tx_hash.hex() if hasattr(tx_hash, "hex") else str(tx_hash)
+    pending_order_key = raw_tx if raw_tx.startswith("0x") else "0x" + raw_tx
 
     if db is not None:
         await record_journal_pending(
@@ -415,7 +417,9 @@ async def run_cycle(
         return {
             "status": "liquidated",
             "order_key": order_key_hex,
-            "tx_hash": exec_tx.hex() if hasattr(exec_tx, "hex") else str(exec_tx),
+            "tx_hash": ("0x" + exec_tx.hex())
+            if hasattr(exec_tx, "hex") and not str(exec_tx).startswith("0x")
+            else str(exec_tx),
             "block_number": exec_block,
         }
 
@@ -423,7 +427,9 @@ async def run_cycle(
     position_key = event["args"]["positionKey"]
 
     # ── Step 8: record_trade (D-02: on OrderExecuted, not on open receipt) ───
-    exec_tx_hex = exec_tx.hex() if hasattr(exec_tx, "hex") else str(exec_tx)
+    # HexBytes.hex() returns without 0x prefix — ensure 0x-prefixed output
+    raw_hex = exec_tx.hex() if hasattr(exec_tx, "hex") else str(exec_tx)
+    exec_tx_hex = raw_hex if raw_hex.startswith("0x") else "0x" + raw_hex
     trade_hash = None
     if db is not None:
         trade_hash = await record_trade(
