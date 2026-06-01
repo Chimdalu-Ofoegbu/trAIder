@@ -1,0 +1,4 @@
+{
+  "_harness_marker": "timeout",
+  "_reason": "Simulates a provider timeout: the harness treats any fixture with _harness_marker=timeout as a provider timeout failure (ORCH-06 path). No trade is produced."
+}

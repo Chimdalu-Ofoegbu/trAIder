@@ -1,0 +1,9 @@
+{
+  "market": "BTC",
+  "side": "short",
+  "sizeUsd": 3000,
+  "leverage": 1.5,
+  "rationale": "BTC showing weakness",
+  "confidence": 0.6,
+  "expectedHoldingPeriod": "medium"
+}

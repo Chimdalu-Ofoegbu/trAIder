@@ -1,0 +1,10 @@
+{
+  "action": "open",
+  "market": "ETH",
+  "side": "long",
+  "sizeUsd": 5000,
+  "leverage": 2,
+  "rationale": "ETH momentum is strong with RSI indicating oversold conditions. Opening a long position to capture upside in the current trend.",
+  "confidence": 0.75,
+  "expectedHoldingPeriod": "short"
+}
