@@ -1,0 +1,138 @@
+# =============================================================================
+# trAIder — dev stack (D-34 / D-37)
+#
+# Services: postgres:16 + redis:7-alpine + anvil (Arbitrum fork) + pgadmin
+# All services have healthchecks. Dependents use condition: service_healthy.
+# Apps (orchestrator, backend, frontend) run natively on the host via uv/pnpm.
+#
+# Usage:
+#   make up          → bring up all services (waits for healthy)
+#   make seed        → run alembic + USDC/ETH seed + optional MockPerps deploy
+#   make verify-stack → assert post-seed state
+#   make down        → stop + remove containers (preserves named volumes)
+#   make reset       → down (remove volumes) → up → seed → verify-stack
+# =============================================================================
+
+version: "3.9"
+
+services:
+
+  # ── Postgres 16 ─────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: traider-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: traider
+      POSTGRES_USER: traider
+      POSTGRES_PASSWORD: traider
+      # Bootstrap restricted roles (migrator_user, orchestrator_user, backend_user)
+      # Real passwords must be set in the production .env; dev uses defaults below.
+      POSTGRES_INITDB_ARGS: "--auth-local=scram-sha-256"
+    env_file:
+      - path: .env.example
+        required: false
+    ports:
+      - "5432:5432"
+    volumes:
+      - traider-pgdata:/var/lib/postgresql/data
+      - ./scripts/postgres-init.sql:/docker-entrypoint-initdb.d/01-roles.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U traider -d traider"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # ── Redis 7 ─────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: traider-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+    ports:
+      - "6379:6379"
+    volumes:
+      - traider-redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  # ── Anvil (Arbitrum mainnet fork at pinned block) ────────────────────────────
+  # Image: ghcr.io/foundry-rs/foundry:latest (Alpine — no curl; cast ships in image)
+  # Healthcheck uses `cast block-number` to assert fork-completion (D-37).
+  # ARB_RPC + FORK_BLOCK must be set (see .env.example).
+  anvil:
+    image: ghcr.io/foundry-rs/foundry:latest
+    container_name: traider-anvil
+    restart: unless-stopped
+    entrypoint:
+      - anvil
+      - --fork-url
+      - ${ARB_RPC:-https://arb1.arbitrum.io/rpc}
+      - --fork-block-number
+      - ${FORK_BLOCK:-353000000}
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8545"
+      - --block-time
+      - "2"
+      - --accounts
+      - "10"
+      - --chain-id
+      - "31337"
+    ports:
+      - "8545:8545"
+    healthcheck:
+      # cast ships in the Foundry Alpine image (D-37 — no curl available by default)
+      # Assert block-number >= FORK_BLOCK to confirm fork-chain is ready, not just process up.
+      test:
+        - "CMD-SHELL"
+        - >
+          BLOCK=$(cast block-number --rpc-url http://localhost:8545 2>/dev/null) &&
+          [ -n "$$BLOCK" ] && [ "$$BLOCK" -ge "${FORK_BLOCK:-353000000}" ]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+
+  # ── pgadmin (web UI — depends on postgres service_healthy) ───────────────────
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: traider-pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@traider.local
+      PGADMIN_DEFAULT_PASSWORD: traider
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+    ports:
+      - "5050:80"
+    volumes:
+      - traider-pgadmin:/var/lib/pgadmin
+      - ./scripts/pgadmin-servers.json:/pgadmin4/servers.json:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:80/misc/ping || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+# ── Named volumes ─────────────────────────────────────────────────────────────
+volumes:
+  traider-pgdata:
+    name: traider-pgdata
+  traider-redisdata:
+    name: traider-redisdata
+  traider-pgadmin:
+    name: traider-pgadmin

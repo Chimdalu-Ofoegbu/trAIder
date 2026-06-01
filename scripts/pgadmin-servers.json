@@ -1,0 +1,14 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "trAIder Dev",
+      "Group": "Servers",
+      "Host": "postgres",
+      "Port": 5432,
+      "MaintenanceDB": "traider",
+      "Username": "traider",
+      "SSLMode": "prefer",
+      "PassFile": "/pgpass"
+    }
+  }
+}
