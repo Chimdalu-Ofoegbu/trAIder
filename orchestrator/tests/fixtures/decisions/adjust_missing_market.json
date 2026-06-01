@@ -1,0 +1,9 @@
+{
+  "action": "adjust",
+  "side": "short",
+  "sizeUsd": 3000,
+  "leverage": 1.5,
+  "rationale": "reducing exposure",
+  "confidence": 0.5,
+  "expectedHoldingPeriod": "medium"
+}

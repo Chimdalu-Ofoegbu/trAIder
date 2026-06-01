@@ -1,0 +1,8 @@
+{
+  "action": "hold",
+  "sizeUsd": 0,
+  "leverage": 1,
+  "rationale": "no clear signal",
+  "confidence": 0.3,
+  "expectedHoldingPeriod": "short"
+}

@@ -15,7 +15,7 @@ import json
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # ---------------------------------------------------------------------------
 # Canonical schema — loaded once at import time
@@ -86,6 +86,27 @@ class Decision(BaseModel):
 
     # stopLoss / takeProfit: DEFERRED (D-06) — not part of Phase 0 schema.
     # Do not add until Phase 1 operator decision.
+
+    # --- Cross-field validators (D-05, CR-02) ---
+
+    @model_validator(mode="after")
+    def _require_market_and_side_for_open_adjust(self) -> Decision:
+        """
+        Enforce the cross-field contract documented in schema.json:
+          open / adjust  →  market AND side are required.
+          close / hold   →  both may be omitted.
+
+        A missing market or side on open/adjust raises ValueError so the harness
+        routes the response to the ORCH-05 'malformed' path (no trade, no journal).
+        Without this guard, None-market crashes ABI encoding and None-side silently
+        opens a SHORT (the directional-integrity bug for the fairness seam, CR-02).
+        """
+        if self.action in ("open", "adjust"):
+            if self.market is None:
+                raise ValueError("market is required for open/adjust actions")
+            if self.side is None:
+                raise ValueError("side is required for open/adjust actions")
+        return self
 
 
 # ---------------------------------------------------------------------------

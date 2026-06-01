@@ -1,0 +1,8 @@
+{
+  "action": "close",
+  "sizeUsd": 0,
+  "leverage": 1,
+  "rationale": "taking profits",
+  "confidence": 0.8,
+  "expectedHoldingPeriod": "short"
+}
