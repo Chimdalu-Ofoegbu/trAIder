@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://traider.build/schemas/decision/v1",
+  "title": "TraderDecision",
+  "description": "Canonical decision schema emitted by each model every cycle. Frozen at Phase 0 — do not modify once Phase 1 begins (IFACE-03).",
+  "type": "object",
+  "required": ["action", "sizeUsd", "leverage", "rationale", "confidence", "expectedHoldingPeriod"],
+  "properties": {
+    "action": {
+      "enum": ["open", "close", "hold", "adjust"],
+      "description": "Trade action to execute. 'hold' means no position change this cycle."
+    },
+    "market": {
+      "enum": ["ETH", "BTC", "SOL"],
+      "description": "Perpetual market to trade. Required for open/close/adjust; omit on hold."
+    },
+    "side": {
+      "enum": ["long", "short"],
+      "description": "Direction. Required for open/adjust; omit on close and hold."
+    },
+    "sizeUsd": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Notional position size in USD (post-leverage). 0 on hold or close."
+    },
+    "leverage": {
+      "type": "number",
+      "minimum": 1,
+      "maximum": 3,
+      "description": "Leverage multiplier. Hard cap: 3x (CLAUDE.md constraint). 1 on hold."
+    },
+    "rationale": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2000,
+      "description": "Step-by-step reasoning. Stored verbatim in the journal for verifier replay."
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "Model's self-assessed confidence in this decision (0 = no conviction, 1 = maximum)."
+    },
+    "expectedHoldingPeriod": {
+      "enum": ["short", "medium", "long"],
+      "description": "Expected holding duration: short (<4h), medium (4-24h), long (>24h)."
+    }
+  },
+  "additionalProperties": true,
+  "$comment": "VALIDATION VARIANT — additionalProperties:true for forward-compat (D-08). Extra fields are stored verbatim in the journal but ignored for trade execution. See schema.py:strict_provider_schema() for the provider-strict variant. sl/tp fields are DEFERRED (D-06)."
+}
