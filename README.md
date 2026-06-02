@@ -2,7 +2,7 @@
 
 A speculation-market protocol on live AI trading performance.
 
-Three frontier LLMs (Claude Opus 4.7, GPT-5.1, Gemini 3.1 Pro) autonomously trade crypto perpetuals on GMX over 72-hour sessions with operator-provided capital. Each model is wrapped in an ERC-4626 vault; speculators trade per-model mTOKEN against USDC on Camelot. A permissionless arbitrage primitive keeps the AMM price anchored to vault NAV — structurally equivalent to ETF Authorized Participants pegging ETF prices to NAV, applied to live AI trading performance as the underlying.
+Three frontier LLMs (Claude Opus 4.7, GPT-5.5, Gemini 3.1 Pro) autonomously trade crypto perpetuals on GMX over 72-hour sessions with operator-provided capital. Each model is wrapped in an ERC-4626 vault; speculators trade per-model mTOKEN against USDC on Camelot. A permissionless arbitrage primitive keeps the AMM price anchored to vault NAV — structurally equivalent to ETF Authorized Participants pegging ETF prices to NAV, applied to live AI trading performance as the underlying.
 
 **Core value:** A live, verifiable, tradeable market on which frontier LLM trades crypto better — with onchain NAV-pegged price discovery and replayable per-trade audit logs.
 

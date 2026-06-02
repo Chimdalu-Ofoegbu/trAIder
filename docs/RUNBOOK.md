@@ -266,11 +266,9 @@ ORDER BY created_at ASC;
 > **Status:** RESOLVED. All three providers are on spend-activated tiers, confirmed ACTIVE
 > as of 2026-06-01. No support tickets or 2–5 day approvals were required. ORCH-09 CLOSED.
 
-> **Model string reconciliation note (OpenAI):** The operator's active OpenAI model is
-> `gpt-5.5-2026-04-23`, which differs from `gpt-5.1` currently referenced in CLAUDE.md,
-> `orchestrator/prompts/system.md`, and RESEARCH.md. Reconciliation of the model string
-> across those files is required in a follow-up plan — it is OUT OF SCOPE for Plan 00-07
-> and those files are not touched here.
+> **Model string reconciliation note (OpenAI):** Active model is `gpt-5.5-2026-04-23`.
+> All live code and forward-looking docs have been reconciled to this string (2026-06-02).
+> Historical SUMMARY/PLAN audit records intentionally preserved with original `gpt-5.1` references.
 
 ### Demo Sizing Rationale
 
@@ -308,8 +306,7 @@ ORDER BY created_at ASC;
 
 **Status:** ACTIVE (operator's own account). No application required.
 
-**Model string note:** Active model is `gpt-5.5-2026-04-23`. CLAUDE.md / prompts /
-RESEARCH.md currently reference `gpt-5.1`. Reconciliation required in a follow-up plan.
+**Model string note:** Active model is `gpt-5.5-2026-04-23`. Reconciled across all live code and forward-looking docs as of 2026-06-02.
 
 #### Google — `gemini-3.1-pro-preview` (Paid Tier 1, activated via $15 deposit)
 

@@ -4,7 +4,7 @@
 // Phase 0: skeleton export only. Store slices ship in Phase 5 (FRONT-02).
 //
 // Architecture (D-40..D-43):
-//   - One slice per vault (Claude, GPT-5.1, Gemini) — mirrors ws/vault/{addr}
+//   - One slice per vault (Claude, GPT-5.5, Gemini) — mirrors ws/vault/{addr}
 //   - One global slice — mirrors ws/global
 //   - All live push data (WS) flows through Zustand
 //   - All REST / request-response data flows through TanStack Query

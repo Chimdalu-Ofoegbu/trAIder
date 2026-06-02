@@ -21,7 +21,7 @@ dependencies = [
 # Phase 2 provider SDKs — uncomment when live LLM loop lands (D-14)
 # NOTE: pin floors verified against PyPI on 2026-06-01 (see 00-RESEARCH.md Standard Stack)
 # "anthropic>=0.105",         # Claude Opus 4.7 — NO temperature param (400 error)
-# "openai>=2.38",             # GPT-5.1 — use reasoning_effort="none" for speed
+# "openai>=2.38",             # GPT-5.5 (gpt-5.5-2026-04-23) — use reasoning_effort="none" for speed
 # "google-genai>=2.7",        # Gemini 3.1 Pro — from google import genai (NOT google-generativeai)
 
 [project.optional-dependencies]

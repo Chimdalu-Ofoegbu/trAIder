@@ -64,12 +64,12 @@ response = client.messages.create(
 The verifier reports `SEMANTIC_MATCH` (decision payload equivalent) vs `MISMATCH` (payload differs),
 not byte equality. See `D-75` and verifier design in Phase 5.
 
-### OpenAI — gpt-5.1
+### OpenAI — gpt-5.5-2026-04-23
 
 ```python
 # Structured output with json_schema strict mode
 response = client.chat.completions.create(
-    model="gpt-5.1",
+    model="gpt-5.5-2026-04-23",
     temperature=0,
     seed=DETERMINISTIC_SEED,          # enables best-effort determinism
     reasoning_effort="none",           # omit reasoning overhead for fast trading decisions
@@ -136,7 +136,7 @@ These are observability and verifier metadata only. They have no influence on tr
 | Model | API String |
 |-------|-----------|
 | Anthropic | `claude-opus-4-7` |
-| OpenAI | `gpt-5.1` |
+| OpenAI | `gpt-5.5-2026-04-23` |
 | Google | `gemini-3.1-pro-preview` |
 
 ---

@@ -1,4 +1,4 @@
-{# IDENTICAL across claude-opus-4-7 / gpt-5.1 / gemini-3.1-pro-preview — no model-specific tuning (ORCH-04/D-72) #}
+{# IDENTICAL across claude-opus-4-7 / gpt-5.5-2026-04-23 / gemini-3.1-pro-preview — no model-specific tuning (ORCH-04/D-72) #}
 
 ## Role
 

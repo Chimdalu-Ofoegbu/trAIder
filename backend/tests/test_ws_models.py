@@ -210,7 +210,7 @@ class TestModelStatus:
     def test_json_round_trip(self) -> None:
         event = ModelStatus(
             vault_address="0xV",
-            model="gpt-5.1",
+            model="gpt-5.5-2026-04-23",
             status=ModelStatusEnum.malformed,
             consecutive_failures=3,
         )
@@ -389,7 +389,7 @@ class TestEnvelope:
     def test_nullable_chain_fields_for_operational_events(self) -> None:
         status = ModelStatus(
             vault_address="0xV",
-            model="gpt-5.1",
+            model="gpt-5.5-2026-04-23",
             status=ModelStatusEnum.paused,
             consecutive_failures=1,
         )
