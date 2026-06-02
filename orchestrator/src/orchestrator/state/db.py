@@ -140,7 +140,7 @@ async def record_trade(
                  market, side, action, size_usdc, entry_price, pnl_usdc,
                  onchain_tx, block_number, block_timestamp, created_at)
             VALUES
-                (:id, :vault_address, :session_id::uuid, :trade_hash, :order_key,
+                (:id, :vault_address, CAST(:session_id AS uuid), :trade_hash, :order_key,
                  :market, :side, :action, :size_usdc, :entry_price, :pnl_usdc,
                  :onchain_tx, :block_number, :block_timestamp, :created_at)
             """
@@ -209,7 +209,7 @@ async def record_journal_pending(
                  created_at, updated_at)
             VALUES
                 (:id, :vault_address, :order_key, :trade_hash, 'pending_pin',
-                 :raw_request::jsonb, :raw_response::jsonb, :canonical_decision::jsonb,
+                 CAST(:raw_request AS jsonb), CAST(:raw_response AS jsonb), CAST(:canonical_decision AS jsonb),
                  :created_at, :updated_at)
             ON CONFLICT (vault_address, order_key) DO NOTHING
             """
@@ -268,7 +268,7 @@ async def record_model_status(
             INSERT INTO orchestrator.model_status_log
                 (id, vault_address, session_id, status, reason, cycle_number, created_at)
             VALUES
-                (:id, :vault_address, :session_id::uuid, :status, :reason,
+                (:id, :vault_address, CAST(:session_id AS uuid), :status, :reason,
                  :cycle_number, :created_at)
             """
         ),

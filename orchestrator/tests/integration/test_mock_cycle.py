@@ -219,6 +219,22 @@ async def test_MockCycle_GoodFixture_EndToEnd(mock_perps, anvil_w3):
 
             engine = get_engine(db_url)
             async with AsyncSession(engine) as session:
+                # Arrange: seed the parent session row so the trades.session_id FK
+                # (trades_session_id_fkey -> orchestrator.sessions.id) is satisfied.
+                # A real session-start creates this row; the E2E must do the same.
+                # Idempotent (ON CONFLICT DO NOTHING) so re-runs stay clean.
+                await session.execute(
+                    text(
+                        "INSERT INTO orchestrator.sessions (id, session_key) "
+                        "VALUES (CAST(:sid AS uuid), :skey) "
+                        "ON CONFLICT (id) DO NOTHING"
+                    ),
+                    {
+                        "sid": "00000000-0000-0000-0000-000000000001",
+                        "skey": "e2e-mock-cycle-0001",
+                    },
+                )
+                await session.commit()
                 await record_trade(
                     session,
                     vault_address=vault,
