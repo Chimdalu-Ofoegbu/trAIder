@@ -452,3 +452,128 @@ async def test_CR01_MultiCycle_OrderKeyIsFromCurrentOrder(mock_perps, anvil_w3):
         "Cycle 1 order should still be pending after cycle 2 — event-parse does not "
         "accidentally execute or modify the cycle-1 order"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 9: Full integrated E2E — run_cycle writes to Postgres AND publishes the
+# TradeEvent envelope to the vault's Redis channel (closes the MOCK-02 Redis leg
+# that the anvil-only good-fixture test leaves at redis=None).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_MockCycle_GoodFixture_PublishesTradeEventToRedis(mock_perps, anvil_w3):
+    """run_cycle, given a LIVE db + redis, records a trade AND publishes a TradeEvent
+    envelope to ws/vault/{vault} (D-23/D-26). This drives the integrated harness path
+    end-to-end — the Redis-publish leg the anvil-only good-fixture test cannot cover.
+
+    Skips inline when Postgres or Redis is unreachable so the suite still runs on an
+    anvil-only machine.
+    """
+    import json
+
+    contract, mock_perps_addr, deployer, rpc_url = mock_perps
+    vault = deployer
+    session_id = "00000000-0000-0000-0000-000000000009"
+
+    db_url = os.environ.get("ORCHESTRATOR_DATABASE_URL") or os.environ.get("DATABASE_URL", "")
+    if not db_url:
+        pytest.skip(
+            "ORCHESTRATOR_DATABASE_URL/DATABASE_URL not set — Redis-publish E2E needs Postgres"
+        )
+
+    try:
+        import redis.asyncio as aioredis
+    except ImportError:
+        pytest.skip("redis package not installed")
+
+    from backend.ws.channels import channel_for
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from orchestrator.mock_harness import run_cycle
+    from orchestrator.state.db import get_engine
+
+    if "+psycopg" in db_url:
+        db_url = db_url.replace("+psycopg", "+asyncpg", 1)
+
+    redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379")
+    try:
+        rclient = aioredis.from_url(redis_url, socket_connect_timeout=2, socket_timeout=2)
+        await rclient.ping()
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"Redis not reachable at {redis_url}: {exc}")
+
+    trade_channel = channel_for("TradeEvent", vault_address=vault)
+    pubsub = rclient.pubsub()
+    await pubsub.subscribe(trade_channel)
+
+    engine = get_engine(db_url)
+    try:
+        async with AsyncSession(engine) as session:
+            # Seed the parent session row so trades_session_id_fkey is satisfied.
+            await session.execute(
+                text(
+                    "INSERT INTO orchestrator.sessions (id, session_key) "
+                    "VALUES (CAST(:sid AS uuid), :skey) ON CONFLICT (id) DO NOTHING"
+                ),
+                {"sid": session_id, "skey": "e2e-redis-publish-0009"},
+            )
+            await session.commit()
+
+            result = await run_cycle(
+                anvil_w3,
+                contract,
+                vault,
+                "claude",
+                1,
+                db=session,
+                redis=rclient,
+                session_id=session_id,
+                seq=1,
+                roll_blocks=True,
+            )
+
+        assert result["status"] == "ok", f"Expected status=ok, got {result}"
+        order_key = result.get("order_key")
+        assert order_key, "run_cycle returned no order_key on the good path"
+
+        # Collect the published TradeEvent envelope (poll up to ~10s).
+        received = None
+        for _ in range(50):
+            msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.2)
+            if msg and msg.get("type") == "message":
+                data = msg["data"]
+                if isinstance(data, bytes | bytearray):
+                    data = data.decode()
+                env = json.loads(data)
+                if env.get("event_type") == "TradeEvent":
+                    received = env
+                    break
+
+        assert received is not None, (
+            f"No TradeEvent envelope received on {trade_channel} — the Redis publish "
+            "leg of run_cycle did not fire."
+        )
+        # Envelope shape (D-26) + payload links back to this cycle's order (D-23 routing).
+        assert received["seq"] == 1, f"Envelope seq mismatch: {received.get('seq')}"
+        payload = received["payload"]
+        assert payload["order_key"].lower() == order_key.lower(), (
+            "TradeEvent payload order_key must match the executed order"
+        )
+        assert payload["vault_address"].lower() == vault.lower(), (
+            "TradeEvent must be routed to the correct vault channel/payload"
+        )
+
+        # And the trade row was persisted (DB leg of the same integrated cycle).
+        async with AsyncSession(engine) as verify_session:
+            row = await verify_session.execute(
+                text("SELECT trade_hash FROM orchestrator.trades WHERE order_key = :ok"),
+                {"ok": order_key},
+            )
+            assert row.fetchone() is not None, f"Expected a trades row for order_key={order_key}"
+    finally:
+        await pubsub.unsubscribe(trade_channel)
+        await pubsub.aclose()
+        await rclient.aclose()
+        await engine.dispose()
