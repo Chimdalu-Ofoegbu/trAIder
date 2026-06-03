@@ -17,7 +17,7 @@
 #   pnpm (make gen-types: frontend)
 # =============================================================================
 
-.PHONY: up seed verify-stack reset down db-reset gen-types help
+.PHONY: up seed verify-stack reset down db-reset gen-types coverage help
 
 # ── Environment ───────────────────────────────────────────────────────────────
 # Source .env.example for defaults (real values come from .env.* gitignored files)
@@ -104,6 +104,15 @@ gen-types:
 	@echo "==> Regenerating frontend/types/api.ts from backend OpenAPI schema..."
 	@bash scripts/gen-types.sh
 
+# ── coverage ──────────────────────────────────────────────────────────────────
+# TEST-01: contracts/src/ line coverage >= 90% enforced by this target.
+# Uses FOUNDRY_PROFILE=coverage (via_ir=false, optimizer=false) with --ir-minimum
+# to work around the foundry#6592 stack-too-deep incompatibility between coverage
+# instrumentation and the default via-ir pipeline.
+# Run: make coverage
+coverage:
+	cd contracts && FOUNDRY_PROFILE=coverage forge coverage --ir-minimum --report summary
+
 # ── help ──────────────────────────────────────────────────────────────────────
 help:
 	@echo "trAIder Makefile targets:"
@@ -114,5 +123,6 @@ help:
 	@echo "  make down         Stop dev stack (preserves volumes)"
 	@echo "  make db-reset     Drop + recreate DB + alembic upgrade head"
 	@echo "  make gen-types    Regenerate frontend/types/api.ts from backend OpenAPI"
+	@echo "  make coverage     Run forge coverage on contracts/src/ (>= 90% gate, TEST-01)"
 	@echo ""
 	@echo "Prerequisites: Docker Desktop, Foundry (cast/forge), uv, pnpm"

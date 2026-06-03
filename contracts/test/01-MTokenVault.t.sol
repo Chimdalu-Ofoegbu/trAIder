@@ -751,4 +751,163 @@ contract MTokenVaultTest is Test {
         assertApproxEqAbs(assets, depositAmt, 1, "redeem must return approximately the deposited USDC");
         assertGt(usdc.balanceOf(user), usdcBefore, "user USDC must increase after redeem");
     }
+
+    // =========================================================================
+    // Coverage top-ups — reach >= 90% line coverage on contracts/src/ (TEST-01)
+    // =========================================================================
+
+    /// @notice Proves mint() (shares-based) succeeds and returns assets ≤ deposited (VAULT-01 roundtrip).
+    ///         mint() is the ERC-4626 counterpart to deposit() — takes shares, returns assets paid.
+    ///         This exercises the mint() code path which is distinct from deposit().
+    function test_Mint_Shares_RoundtripAssets() public {
+        // First deposit so totalSupply > 0, giving mint() a meaningful conversion.
+        vm.prank(user);
+        vault.deposit(1000e6, user);
+
+        // Approve a fresh amount for the mint
+        usdc.mint(user, 500e6);
+        vm.prank(user);
+        usdc.approve(address(vault), 500e6);
+
+        // Mint exactly 100e18 shares — must succeed and return the assets consumed.
+        vm.prank(user);
+        uint256 assetsPaid = vault.mint(100e18, user);
+        assertGt(assetsPaid, 0, "mint() must consume USDC");
+        assertGt(vault.balanceOf(user), 0, "user must have shares after mint()");
+    }
+
+    /// @notice Proves openShort() succeeds with valid leverage and returns a non-zero orderKey.
+    ///         Complements test_LeverageCap_Short_Reverts_Above3x() with the success path.
+    function test_OpenShort_Succeeds_ValidLeverage() public {
+        vm.prank(orchestrator);
+        bytes32 key = vault.openShort("ETH", 1000e30, 20_000, 30);
+        assertNotEq(key, bytes32(0), "openShort at 2x must return a non-zero orderKey");
+    }
+
+    /// @notice Proves staleness escalation auto-pauses the session when elapsed > ESCALATION_THRESHOLD.
+    ///         Also proves staleness recovery clears the stale state when feeds return fresh.
+    ///         Exercises the "escalate" branch in _checkAndUpdateStaleness and the clear branch.
+    function test_Staleness_Escalation_PausesSession_ThenRecovery() public {
+        vm.prank(user);
+        vault.deposit(1000e6, user);
+
+        // Make ETH feed stale (exceeds ESCALATION_THRESHOLD = 10 minutes after GRACE_WINDOW).
+        // Set updatedAt to a time that is MAX_STALENESS_ETH + ESCALATION_THRESHOLD + GRACE_WINDOW + 1 ago.
+        uint256 staleAge = vault.MAX_STALENESS_ETH() + vault.ESCALATION_THRESHOLD() + vault.GRACE_WINDOW() + 1;
+        uint256 staleAt = block.timestamp - staleAge;
+        ethFeed.setPriceAt(ETH_PRICE_8DEC, staleAt);
+
+        // A deposit attempt (calls _checkAndUpdateStaleness) will now: set _stalenessCrossedAt,
+        // see elapsed > ESCALATION_THRESHOLD, set _sessionPaused = true, emit OracleStale("escalate").
+        // The deposit itself will revert at _requireFreshNavForMint() (MintBlockedStaleFeed).
+        vm.prank(user);
+        usdc.mint(user, 100e6);
+        vm.prank(user);
+        usdc.approve(address(vault), 100e6);
+        vm.prank(user);
+        vm.expectRevert(MTokenVault.MintBlockedStaleFeed.selector);
+        vault.deposit(100e6, user);
+
+        // Confirm staleness state was updated (_stalenessCrossedAt != 0) by checking mint is blocked.
+        // (We can't read _stalenessCrossedAt directly since it's private; the MintBlockedStaleFeed
+        // revert confirms _stalenessCrossedAt > 0.)
+
+        // Recovery: refresh all feeds to fresh timestamps.
+        ethFeed.setPrice(ETH_PRICE_8DEC);
+        btcFeed.setPrice(BTC_PRICE_8DEC);
+        solFeed.setPrice(SOL_PRICE_8DEC);
+
+        // A deposit now should succeed: _checkAndUpdateStaleness sees all fresh,
+        // clears _stalenessCrossedAt and _sessionPaused, refreshes _lastGoodNavE18.
+        usdc.mint(user, 200e6);
+        vm.prank(user);
+        usdc.approve(address(vault), 200e6);
+        vm.prank(user);
+        uint256 shares = vault.deposit(100e6, user); // must not revert after recovery
+        assertGt(shares, 0, "deposit must succeed after staleness recovery");
+    }
+
+    /// @notice Proves _maxStalenessFor returns MAX_STALENESS_BTC for the BTC feed specifically.
+    ///         Exercises the BTC_FEED branch in _maxStalenessFor (distinct from ETH and SOL).
+    ///         Vault deployed with useSepoliaStaleness=false so per-feed MAX_STALENESS is used.
+    function test_Staleness_BtcFeed_UsesCorrectMaxStaleness() public {
+        // Warp to a timestamp large enough to avoid underflow when subtracting MAX_STALENESS_BTC.
+        // MAX_STALENESS_BTC = 90000s; we need block.timestamp > MAX_STALENESS_BTC.
+        vm.warp(200_000); // 200_000 >> 90_000 — no underflow possible
+
+        // Refresh all Chainlink feeds to the new block.timestamp.
+        ethFeed.setPrice(ETH_PRICE_8DEC);
+        btcFeed.setPrice(BTC_PRICE_8DEC);
+        solFeed.setPrice(SOL_PRICE_8DEC);
+
+        vm.prank(user);
+        vault.deposit(1000e6, user);
+
+        // Make only BTC feed stale by MAX_STALENESS_BTC + 1 seconds.
+        // block.timestamp (200_000) - MAX_STALENESS_BTC (90_000) - 1 = 109_999 — no underflow.
+        uint256 btcStaleAt = block.timestamp - vault.MAX_STALENESS_BTC() - 1;
+        btcFeed.setPriceAt(BTC_PRICE_8DEC, btcStaleAt);
+        // Keep ETH and SOL feeds fresh.
+        ethFeed.setPrice(ETH_PRICE_8DEC);
+        solFeed.setPrice(SOL_PRICE_8DEC);
+
+        // Mint must revert — BTC feed stale triggers MintBlockedStaleFeed.
+        usdc.mint(user, 100e6);
+        vm.prank(user);
+        usdc.approve(address(vault), 100e6);
+        vm.prank(user);
+        vm.expectRevert(MTokenVault.MintBlockedStaleFeed.selector);
+        vault.deposit(100e6, user);
+
+        // Burn must succeed — BTC staleness does not block withdraws (burn-live invariant).
+        vm.prank(user);
+        vault.withdraw(100e6, user, user);
+    }
+
+    /// @notice Proves settlementClosePosition routes to the adapter correctly when called by settlement.
+    ///         Exercises the settlement-gated drain hook in mTokenVault.
+    function test_SettlementClosePosition_SucceedsAsSettlement() public {
+        vm.prank(user);
+        vault.deposit(1000e6, user);
+
+        // Open a long position.
+        vm.prank(orchestrator);
+        bytes32 orderKey = vault.openLong("ETH", 1000e30, 20_000, 30);
+
+        // Execute the open order.
+        vm.roll(block.number + perps.executionDelay());
+        perps.executeOrder(orderKey);
+
+        // Clear the trading lock.
+        vm.prank(orchestrator);
+        vault.clearTradingLock(orderKey);
+
+        // Retrieve positionKey.
+        (bytes32 posKey,,,,) = perps.pendingOrders(orderKey);
+        assertNotEq(posKey, bytes32(0), "positionKey must be non-zero");
+
+        // settlementClosePosition is gated to the settlement address.
+        vm.prank(stranger);
+        vm.expectRevert("Vault: not settlement");
+        vault.settlementClosePosition(posKey, 0);
+
+        // Settlement can call it.
+        vm.prank(settlement);
+        bytes32 closeKey = vault.settlementClosePosition(posKey, 0);
+        assertNotEq(closeKey, bytes32(0), "settlementClosePosition must return a non-zero closeKey");
+    }
+
+    /// @notice Proves maxWithdraw returns 0 post-sessionEnded for all users (not just operator).
+    ///         Exercises the sessionEnded branch in maxWithdraw/maxRedeem (VAULT-08 extension).
+    function test_MaxWithdrawRedeem_Zero_PostSessionEnd() public {
+        vm.prank(user);
+        vault.deposit(1000e6, user);
+
+        vm.prank(sessionFactory);
+        vault.endSession();
+
+        // Both maxWithdraw and maxRedeem must return 0 post-session for all users.
+        assertEq(vault.maxWithdraw(user), 0, "maxWithdraw must be 0 post-sessionEnded");
+        assertEq(vault.maxRedeem(user), 0, "maxRedeem must be 0 post-sessionEnded");
+    }
 }
