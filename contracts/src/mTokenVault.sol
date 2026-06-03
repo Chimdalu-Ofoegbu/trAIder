@@ -340,12 +340,20 @@ contract MTokenVault is ERC4626, ReentrancyGuardTransient, IMTokenVault {
     /// @dev Computes NAV from current totalAssets/totalSupply. Pure view — no storage writes.
     ///      Returns INITIAL_NAV_E18 when totalSupply is 0 (Pitfall 2 — no division by zero,
     ///      circuit breaker floor = 0.3e18 relative to the constant, not a snapshot).
+    ///
+    ///      NAV formula: totalAssets (6-dec USDC) * 10^_decimalsOffset() * 1e18 / totalSupply (18-dec shares)
+    ///        = totalAssets * 1e12 * 1e18 / totalSupply = totalAssets * 1e30 / totalSupply.
+    ///      Derivation at 1:1 seed (1000 USDC / 1000e18 shares):
+    ///        = 1000e6 * 1e12 * 1e18 / 1000e18 = 1e9 * 1e30 / 1e21 = 1e18 ✓
+    ///      The offset factor (1e12 = 10^_decimalsOffset()) normalises USDC 6-dec to the 18-dec
+    ///      share decimal so that nav() == INITIAL_NAV_E18 at a true 1:1 USDC/mTOKEN NAV.
     function _computeNav() internal view returns (uint256) {
         uint256 supply = totalSupply();
         if (supply == 0) return INITIAL_NAV_E18;
-        // NAV = totalAssets (6-dec USDC) * 1e18 / totalSupply (18-dec shares)
-        // Result is 1e18-scaled: at 1:1 seed (1 USDC per share), nav() == 1e18.
-        return Math.mulDiv(totalAssets(), 1e18, supply);
+        // Scale: totalAssets is 6-dec; shares are 18-dec. To express NAV in 1e18-scaled USD/share:
+        //   nav = totalAssets * 10^offset * 1e18 / totalSupply (where offset = 12 for USDC)
+        // Using 1e30 = 10^12 * 1e18. Math.mulDiv handles overflow safely.
+        return Math.mulDiv(totalAssets(), 1e30, supply);
     }
 
     /// @dev Updates the per-block NAV cache from state-changing paths.
@@ -479,6 +487,18 @@ contract MTokenVault is ERC4626, ReentrancyGuardTransient, IMTokenVault {
             _mintPaused = true;
             emit CircuitBreakerTripped(currentNavE18, INITIAL_NAV_E18);
         }
+    }
+
+    /// @notice Permissionless circuit-breaker latch: anyone can call this to evaluate NAV
+    ///         and permanently set _mintPaused if nav < 30% of INITIAL_NAV_E18.
+    /// @dev Necessary because the CB check inside deposit() cannot persist state when the
+    ///      transaction reverts. This function SUCCEEDS (does not revert), so state changes
+    ///      persist. After this call, deposit() will hit `require(!_mintPaused)` and revert.
+    ///      If NAV is healthy, this is a no-op. If CB already tripped, this is a no-op.
+    ///      Callable by anyone — permissionless safety valve (no privilege escalation risk:
+    ///      setting _mintPaused can only BLOCK minting, it cannot drain funds or create tokens).
+    function checkAndLatchCircuitBreaker() external {
+        _checkCircuitBreaker(_computeNav());
     }
 
     // =========================================================================
