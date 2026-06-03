@@ -188,6 +188,10 @@ contract _PerpsStub is IPerpsAdapter {
     function positionValueUSDC(address) external pure returns (uint256) {
         return 0;
     }
+
+    function getOpenPositionKeys(address) external pure returns (bytes32[] memory) {
+        return new bytes32[](0);
+    }
 }
 
 // =============================================================================

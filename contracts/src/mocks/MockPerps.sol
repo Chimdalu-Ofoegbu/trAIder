@@ -292,6 +292,36 @@ contract MockPerps is IPerpsAdapter, Ownable {
     }
 
     // =========================================================================
+    // IPerpsAdapter — position enumeration (SETT-01)
+    // =========================================================================
+
+    /// @notice Returns all open (non-closed) position keys held by `vault`.
+    /// @dev SettlementContract.endSession uses this to enumerate positions for the
+    ///      in-contract drain (SETT-01). Filters out closed positions so the
+    ///      settlement loop does not attempt to re-close already-closed keys.
+    /// @param vault The mTokenVault address whose open position keys to return.
+    /// @return keys Array of open (non-closed) position keys for the vault.
+    function getOpenPositionKeys(address vault) external view override returns (bytes32[] memory keys) {
+        bytes32[] storage allKeys = vaultPositionKeys[vault];
+        uint256 len = allKeys.length;
+
+        // First pass: count open positions
+        uint256 openCount;
+        for (uint256 i = 0; i < len; i++) {
+            if (!positions[allKeys[i]].closed) openCount++;
+        }
+
+        // Second pass: populate result array
+        keys = new bytes32[](openCount);
+        uint256 idx;
+        for (uint256 i = 0; i < len; i++) {
+            if (!positions[allKeys[i]].closed) {
+                keys[idx++] = allKeys[i];
+            }
+        }
+    }
+
+    // =========================================================================
     // IPerpsAdapter — NAV feed (D-03)
     // =========================================================================
 

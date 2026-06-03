@@ -122,4 +122,18 @@ interface IPerpsAdapter {
     /// @param vault The mTokenVault address whose open positions to value.
     /// @return uint256 Total position value in USDC (6 decimals).
     function positionValueUSDC(address vault) external view returns (uint256);
+
+    // =========================================================================
+    // Position enumeration — settlement drain (SETT-01)
+    // =========================================================================
+
+    /// @notice Returns all open (non-closed) position keys held by `vault`.
+    /// @dev Used by SettlementContract.endSession to enumerate positions for the
+    ///      in-contract drain (SETT-01). Only returns keys for positions that are
+    ///      not yet closed so the settlement loop can call closePosition on each.
+    ///      Venue implementations maintain this list per-vault (e.g., GMXAdapter
+    ///      queries the Reader; MockPerps reads vaultPositionKeys storage).
+    /// @param vault The mTokenVault address whose open position keys to return.
+    /// @return keys Array of open position keys for the vault.
+    function getOpenPositionKeys(address vault) external view returns (bytes32[] memory keys);
 }

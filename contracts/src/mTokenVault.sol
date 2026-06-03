@@ -726,6 +726,25 @@ contract MTokenVault is ERC4626, ReentrancyGuardTransient, IMTokenVault {
     }
 
     // =========================================================================
+    // Settlement drain hook (SETT-01)
+    // =========================================================================
+
+    /// @notice Closes a single open perpetuals position on behalf of the SettlementContract.
+    /// @dev Gated to the registered settlement address (SETT-01). The settlement contract
+    ///      calls this in its endSession drain loop — it cannot call the adapter directly
+    ///      because the adapter gates on msg.sender == pos.vault (the vault IS the position
+    ///      owner). This function bridges that call: settlement → vault → adapter (vault is
+    ///      msg.sender to the adapter). Does NOT set _tradingLocked — settlement drains all
+    ///      positions in one loop without needing per-order lock tracking.
+    /// @param positionKey The position identifier from the prior OrderExecuted event.
+    /// @param sizeUsd     USD amount to close, 1e30-scaled (pass 0 for full close in mock).
+    /// @return orderKey   Unique order key for async tracking.
+    function settlementClosePosition(bytes32 positionKey, uint256 sizeUsd) external returns (bytes32 orderKey) {
+        require(msg.sender == settlement, "Vault: not settlement");
+        return IPerpsAdapter(adapter).closePosition(positionKey, sizeUsd);
+    }
+
+    // =========================================================================
     // Stats (IMTokenVault, ORACLE-01)
     // =========================================================================
 

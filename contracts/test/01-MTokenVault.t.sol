@@ -54,6 +54,10 @@ contract ControlledAdapter is IPerpsAdapter {
     function closePosition(bytes32, uint256) external override returns (bytes32) {
         return bytes32(0);
     }
+
+    function getOpenPositionKeys(address) external pure override returns (bytes32[] memory) {
+        return new bytes32[](0);
+    }
 }
 
 // =========================================================================
