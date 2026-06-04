@@ -78,10 +78,10 @@ load_address() {
 # ── Step 1: Alembic migrations (UNCONDITIONAL) ────────────────────────────────
 echo "[1/5] Running Alembic migrations (alembic upgrade head)..."
 if command -v uv &>/dev/null; then
-    (cd "${REPO_ROOT}" && DATABASE_URL="${DB_URL}" uv run alembic -c migrations/alembic.ini upgrade head)
+    (cd "${REPO_ROOT}" && DATABASE_URL="${DB_URL}" uv run --project orchestrator alembic -c migrations/alembic.ini upgrade head)
 else
     echo "[WARN] uv not found — attempting python fallback"
-    (cd "${REPO_ROOT}" && DATABASE_URL="${DB_URL}" python -m alembic -c migrations/alembic.ini upgrade head)
+    (cd "${REPO_ROOT}/orchestrator" && DATABASE_URL="${DB_URL}" python -m alembic -c ../migrations/alembic.ini upgrade head)
 fi
 echo "[1/5] Alembic migrations complete."
 echo ""

@@ -96,7 +96,7 @@ db-reset:
 	PGPASSWORD=traider psql -h localhost -p 5432 -U traider -c "CREATE DATABASE traider OWNER traider;" postgres 2>/dev/null || true
 	@echo "==> Database recreated. Running alembic upgrade head..."
 	DATABASE_URL=postgresql+psycopg://migrator_user:migrator_pass@localhost:5432/traider \
-		uv run alembic -c migrations/alembic.ini upgrade head
+		uv run --project orchestrator alembic -c migrations/alembic.ini upgrade head
 	@echo "==> db-reset complete."
 
 # ── gen-types ─────────────────────────────────────────────────────────────────
