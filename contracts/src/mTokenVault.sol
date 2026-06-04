@@ -155,6 +155,13 @@ contract MTokenVault is ERC4626, ReentrancyGuardTransient, IMTokenVault {
     /// @dev Timestamp when the first feed crossed its MAX_STALENESS (0 = not stale).
     uint256 private _stalenessCrossedAt;
 
+    /// @dev Last successfully-read adapter position value (USDC, 6 decimals).
+    ///      Updated every time positionValueUSDC() succeeds on a state-changing path.
+    ///      Used as last-known-good fallback in totalAssets() when the adapter reverts
+    ///      (e.g., stale Chainlink feed inside the adapter). Implements CONTRACTS-08:
+    ///      burn/exit stays live on last-known-good NAV when the oracle is stale.
+    uint256 private _lastGoodPositionValueUSDC;
+
     // =========================================================================
     // State — circuit breaker + trading (VAULT-05, VAULT-06)
     // =========================================================================
@@ -316,8 +323,21 @@ contract MTokenVault is ERC4626, ReentrancyGuardTransient, IMTokenVault {
     /// @dev Overrides OZ base which only returns balanceOf. The perps position value (Chainlink-priced
     ///      via the adapter) MUST be included or NAV is understated during open positions (Pitfall 1).
     ///      totalAssets() is called internally by all ERC-4626 deposit/mint/withdraw/redeem paths.
+    ///
+    ///      REVERT-SAFE (CONTRACTS-08, CLAUDE.md §4): if the adapter reverts (e.g., stale Chainlink
+    ///      feed inside positionValueUSDC), falls back to _lastGoodPositionValueUSDC so that
+    ///      burn/withdraw/redeem NEVER revert due to oracle staleness. Mint asymmetry is preserved:
+    ///      deposit/mint paths still revert via _requireFreshNavForMint() — this fallback only
+    ///      benefits the burn path (VAULT-02/05, D-10).
     function totalAssets() public view virtual override(ERC4626, IERC4626) returns (uint256) {
-        return IERC20(asset()).balanceOf(address(this)) + IPerpsAdapter(adapter).positionValueUSDC(address(this));
+        uint256 usdcBalance = IERC20(asset()).balanceOf(address(this));
+        try IPerpsAdapter(adapter).positionValueUSDC(address(this)) returns (uint256 posVal) {
+            return usdcBalance + posVal;
+        } catch {
+            // Adapter reverted (stale oracle, entry==0, etc.) — use last-known-good position value.
+            // This ensures burn/withdraw/redeem stay live during stale oracle periods (CONTRACTS-08).
+            return usdcBalance + _lastGoodPositionValueUSDC;
+        }
     }
 
     // =========================================================================
@@ -357,7 +377,7 @@ contract MTokenVault is ERC4626, ReentrancyGuardTransient, IMTokenVault {
     }
 
     /// @dev Updates the per-block NAV cache from state-changing paths.
-    ///      Also refreshes _lastGoodNavE18 if feeds are fresh.
+    ///      Also refreshes _lastGoodNavE18 and _lastGoodPositionValueUSDC if feeds are fresh.
     function _updateNavCache() internal returns (uint256 currentNav) {
         currentNav = _computeNav();
         // casting to 'uint128' is safe: NAV is 1e18-scaled and totalSupply >> 0,
@@ -366,13 +386,29 @@ contract MTokenVault is ERC4626, ReentrancyGuardTransient, IMTokenVault {
         _navCache = NavCache({navE18: uint128(currentNav), blockNumber: uint64(block.number), _pad: 0});
         if (_stalenessCrossedAt == 0) {
             _lastGoodNavE18 = currentNav;
+            // Snapshot the current position value so the burn path has a fresh last-known-good
+            // to fall back on if the adapter later reverts due to oracle staleness (CONTRACTS-08).
+            // The try/catch mirrors totalAssets() — if positionValueUSDC reverts here, keep the
+            // existing _lastGoodPositionValueUSDC unchanged.
+            try IPerpsAdapter(adapter).positionValueUSDC(address(this)) returns (uint256 posVal) {
+                _lastGoodPositionValueUSDC = posVal;
+            } catch {}
         }
     }
 
     /// @dev Returns NAV to use on the BURN path. Never reverts (VAULT-02, CONTRACTS-08).
     ///      If any feed is stale, returns last-known-good NAV so exits are always possible.
+    ///
+    ///      NOTE: With totalAssets() now revert-safe (try/catch over positionValueUSDC),
+    ///      _computeNav() itself no longer reverts. This function is kept for explicit
+    ///      documentation of the burn-path semantics and used internally in the NAV view path.
+    ///      _stalenessCrossedAt == 0 means feeds are fresh — use live NAV (totalAssets is live).
+    ///      _stalenessCrossedAt > 0 means feeds are stale — totalAssets() falls back to
+    ///      _lastGoodPositionValueUSDC, making _computeNav() return a last-good-based NAV.
+    ///      Either path is safe for exits; the distinction exists only for the mint gate.
     function _navForBurn() internal view returns (uint256) {
-        if (_stalenessCrossedAt > 0) return _lastGoodNavE18;
+        // totalAssets() is now revert-safe — _computeNav() never reverts regardless of staleness.
+        // The stale path uses _lastGoodPositionValueUSDC fallback inside totalAssets().
         return _computeNav();
     }
 
@@ -444,7 +480,17 @@ contract MTokenVault is ERC4626, ReentrancyGuardTransient, IMTokenVault {
                 _stalenessCrossedAt = 0;
                 _sessionPaused = false;
             }
-            _lastGoodNavE18 = _computeNav();
+            // Refresh last-good NAV using a try/catch in case the adapter still reverts
+            // on an internal feed that just recovered at the vault level but not in the adapter
+            // (e.g., a partial Chainlink recovery window). Keeps _checkAndUpdateStaleness safe
+            // even when positionValueUSDC internally reverts (CR-01 protection).
+            try this.totalAssets() returns (uint256) {
+                _lastGoodNavE18 = _computeNav();
+            } catch {
+                // Adapter still reverts — keep existing _lastGoodNavE18, do not update.
+                // _lastGoodPositionValueUSDC is updated from _updateNavCache() on the next
+                // successful state-changing tx, so no stale value is locked in permanently.
+            }
         }
     }
 

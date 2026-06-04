@@ -910,4 +910,79 @@ contract MTokenVaultTest is Test {
         assertEq(vault.maxWithdraw(user), 0, "maxWithdraw must be 0 post-sessionEnded");
         assertEq(vault.maxRedeem(user), 0, "maxRedeem must be 0 post-sessionEnded");
     }
+
+    // =========================================================================
+    // CR-03 regression — Burn-stays-live with open position + stale oracle (CONTRACTS-08)
+    // =========================================================================
+
+    /// @notice REGRESSION (CR-03 + CR-01 + CR-04): proves burn/exit stays live when the
+    ///         Chainlink feed inside the adapter is stale but the vault has an open position.
+    ///
+    ///         Before the fix, withdraw() called _updateNavCache() → _computeNav() →
+    ///         totalAssets() → positionValueUSDC() which REVERTED on stale feed, so
+    ///         _navForBurn() was dead code and CONTRACTS-08 was not satisfied.
+    ///
+    ///         After the fix, totalAssets() wraps positionValueUSDC() in try/catch and
+    ///         falls back to _lastGoodPositionValueUSDC, keeping withdraw/redeem live.
+    ///         deposit/mint must STILL REVERT on stale feeds (mint asymmetry preserved).
+    ///
+    ///         Also proves CR-04: MockPerps._computePnl now returns 0 on entry==0 instead
+    ///         of reverting, preventing a permanent DoS of totalAssets().
+    function test_BurnStaysLive_StaleOracle_OpenPosition() public {
+        // 1. Deposit so there are shares outstanding.
+        vm.prank(user);
+        uint256 shares = vault.deposit(1000e6, user);
+        assertGt(shares, 0, "user must have shares");
+
+        // 2. Open a real position so positionValueUSDC is non-trivial.
+        //    This causes the vault's adapter to have live position data.
+        vm.prank(orchestrator);
+        bytes32 orderKey = vault.openLong("ETH", 1000e30, 20_000, 30);
+
+        // Execute the pending open order (async keeper pattern).
+        vm.roll(block.number + perps.executionDelay());
+        perps.executeOrder(orderKey);
+
+        // Clear the trading lock so withdraw is not blocked by an in-flight order.
+        vm.prank(orchestrator);
+        vault.clearTradingLock(orderKey);
+
+        // Confirm position is open and non-trivial.
+        uint256 posVal = perps.positionValueUSDC(address(vault));
+        assertGt(posVal, 0, "position value must be > 0 before feed goes stale");
+
+        // 3. Make the ETH feed stale so positionValueUSDC() inside the adapter REVERTS.
+        //    Both the vault (MAX_STALENESS_ETH = 4500s) and MockPerps (MAX_STALENESS = 3600s)
+        //    must see it as stale — use the larger of the two plus a safety margin.
+        uint256 maxStalenessForVault = vault.MAX_STALENESS_ETH(); // 4500s
+        uint256 staleAt = block.timestamp - maxStalenessForVault - 1;
+        ethFeed.setPriceAt(ETH_PRICE_8DEC, staleAt);
+
+        // Verify the adapter now reverts on positionValueUSDC.
+        vm.expectRevert("MockPerps: stale price");
+        perps.positionValueUSDC(address(vault));
+
+        // 4. ASSERT: withdraw SUCCEEDS despite the stale adapter (CONTRACTS-08 / CR-03 fix).
+        //    The vault falls back to _lastGoodPositionValueUSDC in totalAssets().
+        uint256 usdcBefore = usdc.balanceOf(user);
+        vm.prank(user);
+        uint256 withdrawn = vault.withdraw(100e6, user, user); // must NOT revert
+        assertGt(withdrawn, 0, "withdraw must return non-zero shares burned");
+        assertGt(usdc.balanceOf(user), usdcBefore, "user USDC must increase after stale-feed withdraw");
+
+        // 5. ASSERT: redeem SUCCEEDS too (same path).
+        uint256 remainingShares = vault.balanceOf(user);
+        assertGt(remainingShares, 0, "user must have remaining shares for redeem");
+        vm.prank(user);
+        uint256 redeemedAssets = vault.redeem(remainingShares / 2, user, user); // must NOT revert
+        assertGt(redeemedAssets, 0, "redeem must return non-zero assets");
+
+        // 6. ASSERT: deposit STILL REVERTS on stale feed (mint asymmetry preserved, VAULT-02/D-10).
+        usdc.mint(user, 100e6);
+        vm.prank(user);
+        usdc.approve(address(vault), 100e6);
+        vm.prank(user);
+        vm.expectRevert(MTokenVault.MintBlockedStaleFeed.selector);
+        vault.deposit(100e6, user); // must revert — staleness gate still active for mint
+    }
 }

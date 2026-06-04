@@ -464,7 +464,11 @@ contract MockPerps is IPerpsAdapter, Ownable {
         // _markPrice may revert on staleness — intentional (D-03 enforcement)
         int256 mark = _markPrice(pos.market);
         int256 entry = pos.entryPrice;
-        require(entry > 0, "MockPerps: zero entry price");
+        // CR-04: safe degradation — if entry is somehow 0 (corrupt storage), return 0 PnL
+        // rather than reverting and permanently bricking positionValueUSDC/totalAssets.
+        // _openPosition sets entryPrice from _markPrice which requires answer > 0, so this
+        // guard is defensive. A revert here would DoS the vault permanently with no recovery.
+        if (entry <= 0) return 0;
 
         // pnl_usdc = signedSize * (mark - entry) / (entry * 1e24)
         // Division is safe: entry > 0 (asserted), 1e24 > 0 always.
