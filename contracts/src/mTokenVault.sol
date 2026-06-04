@@ -840,12 +840,15 @@ contract MTokenVault is ERC4626, ReentrancyGuardTransient, IMTokenVault {
     ///      lands in Phase 2 when the orchestrator can call recordClose.
     ///      In Phase 1: realizedPnlUsd=0, maxDrawdownBps=0, closes=0.
     ///      survived = !_mintPaused (D-08: circuit breaker trip sets this permanently false).
+    ///      initialCapitalUsdc is populated so PerformanceOracle can normalize returnBps
+    ///      correctly for any initial capital (WR-03 fix).
     function getStats() external view override returns (IPerformanceOracle.VaultStats memory stats) {
         stats.realizedPnlUsd = _realizedPnlUsd;
         stats.maxDrawdownBps = _maxDrawdownBps;
         stats.winningCloses = _winningCloses;
         stats.totalCloses = _totalCloses;
         stats.survived = !_mintPaused; // D-08: circuit breaker never resets
+        stats.initialCapitalUsdc = initialCapitalUsdc; // WR-03: parameterize pnl normalization
     }
 
     // =========================================================================

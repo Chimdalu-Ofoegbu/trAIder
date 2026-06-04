@@ -104,10 +104,11 @@ contract PerformanceOracle is Ownable {
     ///      compiler enforces this — any storage access would fail to compile (ORACLE-01, D-43).
     ///      Formula: scorePpm = (pnlPpm·500_000 + ddPpm·200_000 + wrPpm·200_000 + survPpm·100_000) / 1_000_000
     ///      Integer truncation is intentional — the error is at most 1 ppm per component.
+    ///      WR-03 fix: pnlPpm now uses stats.initialCapitalUsdc for correct normalization.
     /// @param stats The session snapshot. Consumed but not stored.
     /// @return scorePpm Coliseum Score in parts per million [0, 1_000_000].
     function computeScore(IPerformanceOracle.VaultStats memory stats) external pure returns (uint256 scorePpm) {
-        uint256 pnlPpm = _pnlComponent(stats.realizedPnlUsd);
+        uint256 pnlPpm = _pnlComponent(stats.realizedPnlUsd, stats.initialCapitalUsdc);
         uint256 ddPpm = _drawdownComponent(stats.maxDrawdownBps);
         uint256 wrPpm = _winRateComponent(stats.winningCloses, stats.totalCloses);
         uint256 survPpm = stats.survived ? PPM : 0;
@@ -123,10 +124,13 @@ contract PerformanceOracle is Ownable {
     /// @notice Returns the PnL sub-component in ppm for a given realized PnL value.
     /// @dev Thin wrapper around `_pnlComponent`. Pure: no storage access.
     ///      Exposed so tests can pin exact ppm values at locked reference points (D-09b).
+    ///      WR-03 fix: accepts initialCapitalUsdc to parameterize the return-bps formula.
+    ///      Pass 10_000e6 for the legacy $10k default; the formula is correct for any capital.
     /// @param realizedPnlUsd Cumulative realized PnL in 1e18-scaled USD (signed).
+    /// @param initialCapitalUsdc Initial capital in USDC (6 decimals). Must be > 0.
     /// @return pnlPpm PnL component in ppm [0, 1_000_000].
-    function pnlComponent(int256 realizedPnlUsd) external pure returns (uint256 pnlPpm) {
-        return _pnlComponent(realizedPnlUsd);
+    function pnlComponent(int256 realizedPnlUsd, uint256 initialCapitalUsdc) external pure returns (uint256 pnlPpm) {
+        return _pnlComponent(realizedPnlUsd, initialCapitalUsdc);
     }
 
     /// @notice Returns the win-rate sub-component in ppm.
@@ -152,19 +156,51 @@ contract PerformanceOracle is Ownable {
     // Internal — component math
     // =========================================================================
 
-    /// @dev PnL component (D-09b). Initial capital = $10_000 (baked in).
-    ///      returnBps = realizedPnlUsd / 1e18  (18-dec USD → bps of $10k)
+    /// @dev PnL component (D-09b, WR-03 fix). Parameterized by initialCapitalUsdc.
+    ///
+    ///      Formula (WR-03 corrected):
+    ///        pnlDollars  = realizedPnlUsd / 1e18
+    ///        initialCapitalDollars = initialCapitalUsdc / 1e6
+    ///        returnBps   = pnlDollars * 10_000 / initialCapitalDollars
+    ///
+    ///      At initialCapitalUsdc == 10_000e6 ($10,000):
+    ///        returnBps = pnlDollars * 10_000 / 10_000 = pnlDollars  [UNCHANGED from prior formula]
+    ///
+    ///      At initialCapitalUsdc == 20_000e6 ($20,000):
+    ///        returnBps = pnlDollars * 10_000 / 20_000 = pnlDollars / 2
+    ///        → -$10k on $20k capital → -50% → -5_000 bps → 166_666 ppm  ✓
+    ///        → +$20k on $20k capital → +100% → 10_000 bps → 666_666 ppm  ✓
+    ///
     ///      Clamped to [RETURN_BPS_MIN, RETURN_BPS_MAX] = [-10_000, +20_000].
     ///      pnlPpm = uint256(returnBps + RETURN_BPS_OFFSET) * PPM / RETURN_BPS_RANGE
     ///
-    ///      Reference points (D-09b):
+    ///      Reference points (D-09b, any capital):
     ///        returnBps = -10_000 → 0 ppm          (−100%, clamp floor)
     ///        returnBps =      0 → 333_333 ppm      (breakeven)
     ///        returnBps = +10_000 → 666_666 ppm     (+100%)
     ///        returnBps = +20_000 → 1_000_000 ppm   (+200%, clamp ceiling)
-    function _pnlComponent(int256 realizedPnlUsd) internal pure returns (uint256) {
-        // Convert 1e18-scaled USD to returnBps (integer division — truncates toward zero)
-        int256 returnBps = realizedPnlUsd / USD_SCALE;
+    ///
+    /// @param realizedPnlUsd       Cumulative realized PnL in 1e18-scaled USD (signed).
+    /// @param initialCapitalUsdc   Session initial capital in USDC (6 decimals). Must be > 0.
+    function _pnlComponent(int256 realizedPnlUsd, uint256 initialCapitalUsdc) internal pure returns (uint256) {
+        // Guard: if initialCapitalUsdc is 0 (should not happen given constructor default),
+        // fall back to the $10k default to avoid division by zero.
+        if (initialCapitalUsdc == 0) initialCapitalUsdc = 10_000e6;
+
+        // Convert 1e18-scaled USD to plain dollars (integer division — truncates toward zero)
+        int256 pnlDollars = realizedPnlUsd / USD_SCALE;
+
+        // initialCapitalDollars = initialCapitalUsdc / 1e6 (USDC 6-decimal to dollars)
+        // Safe: initialCapitalUsdc is always <= type(uint256).max / 10_000 for realistic capitals.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        int256 initialCapitalDollars = int256(initialCapitalUsdc / 1e6);
+        if (initialCapitalDollars == 0) initialCapitalDollars = 10_000; // paranoid fallback
+
+        // returnBps = pnlDollars * 10_000 / initialCapitalDollars
+        // Both numerator and denominator are in plain dollars; result is basis points.
+        // Overflow safety: pnlDollars can be at most ~5.79e18/1 = ~5.79e18 dollars before
+        // clamping; * 10_000 = ~5.79e22, well within int256 range (~5.79e76).
+        int256 returnBps = pnlDollars * 10_000 / initialCapitalDollars;
 
         // Clamp to [-10_000, +20_000]
         if (returnBps < RETURN_BPS_MIN) returnBps = RETURN_BPS_MIN;

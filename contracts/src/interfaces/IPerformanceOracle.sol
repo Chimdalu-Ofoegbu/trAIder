@@ -30,5 +30,11 @@ interface IPerformanceOracle {
         /// @notice True if the vault has not been force-settled due to NAV <= 0 or
         ///         emergency circuit-breaker (CONTRACTS-08). False once settlement triggered.
         bool survived;
+        /// @notice Initial capital in USDC (6 decimals) used for PnL normalization.
+        ///         WR-03 fix: PerformanceOracle._pnlComponent uses this to compute returnBps
+        ///         correctly for any initial capital, not just the hardcoded $10,000 case.
+        ///         Populated by MTokenVault.getStats() from immutable initialCapitalUsdc.
+        ///         Defaults to 10_000e6 ($10,000) when the vault uses the factory default.
+        uint256 initialCapitalUsdc;
     }
 }

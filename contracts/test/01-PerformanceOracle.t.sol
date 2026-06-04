@@ -31,7 +31,12 @@ contract PerformanceOracleTest is Test {
     ///         ORACLE-02 gate: guards divide-by-zero and neutral scoring (D-06).
     function test_Oracle_ZeroTrade_Neutral() public view {
         IPerformanceOracle.VaultStats memory stats = IPerformanceOracle.VaultStats({
-            realizedPnlUsd: 0, maxDrawdownBps: 0, winningCloses: 0, totalCloses: 0, survived: true
+            realizedPnlUsd: 0,
+            maxDrawdownBps: 0,
+            winningCloses: 0,
+            totalCloses: 0,
+            survived: true,
+            initialCapitalUsdc: 10_000e6
         });
 
         // The win-rate sub-component must be exactly 500_000 ppm (neutral, D-06).
@@ -55,37 +60,68 @@ contract PerformanceOracleTest is Test {
 
     /// @notice +$10k on $10k initial capital → returnBps = +10_000 → pnlPpm = 666_666.
     function test_Oracle_PnlComponent_100pct() public view {
-        // +$10k in 1e18-scaled USD
+        // +$10k in 1e18-scaled USD. initialCapitalUsdc = 10_000e6 (default $10k)
         int256 pnl = 10_000e18;
-        uint256 pnlPpm = oracle.pnlComponent(pnl);
+        uint256 pnlPpm = oracle.pnlComponent(pnl, 10_000e6);
         assertEq(pnlPpm, 666_666, "100pct return must map to 666_666 ppm");
     }
 
     /// @notice -$5k on $10k initial capital → returnBps = -5_000 → pnlPpm = 166_666.
     function test_Oracle_PnlComponent_Loss50pct() public view {
         int256 pnl = -5_000e18;
-        uint256 pnlPpm = oracle.pnlComponent(pnl);
+        uint256 pnlPpm = oracle.pnlComponent(pnl, 10_000e6);
         assertEq(pnlPpm, 166_666, "-50pct return must map to 166_666 ppm");
     }
 
     /// @notice Breakeven ($0 PnL) → returnBps = 0 → pnlPpm = 333_333.
     function test_Oracle_PnlComponent_Breakeven() public view {
-        uint256 pnlPpm = oracle.pnlComponent(0);
+        uint256 pnlPpm = oracle.pnlComponent(0, 10_000e6);
         assertEq(pnlPpm, 333_333, "breakeven must map to 333_333 ppm (0.5 anchor)");
     }
 
     /// @notice +$50k (+500%) clamps to +20_000 bps → pnlPpm = 1_000_000.
     function test_Oracle_PnlComponent_ClampHigh() public view {
         int256 pnl = 50_000e18;
-        uint256 pnlPpm = oracle.pnlComponent(pnl);
+        uint256 pnlPpm = oracle.pnlComponent(pnl, 10_000e6);
         assertEq(pnlPpm, 1_000_000, "+500pct must clamp to 1_000_000 ppm");
     }
 
     /// @notice -$50k (-500%, impossible in practice) clamps to -10_000 bps → pnlPpm = 0.
     function test_Oracle_PnlComponent_ClampLow() public view {
         int256 pnl = -50_000e18;
-        uint256 pnlPpm = oracle.pnlComponent(pnl);
+        uint256 pnlPpm = oracle.pnlComponent(pnl, 10_000e6);
         assertEq(pnlPpm, 0, "-500pct must clamp to 0 ppm");
+    }
+
+    // =========================================================================
+    // WR-03 regression — pnl-bps parameterized by initialCapital (non-$10k)
+    // =========================================================================
+
+    /// @notice REGRESSION (WR-03): pnlComponent is correctly parameterized for non-$10k capital.
+    ///         Proves: -50% on $20k → 166_666 ppm; +100% on $20k → 666_666 ppm.
+    ///         Before fix, the formula hardcoded $10k so $20k capital would produce wrong bps:
+    ///         -$10k at $20k capital would map returnBps=-10_000 → 0 ppm (wrong: should be 166_666).
+    function test_Oracle_PnlComponent_NonDefault_Capital_20k() public view {
+        uint256 capital20k = 20_000e6; // $20,000 initial capital
+
+        // -50% on $20k = -$10k PnL → returnBps = -$10k * 10_000 / $20k = -5_000 → 166_666 ppm
+        int256 pnlMinus10k = -10_000e18;
+        uint256 ppmLoss50 = oracle.pnlComponent(pnlMinus10k, capital20k);
+        assertEq(ppmLoss50, 166_666, "WR-03: -50pct on $20k must map to 166_666 ppm");
+
+        // +100% on $20k = +$20k PnL → returnBps = $20k * 10_000 / $20k = 10_000 → 666_666 ppm
+        int256 pnlPlus20k = 20_000e18;
+        uint256 ppmGain100 = oracle.pnlComponent(pnlPlus20k, capital20k);
+        assertEq(ppmGain100, 666_666, "WR-03: +100pct on $20k must map to 666_666 ppm");
+
+        // Breakeven on $20k = $0 PnL → returnBps = 0 → 333_333 ppm
+        uint256 ppmBreakeven = oracle.pnlComponent(0, capital20k);
+        assertEq(ppmBreakeven, 333_333, "WR-03: breakeven on $20k must map to 333_333 ppm");
+
+        // +200% on $20k = +$40k PnL → returnBps = 20_000 (hits ceiling) → 1_000_000 ppm
+        int256 pnlPlus40k = 40_000e18;
+        uint256 ppmGain200 = oracle.pnlComponent(pnlPlus40k, capital20k);
+        assertEq(ppmGain200, 1_000_000, "WR-03: +200pct on $20k must clamp to 1_000_000 ppm");
     }
 
     // =========================================================================
@@ -118,7 +154,8 @@ contract PerformanceOracleTest is Test {
             maxDrawdownBps: 0, // ddPpm = 1_000_000
             winningCloses: 4,
             totalCloses: 4, // wrPpm = 1_000_000
-            survived: true // survivalPpm = 1_000_000
+            survived: true, // survivalPpm = 1_000_000
+            initialCapitalUsdc: 10_000e6 // $10k default
         });
 
         uint256 score = oracle.computeScore(stats);
@@ -132,7 +169,8 @@ contract PerformanceOracleTest is Test {
             maxDrawdownBps: 10_000, // ddPpm = 0
             winningCloses: 0,
             totalCloses: 4, // wrPpm = 0 (0 wins out of 4)
-            survived: false // survivalPpm = 0
+            survived: false, // survivalPpm = 0
+            initialCapitalUsdc: 10_000e6 // $10k default
         });
 
         uint256 score = oracle.computeScore(stats);
@@ -148,7 +186,12 @@ contract PerformanceOracleTest is Test {
     ///         from a view context without state mutation.
     function test_Oracle_ComputeScore_IsPure() public view {
         IPerformanceOracle.VaultStats memory stats = IPerformanceOracle.VaultStats({
-            realizedPnlUsd: 0, maxDrawdownBps: 0, winningCloses: 0, totalCloses: 0, survived: true
+            realizedPnlUsd: 0,
+            maxDrawdownBps: 0,
+            winningCloses: 0,
+            totalCloses: 0,
+            survived: true,
+            initialCapitalUsdc: 10_000e6
         });
         // If this compiles and runs, computeScore is pure (no state read/write).
         oracle.computeScore(stats);
