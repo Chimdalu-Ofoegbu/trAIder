@@ -116,61 +116,66 @@ if [[ ${#ADDRESSES[@]} -eq 0 ]]; then
 fi
 echo ""
 
-# ── Step 3: Seed USDC via forge script deal() (UNCONDITIONAL, Pattern 5) ─────
-echo "[3/5] Seeding USDC via forge script deal() (Pattern 5 — auto-detects Arbitrum proxy slot)..."
+# ── Step 3: Seed USDC + ETH (UNCONDITIONAL, Pattern 5) ───────────────────────
+# Seed USDC via cast rpc anvil_setStorageAt (Pattern 5 — direct storage slot write).
+# USDC v2 on Arbitrum One (0xaf88…) uses mapping slot 9 for balances:
+#   slot = keccak256(abi.encode(address, uint256(9)))
+# Verified on fork block 353000000 — balanceOf(0x...001) == storage[slot9(0x...001)].
+#
+# Seed ETH via cast rpc anvil_setBalance.
+#
+# Note: forge script deal() writes cheatcode storage in forge's local EVM and does NOT
+# persist to the live anvil RPC state — the cast rpc approach is the correct pattern.
+echo "[3/5] Seeding USDC (anvil_setStorageAt slot 9) + ETH (anvil_setBalance) for operator addresses..."
 
-# Write a temporary Solidity forge script to deal() USDC to all addresses
-TEMP_SCRIPT=$(mktemp --suffix=.s.sol)
-trap "rm -f ${TEMP_SCRIPT}" EXIT
+# USDC_BALANCE_SLOT_INDEX is the Solidity mapping slot index (9 for USDC v2 FiatToken)
+USDC_BALANCE_SLOT_INDEX=9
+# USDC_SEED_AMOUNT as 32-byte hex (1e12 = 0xE8D4A51000)
+USDC_SEED_HEX=$(cast to-uint256 "${USDC_SEED_AMOUNT}" 2>/dev/null || printf '0x%064x' "${USDC_SEED_AMOUNT}")
 
-# Build the address list for the script
-DEAL_CALLS=""
+SEED_FAILURES=0
 for addr in "${ADDRESSES[@]}"; do
-    DEAL_CALLS+="        vm.deal(${addr}, 1 ether);\n"
-    DEAL_CALLS+="        deal(${USDC_ARBITRUM}, ${addr}, ${USDC_SEED_AMOUNT});\n"
+    # Compute the balance storage slot: keccak256(abi.encode(addr, slot_index))
+    BALANCE_SLOT=$(cast index address "${addr}" "${USDC_BALANCE_SLOT_INDEX}" 2>/dev/null)
+    if [[ -z "${BALANCE_SLOT}" ]]; then
+        echo "  [WARN] Could not compute storage slot for ${addr} — skipping USDC seed"
+        SEED_FAILURES=$((SEED_FAILURES + 1))
+        continue
+    fi
+
+    # Write USDC balance via anvil_setStorageAt (redirect stdout; capture only exit code)
+    USDC_OK="false"
+    if cast rpc anvil_setStorageAt \
+        "${USDC_ARBITRUM}" "${BALANCE_SLOT}" "${USDC_SEED_HEX}" \
+        --rpc-url "${ANVIL_RPC}" >/dev/null 2>&1; then
+        USDC_OK="true"
+    fi
+
+    # Seed ETH via anvil_setBalance
+    ETH_OK="false"
+    if cast rpc anvil_setBalance \
+        "${addr}" "${ETH_SEED_AMOUNT}" \
+        --rpc-url "${ANVIL_RPC}" >/dev/null 2>&1; then
+        ETH_OK="true"
+    fi
+
+    if [[ "${USDC_OK}" == "true" && "${ETH_OK}" == "true" ]]; then
+        echo "  [OK] ${addr}: USDC + ETH funded"
+    elif [[ "${USDC_OK}" == "true" ]]; then
+        echo "  [WARN] ${addr}: USDC funded but ETH seed failed"
+    elif [[ "${ETH_OK}" == "true" ]]; then
+        echo "  [WARN] ${addr}: ETH funded but USDC seed failed (slot=${BALANCE_SLOT})"
+        SEED_FAILURES=$((SEED_FAILURES + 1))
+    else
+        echo "  [WARN] ${addr}: both USDC and ETH seed failed — is anvil running?"
+        SEED_FAILURES=$((SEED_FAILURES + 1))
+    fi
 done
 
-cat > "${TEMP_SCRIPT}" << SOLIDITY_EOF
-// SPDX-License-Identifier: MIT
-pragma solidity 0.8.24;
-
-import {Script} from "forge-std/Script.sol";
-
-contract SeedOperators is Script {
-    function run() external {
-        vm.startBroadcast();
-$(printf '%b' "${DEAL_CALLS}")
-        vm.stopBroadcast();
-    }
-}
-SOLIDITY_EOF
-
-# Run the forge script against the local anvil fork
-# --unlocked allows broadcasting without a private key (anvil dev mode)
-FORGE_OK=true
-(cd "${REPO_ROOT}/contracts" && \
-    forge script "${TEMP_SCRIPT}" \
-    --rpc-url "${ANVIL_RPC}" \
-    --broadcast \
-    --unlocked \
-    2>&1) || {
-    FORGE_OK=false
-    echo "[WARN] forge script for USDC deal() failed — falling back to cast rpc anvil_setStorageAt"
-}
-
-if [[ "$FORGE_OK" == "false" ]]; then
-    echo "[INFO] Forge script failed (expected if contracts/ deps not initialized). Continuing with cast rpc fallback..."
-    # Fallback: use anvil_setBalance for ETH (USDC seeding requires deal() or correct slot)
-    # The verify-stack.sh will catch if USDC balances are wrong.
-    for addr in "${ADDRESSES[@]}"; do
-        cast rpc anvil_setBalance "${addr}" "${ETH_SEED_AMOUNT}" --rpc-url "${ANVIL_RPC}" >/dev/null 2>&1 && \
-            echo "  [OK] ETH funded: ${addr}" || \
-            echo "  [WARN] ETH fund failed for: ${addr}"
-    done
-    echo "[WARN] USDC seeding incomplete (forge script needed) — verify-stack USDC assertions will fail."
-    echo "       Fix: ensure contracts/ forge deps are installed (forge install) and re-run make seed."
+if [[ ${SEED_FAILURES} -eq 0 ]]; then
+    echo "[3/5] USDC + ETH seeding complete."
 else
-    echo "[3/5] USDC + ETH seeding via forge script complete."
+    echo "[3/5] Seeding complete with ${SEED_FAILURES} warning(s) — check output above."
 fi
 echo ""
 

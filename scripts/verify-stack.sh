@@ -95,13 +95,28 @@ echo ""
 
 # ── Assertion 2: Postgres schemas ─────────────────────────────────────────────
 echo "[2/4] Checking Postgres schemas (orchestrator + backend)..."
-SCHEMA_OUTPUT=$(PGPASSWORD="${PG_PASS}" psql \
-    -h "${PG_HOST}" \
-    -p "${PG_PORT}" \
-    -U "${PG_USER}" \
-    -d "${PG_DB}" \
-    -t \
-    -c "\dn" 2>/dev/null || echo "psql_failed")
+# Try host psql first; fall back to docker exec (for hosts without psql client installed)
+SCHEMA_OUTPUT=""
+if command -v psql &>/dev/null; then
+    SCHEMA_OUTPUT=$(PGPASSWORD="${PG_PASS}" psql \
+        -h "${PG_HOST}" \
+        -p "${PG_PORT}" \
+        -U "${PG_USER}" \
+        -d "${PG_DB}" \
+        -t \
+        -c "\dn" 2>/dev/null || echo "psql_failed")
+else
+    # Fallback: use docker exec into the running postgres container
+    CONTAINER_NAME="${PG_CONTAINER:-traider-postgres}"
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+        SCHEMA_OUTPUT=$(docker exec "${CONTAINER_NAME}" \
+            env PGPASSWORD="${PG_PASS}" psql -U "${PG_USER}" -d "${PG_DB}" -t -c "\dn" \
+            2>/dev/null || echo "psql_failed")
+    else
+        SCHEMA_OUTPUT="psql_failed"
+        echo "  [INFO] host psql not found and container '${CONTAINER_NAME}' not running"
+    fi
+fi
 
 if [[ "${SCHEMA_OUTPUT}" == "psql_failed" ]]; then
     fail "Postgres not reachable at ${PG_HOST}:${PG_PORT} — is the dev stack running? (make up)"
