@@ -235,9 +235,24 @@ contract MTokenVault is ERC4626, ReentrancyGuardTransient, IMTokenVault {
     // Modifiers
     // =========================================================================
 
-    /// @dev Restricts startSession, endSession, and setSettlement to the SessionFactory (VAULT-07).
+    /// @dev Restricts startSession and setSettlement to the SessionFactory (VAULT-07).
     modifier onlySessionFactory() {
         require(msg.sender == sessionFactory, "Vault: only factory");
+        _;
+    }
+
+    /// @dev Allows endSession to be called by SessionFactory OR the registered settlement.
+    ///      WR-01/WR-05 fix: the SettlementContract must be able to put the vault into
+    ///      settled mode as its FIRST action in endSession(), before any drain or burn.
+    ///      This ensures maxWithdraw/maxRedeem return 0 during the drain window (blocking
+    ///      normal ERC-4626 exits) and guarantees settlementBurn's sessionEnded guard is
+    ///      satisfied during the claim() → settlementBurn → settlementWithdraw flow.
+    ///      startSession and setSettlement remain factory-only (VAULT-07 preserved).
+    modifier onlyFactoryOrSettlement() {
+        require(
+            msg.sender == sessionFactory || (settlement != address(0) && msg.sender == settlement),
+            "Vault: only factory or settlement"
+        );
         _;
     }
 
@@ -655,10 +670,21 @@ contract MTokenVault is ERC4626, ReentrancyGuardTransient, IMTokenVault {
     /// @dev Callable ONLY by the registered SettlementContract (TOKEN-01, D-18).
     ///      This is the ONLY external share-burn path beyond standard ERC4626 withdraw/redeem.
     ///      Plan 05's claim() calls this before paying USDC (CEI — burn before transfer).
+    ///
+    ///      CR-02: requires sessionEnded == true (symmetric with settlementWithdraw) so that
+    ///      shares cannot be burned before the redemption rate is frozen. Without this guard,
+    ///      a bug or malicious SettlementContract could burn all holder shares while
+    ///      redemptionRate == 0, destroying shares without paying any USDC.
+    ///
+    ///      Note: sessionEnded is set by endSession() which is callable by sessionFactory OR
+    ///      the registered settlement address (FIX 3 — WR-01/WR-05). This means
+    ///      settlement.endSession() calls vault.endSession() as its first action, ensuring
+    ///      sessionEnded == true before any drain+burn+pay sequence proceeds.
     /// @param from   Holder whose shares to burn.
     /// @param amount Number of shares to burn (in 18-decimal mTOKEN units).
     function settlementBurn(address from, uint256 amount) external {
         require(msg.sender == settlement, "Vault: not settlement");
+        require(sessionEnded, "Vault: not settled"); // CR-02: symmetric with settlementWithdraw
         _burn(from, amount);
     }
 
@@ -761,13 +787,28 @@ contract MTokenVault is ERC4626, ReentrancyGuardTransient, IMTokenVault {
         emit SessionStarted(durationSeconds, block.timestamp);
     }
 
-    /// @notice Ends the active trading session. SessionFactory-only (VAULT-07).
-    /// @dev Sets _sessionEnded=true (enables settlementWithdraw) and clears sessionActive.
-    ///      After this, the SettlementContract may drain positions and freeze the redemption rate.
-    function endSession() external override onlySessionFactory {
+    /// @notice Ends the active trading session. Callable by the SessionFactory OR the
+    ///         registered SettlementContract (WR-01 / WR-05 fix).
+    /// @dev Sets sessionEnded=true (enables settlementWithdraw, blocks maxWithdraw/maxRedeem)
+    ///      and clears sessionActive. Also clears _tradingLocked so any in-flight order
+    ///      does NOT brick the settlement drain (WR-05: in-flight lock before settlement
+    ///      cannot prevent settlementClosePosition from proceeding).
+    ///
+    ///      The settlement address is allowed to call this so SettlementContract.endSession()
+    ///      can put the vault into settled mode as its FIRST action — before draining
+    ///      positions and before any settlementBurn call. This satisfies:
+    ///        - WR-01: maxWithdraw/maxRedeem→0 during the drain window (no race to redeem)
+    ///        - WR-05: lock cleared so drain proceeds even if a trade was in flight
+    ///        - CR-02: sessionEnded==true before settlementBurn can fire
+    ///
+    ///      startSession and setSettlement remain factory-only (VAULT-07 preserved).
+    function endSession() external override onlyFactoryOrSettlement {
         require(sessionActive, "Vault: no active session");
         sessionActive = false;
         sessionEnded = true;
+        // WR-05: clear any in-flight trading lock so the settlement drain can proceed
+        // without being bricked by a pending order that the orchestrator never cleared.
+        _tradingLocked = false;
         emit SessionEnded(block.timestamp);
     }
 

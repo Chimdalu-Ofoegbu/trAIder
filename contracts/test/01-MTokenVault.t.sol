@@ -227,7 +227,8 @@ contract MTokenVaultTest is Test {
     // TOKEN-01 / D-18 — settlementBurn ACL
     // =========================================================================
 
-    /// @notice Proves settlementBurn reverts for non-settlement callers and succeeds for settlement.
+    /// @notice Proves settlementBurn reverts for non-settlement callers and succeeds for settlement
+    ///         post-endSession (CR-02: sessionEnded guard symmetric with settlementWithdraw).
     ///         Also proves setSettlement is factory-only and one-time.
     function test_Token_SettlementBurn_OnlySettlement() public {
         // Give user some shares
@@ -235,14 +236,24 @@ contract MTokenVaultTest is Test {
         uint256 shares = vault.deposit(1000e6, user);
         assertGt(shares, 0);
 
-        // Non-settlement caller must revert
+        // Non-settlement caller must revert (ACL check comes first)
         vm.prank(stranger);
         vm.expectRevert("Vault: not settlement");
         vault.settlementBurn(user, shares);
 
+        // CR-02: settlement caller reverts BEFORE endSession (sessionEnded == false)
+        vm.prank(settlement);
+        vm.expectRevert("Vault: not settled");
+        vault.settlementBurn(user, shares);
+
+        // End the session so settlementBurn's sessionEnded guard is satisfied.
+        // endSession is callable by factory OR registered settlement (WR-01/FIX-3).
+        vm.prank(sessionFactory);
+        vault.endSession();
+
         uint256 supplyBefore = vault.totalSupply();
 
-        // Settlement caller succeeds and burns shares
+        // Settlement caller now succeeds and burns shares (both guards satisfied)
         vm.prank(settlement);
         vault.settlementBurn(user, shares);
 
@@ -648,10 +659,12 @@ contract MTokenVaultTest is Test {
         vault.startSession(72 hours);
     }
 
-    /// @notice Proves endSession reverts for non-factory callers.
+    /// @notice Proves endSession reverts for non-factory / non-settlement callers.
+    ///         After FIX-3 (WR-01), endSession is callable by factory OR settlement.
+    ///         A stranger (neither) must still revert.
     function test_SessionFactory_OnlyAccess_EndReverts() public {
         vm.prank(stranger);
-        vm.expectRevert("Vault: only factory");
+        vm.expectRevert("Vault: only factory or settlement");
         vault.endSession();
     }
 
@@ -909,6 +922,100 @@ contract MTokenVaultTest is Test {
         // Both maxWithdraw and maxRedeem must return 0 post-session for all users.
         assertEq(vault.maxWithdraw(user), 0, "maxWithdraw must be 0 post-sessionEnded");
         assertEq(vault.maxRedeem(user), 0, "maxRedeem must be 0 post-sessionEnded");
+    }
+
+    // =========================================================================
+    // CR-02 regression — settlementBurn requires sessionEnded
+    // =========================================================================
+
+    /// @notice REGRESSION (CR-02): settlementBurn requires sessionEnded == true so shares
+    ///         cannot be burned before the redemption rate is frozen. Proves the guard is
+    ///         symmetric with settlementWithdraw (which already had this guard).
+    function test_SettlementBurn_RequiresSessionEnded() public {
+        vm.prank(user);
+        uint256 shares = vault.deposit(1000e6, user);
+        assertGt(shares, 0);
+
+        // Before endSession: settlementBurn must revert with "Vault: not settled"
+        vm.prank(settlement);
+        vm.expectRevert("Vault: not settled");
+        vault.settlementBurn(user, 1);
+
+        // After endSession: settlementBurn must succeed
+        vm.prank(sessionFactory);
+        vault.endSession();
+
+        uint256 supplyBefore = vault.totalSupply();
+        vm.prank(settlement);
+        vault.settlementBurn(user, shares);
+        assertEq(vault.balanceOf(user), 0, "shares must be burned after endSession");
+        assertEq(vault.totalSupply(), supplyBefore - shares, "totalSupply must decrease");
+    }
+
+    // =========================================================================
+    // WR-01 / WR-05 regression — Settlement calls vault.endSession(); lock cleared
+    // =========================================================================
+
+    /// @notice REGRESSION (WR-01): after settlement.endSession() calls vault.endSession(),
+    ///         vault.maxWithdraw(holder) returns 0 so normal ERC-4626 exits are blocked
+    ///         during the drain window.
+    function test_Settlement_SetsVaultSessionEnded() public {
+        vm.prank(user);
+        vault.deposit(1000e6, user);
+
+        // Confirm vault session is active and withdraw is available before settlement
+        assertFalse(vault.sessionEnded(), "vault.sessionEnded must be false before settlement");
+        assertGt(vault.maxWithdraw(user), 0, "maxWithdraw must be > 0 before settlement");
+
+        // Call vault.endSession() as the settlement address (allowed by onlyFactoryOrSettlement)
+        vm.prank(settlement);
+        vault.endSession();
+
+        // vault.sessionEnded must now be true
+        assertTrue(vault.sessionEnded(), "vault.sessionEnded must be true after settlement calls endSession");
+
+        // maxWithdraw must return 0 post-sessionEnded (WR-01: no race to redeem during drain)
+        assertEq(vault.maxWithdraw(user), 0, "maxWithdraw must be 0 after settlement sets sessionEnded");
+        assertEq(vault.maxRedeem(user), 0, "maxRedeem must be 0 after settlement sets sessionEnded");
+
+        // Normal withdraw must revert because vault fell through to OZ which checks maxWithdraw
+        vm.prank(user);
+        vm.expectRevert();
+        vault.withdraw(100e6, user, user);
+    }
+
+    /// @notice REGRESSION (WR-05): an in-flight order before settlement does not brick endSession.
+    ///         vault.endSession() clears _tradingLocked so the settlement drain can proceed
+    ///         via settlementClosePosition even if a trade was in flight.
+    function test_SettlementClosePosition_NotBrickedByInflightLock() public {
+        vm.prank(user);
+        vault.deposit(1000e6, user);
+
+        // Open a position — this sets _tradingLocked = true
+        vm.prank(orchestrator);
+        bytes32 orderKey = vault.openLong("ETH", 1000e30, 20_000, 30);
+
+        // Execute the pending open order
+        vm.roll(block.number + perps.executionDelay());
+        perps.executeOrder(orderKey);
+        // NOTE: we deliberately do NOT call clearTradingLock here
+        // to simulate an orchestrator that failed to clear the lock
+
+        // Recover positionKey
+        (bytes32 posKey,,,,) = perps.pendingOrders(orderKey);
+
+        // With _tradingLocked==true, normal closePosition would revert
+        // but settlementClosePosition bypasses that check.
+        // However, if endSession also doesn't clear the lock, future paths may be bricked.
+
+        // Call vault.endSession() as settlement — this MUST clear _tradingLocked (WR-05)
+        vm.prank(settlement);
+        vault.endSession();
+
+        // Now settlementClosePosition must succeed (lock was cleared by endSession)
+        vm.prank(settlement);
+        bytes32 closeKey = vault.settlementClosePosition(posKey, 0);
+        assertNotEq(closeKey, bytes32(0), "settlementClosePosition must succeed after endSession clears lock");
     }
 
     // =========================================================================

@@ -160,7 +160,19 @@ contract SettlementContract is ReentrancyGuardTransient {
             msg.sender == sessionFactory || block.timestamp >= deadline, "Settlement: not authorized before deadline"
         );
 
-        // Pitfall 5: set sessionEnded FIRST to block normal ERC-4626 exits during drain.
+        // Pitfall 5 / WR-01 fix: call vault.endSession() FIRST to put the vault into settled
+        // mode before the drain. This ensures:
+        //   - vault.maxWithdraw/maxRedeem → 0 immediately (no race to redeem during drain, WR-01)
+        //   - vault._tradingLocked cleared so settlementClosePosition is not bricked (WR-05)
+        //   - vault.sessionEnded=true so settlementBurn's sessionEnded guard is satisfied (CR-02)
+        // vault.endSession() is gated to factory OR settlement (this contract is the settlement).
+        // If vault.endSession() reverts (session not active — already ended by the factory),
+        // we swallow the revert: the vault is already in settled mode and we can proceed.
+        // slither-disable-next-line unchecked-lowlevel
+        try MTokenVault(vault).endSession() {} catch {}
+        // intentionally swallowed — vault may already be ended by factory before this call.
+
+        // Set our own local sessionEnded flag.
         sessionEnded = true;
 
         // SETT-01 DRAIN — the contract is responsible for issuing every close.
