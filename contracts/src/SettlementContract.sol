@@ -168,7 +168,9 @@ contract SettlementContract is ReentrancyGuardTransient {
         // vault.endSession() is gated to factory OR settlement (this contract is the settlement).
         // If vault.endSession() reverts (session not active — already ended by the factory),
         // we swallow the revert: the vault is already in settled mode and we can proceed.
-        // slither-disable-next-line unchecked-lowlevel
+        // slither-disable-next-line reentrancy-benign — nonReentrant guard prevents re-entry;
+        // sessionEnded is set immediately after. vault.endSession() is a trusted call (vault
+        // is an immutable set at deploy time by the factory; not user-controlled).
         try MTokenVault(vault).endSession() {} catch {}
         // intentionally swallowed — vault may already be ended by factory before this call.
 

@@ -411,21 +411,13 @@ contract MTokenVault is ERC4626, ReentrancyGuardTransient, IMTokenVault {
         }
     }
 
-    /// @dev Returns NAV to use on the BURN path. Never reverts (VAULT-02, CONTRACTS-08).
-    ///      If any feed is stale, returns last-known-good NAV so exits are always possible.
-    ///
-    ///      NOTE: With totalAssets() now revert-safe (try/catch over positionValueUSDC),
-    ///      _computeNav() itself no longer reverts. This function is kept for explicit
-    ///      documentation of the burn-path semantics and used internally in the NAV view path.
-    ///      _stalenessCrossedAt == 0 means feeds are fresh — use live NAV (totalAssets is live).
-    ///      _stalenessCrossedAt > 0 means feeds are stale — totalAssets() falls back to
-    ///      _lastGoodPositionValueUSDC, making _computeNav() return a last-good-based NAV.
-    ///      Either path is safe for exits; the distinction exists only for the mint gate.
-    function _navForBurn() internal view returns (uint256) {
-        // totalAssets() is now revert-safe — _computeNav() never reverts regardless of staleness.
-        // The stale path uses _lastGoodPositionValueUSDC fallback inside totalAssets().
-        return _computeNav();
-    }
+    // @dev _navForBurn() was removed (CR-03 fix). The burn path uses _computeNav() directly,
+    //      which is now always safe because totalAssets() wraps positionValueUSDC in a
+    //      try/catch — falling back to _lastGoodPositionValueUSDC on adapter failure.
+    //      _stalenessCrossedAt > 0 (feeds stale): totalAssets() returns USDC balance +
+    //      _lastGoodPositionValueUSDC → _computeNav() returns a last-good NAV.
+    //      _stalenessCrossedAt == 0 (feeds fresh): totalAssets() returns live NAV.
+    //      CONTRACTS-08: burn/exit always live; mint asymmetry preserved via _requireFreshNavForMint().
 
     // =========================================================================
     // Staleness machine (D-10, VAULT-02)
@@ -499,6 +491,10 @@ contract MTokenVault is ERC4626, ReentrancyGuardTransient, IMTokenVault {
             // on an internal feed that just recovered at the vault level but not in the adapter
             // (e.g., a partial Chainlink recovery window). Keeps _checkAndUpdateStaleness safe
             // even when positionValueUSDC internally reverts (CR-01 protection).
+            // `this.totalAssets()` is required for try/catch — Solidity only supports try on
+            // external calls. The extra STATICCALL is intentional; the return value is unused
+            // because we only care whether the call succeeded (i.e., adapter is not reverting).
+            // slither-disable-next-line var-read-using-this,unused-return
             try this.totalAssets() returns (uint256) {
                 _lastGoodNavE18 = _computeNav();
             } catch {
