@@ -116,17 +116,30 @@ if [[ ${#ADDRESSES[@]} -eq 0 ]]; then
 fi
 echo ""
 
-# ── Step 3: Seed USDC + ETH (UNCONDITIONAL, Pattern 5) ───────────────────────
-# Seed USDC via cast rpc anvil_setStorageAt (Pattern 5 — direct storage slot write).
-# USDC v2 on Arbitrum One (0xaf88…) uses mapping slot 9 for balances:
-#   slot = keccak256(abi.encode(address, uint256(9)))
-# Verified on fork block 353000000 — balanceOf(0x...001) == storage[slot9(0x...001)].
+# ── Step 3: Seed USDC + ETH (UNCONDITIONAL) ──────────────────────────────────
+# Seed USDC via `cast rpc anvil_setStorageAt`; seed ETH via `cast rpc anvil_setBalance`.
 #
-# Seed ETH via cast rpc anvil_setBalance.
+# DEVIATION FROM T-0-seedslot / Pattern 5 (deal() auto-detect) — SUPERSEDED for the
+# LIVE-ANVIL dev stack, documented here so it is not a mystery later:
+#   The 00-06 decision chose forge-std deal() (which probes for the balance slot) over a
+#   hand-written slot to avoid a wrong-slot silent mis-seed. That decision was made for
+#   FORK *TESTS* (`forge test --fork`), where deal()'s vm.store cheatcode mutates the
+#   in-process EVM. seed.sh instead seeds the LIVE external anvil container: deal() via
+#   `forge script` writes cheatcode storage in forge's local EVM and is NEVER broadcast,
+#   so it does not persist to the running node. deal() is therefore non-functional here.
+#   We converge on anvil_setStorageAt (the same RPC the seeds decision already uses to
+#   fund EOAs) writing the FiatToken balances mapping at slot 9:
+#       slot = keccak256(abi.encode(addr, uint256(9)))
 #
-# Note: forge script deal() writes cheatcode storage in forge's local EVM and does NOT
-# persist to the live anvil RPC state — the cast rpc approach is the correct pattern.
-echo "[3/5] Seeding USDC (anvil_setStorageAt slot 9) + ETH (anvil_setBalance) for operator addresses..."
+# Why this is SAFE despite hand-coding a slot (T-0-seedslot's concern was a SILENT mis-seed):
+#   verify-stack.sh asserts USDC balances via balanceOf() — the real accessor — so a WRONG
+#   slot fails LOUD, not silently. Slot 9 is VERIFIED correct: storage[slot9(addr)] written
+#   to 1e12 yields balanceOf(addr)==1e12 on fork block 353000000 (Circle FiatTokenV2_2).
+#
+# DEPENDENCY: slot 9 is correct for the CURRENT USDC contract (0xaf88…) at the CURRENT fork
+#   target. If FORK_BLOCK or the USDC implementation changes, re-verify the slot (verify-stack's
+#   balanceOf read will flag a mismatch loudly). See docs/RUNBOOK.md "USDC seeding".
+echo "[3/5] Seeding USDC (anvil_setStorageAt slot 9; see header — deal() can't seed a live anvil) + ETH..."
 
 # USDC_BALANCE_SLOT_INDEX is the Solidity mapping slot index (9 for USDC v2 FiatToken)
 USDC_BALANCE_SLOT_INDEX=9
@@ -209,44 +222,23 @@ echo "USDC_ARBITRUM=${USDC_ARBITRUM}" >> "${ENV_LOCAL}"
 echo "[4/5] .env.local written."
 echo ""
 
-# ── Step 5: MockPerps CREATE2 deploy (GUARDED) ────────────────────────────────
-# Guard: only run when contracts/src/mocks/MockPerps.sol OR the compiled artifact exists.
-# At Wave 1, MockPerps.sol ships in Plan 08 (Wave 2).
-# Plan 09 (Wave 3) is the AUTHORITATIVE deploy+assert.
-# This guarded step is a convenience early-deploy for Plan 08+ development.
-echo "[5/5] Checking MockPerps deploy guard..."
-
-MOCK_PERPS_SOL="${REPO_ROOT}/contracts/src/mocks/MockPerps.sol"
-MOCK_PERPS_ARTIFACT="${REPO_ROOT}/contracts/out/MockPerps.sol/MockPerps.json"
-
-if [[ -f "${MOCK_PERPS_SOL}" ]] || [[ -f "${MOCK_PERPS_ARTIFACT}" ]]; then
-    echo "[5/5] MockPerps.sol found — deploying to deterministic CREATE2 address..."
-
-    # Deterministic CREATE2 salt (documented — always produces the same address on a given chain)
-    # Salt: keccak256("trAIder.MockPerps.v1") = 0x... (computed offline, documented here)
-    MOCK_PERPS_SALT="0x747241496465722e4d6f636b50657270732e76310000000000000000000000"
-
-    MOCK_PERPS_ADDR=$(
-        cd "${REPO_ROOT}/contracts" && \
-        forge create \
-            --rpc-url "${ANVIL_RPC}" \
-            --unlocked \
-            --json \
-            "src/mocks/MockPerps.sol:MockPerps" \
-            2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('deployedTo',''))" \
-        || echo ""
-    )
-
-    if [[ -n "${MOCK_PERPS_ADDR}" && "${MOCK_PERPS_ADDR}" =~ ^0x[0-9a-fA-F]{40}$ ]]; then
-        echo "MOCK_PERPS_ADDRESS=${MOCK_PERPS_ADDR}" >> "${ENV_LOCAL}"
-        echo "[5/5] MockPerps deployed at: ${MOCK_PERPS_ADDR} (appended to .env.local)"
-    else
-        echo "[WARN] MockPerps deploy attempted but address not captured — check contracts/out for artifacts"
-    fi
-else
-    echo "[5/5] MockPerps.sol not present yet (ships in Plan 08) — skipping mock-perps deploy."
-    echo "      Plan 09 deploys it authoritatively. This is expected at Wave 1."
-fi
+# ── Step 5: MockPerps deploy — DEFERRED to the authoritative path ─────────────
+# MockPerps is NOT deployed by seed.sh. Its authoritative deploy is:
+#     forge script contracts/script/01-Deploy.s.sol
+# which constructs MockPerps WITH its Chainlink feed args (ethFeed, btcFeed, solFeed)
+# and wires it into SessionFactory. seed.sh intentionally does NOT deploy MockPerps, to
+# avoid a SECOND, drifting deploy path (different constructor args / feed wiring / address)
+# — the same duplication anti-pattern avoided elsewhere. If a future seed wants MockPerps
+# pre-deployed in the dev stack, it must CALL 01-Deploy.s.sol, not reimplement the deploy.
+#
+# (Removed: a broken vestigial `forge create` attempt that NEVER deployed — `forge create
+#  --unlocked` requires --from, MockPerps needs 3 constructor args (no --constructor-args
+#  was passed), the declared CREATE2 salt was unused 31-byte dead code, and the output was
+#  piped through python3 which is the Windows "not found" stub. It silently produced no
+#  address, and verify-stack then silently skipped its check. See quick task 260604-nlp.)
+echo "[5/5] MockPerps deploy DEFERRED to the authoritative path:"
+echo "      forge script contracts/script/01-Deploy.s.sol  (run by Phase 02 when MockPerps is needed)"
+echo "      seed.sh does not deploy MockPerps — avoids a second, drifting deploy path."
 
 echo ""
 echo "============================================================"

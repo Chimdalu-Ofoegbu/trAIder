@@ -181,37 +181,36 @@ if [[ "$ANY_ADDRESS_CHECKED" == "false" && ${FAILURES} -eq 0 ]]; then
 fi
 echo ""
 
-# ── Assertion 4: MockPerps cast code (GUARDED) ───────────────────────────────
-echo "[4/4] Checking MockPerps deploy guard..."
+# ── Assertion 4: MockPerps cast code ─────────────────────────────────────────
+# NO SILENT SKIPS. This check is always one of three EXPLICIT, VISIBLE outcomes:
+#   [OK]    — MOCK_PERPS_ADDRESS is recorded AND has bytecode on anvil
+#   [FAIL]  — MOCK_PERPS_ADDRESS is recorded but the address has no code (loud failure)
+#   [DEFER] — no MOCK_PERPS_ADDRESS recorded: MockPerps is deployed by the AUTHORITATIVE
+#             path (contracts/script/01-Deploy.s.sol, run by Phase 02), NOT by seed.sh.
+# A clearly-labeled [DEFER] is intentionally NOT a silent pass — seed.sh does not deploy
+# MockPerps (see seed.sh Step 5), so its absence here is expected and reported visibly,
+# never hidden. (Was previously a silent skip that masked a false-green — quick 260604-nlp.)
+echo "[4/4] Checking MockPerps deployment status..."
 
-MOCK_PERPS_SOL="${REPO_ROOT}/contracts/src/mocks/MockPerps.sol"
-MOCK_PERPS_ARTIFACT="${REPO_ROOT}/contracts/out/MockPerps.sol/MockPerps.json"
 MOCK_PERPS_ADDRESS=$(load_env_local_value "MOCK_PERPS_ADDRESS")
 
-if ([[ -f "${MOCK_PERPS_SOL}" ]] || [[ -f "${MOCK_PERPS_ARTIFACT}" ]]) && [[ -n "${MOCK_PERPS_ADDRESS}" ]]; then
-    # Guard condition met: MockPerps.sol/artifact exists AND an address is in .env.local
-    echo "[4/4] MockPerps artifact present + address in .env.local — asserting cast code..."
+if [[ -n "${MOCK_PERPS_ADDRESS}" ]]; then
+    echo "[4/4] MOCK_PERPS_ADDRESS recorded (${MOCK_PERPS_ADDRESS}) — asserting on-chain code..."
 
     CODE=$(cast code "${MOCK_PERPS_ADDRESS}" --rpc-url "${ANVIL_RPC}" 2>/dev/null || echo "cast_failed")
 
     if [[ "${CODE}" == "cast_failed" ]]; then
         fail "cast code call failed for MockPerps at ${MOCK_PERPS_ADDRESS}"
     elif [[ "${CODE}" == "0x" || -z "${CODE}" ]]; then
-        fail "MockPerps at ${MOCK_PERPS_ADDRESS} has no code — deploy may have failed"
+        fail "MockPerps at ${MOCK_PERPS_ADDRESS} has no code — recorded but deploy missing/failed"
     else
         CODE_LEN=${#CODE}
         echo "[OK]  MockPerps at ${MOCK_PERPS_ADDRESS} has bytecode (${CODE_LEN} chars)"
     fi
 else
-    echo "[4/4] MockPerps not deployed yet — skipping cast-code check."
-    if [[ ! -f "${MOCK_PERPS_SOL}" ]] && [[ ! -f "${MOCK_PERPS_ARTIFACT}" ]]; then
-        echo "      contracts/src/mocks/MockPerps.sol not present (ships in Plan 08)."
-    fi
-    if [[ -z "${MOCK_PERPS_ADDRESS}" ]]; then
-        echo "      MOCK_PERPS_ADDRESS not in .env.local (run make seed after Plan 08 lands)."
-    fi
-    echo "      Plan 09 deploys MockPerps authoritatively and owns the cast-code assertion."
-    echo "      This is expected behavior at Wave 1 — continuing with exit 0."
+    echo "[DEFER] MockPerps: not deployed by seed (no MOCK_PERPS_ADDRESS in .env.local)."
+    echo "        Authoritative deploy: forge script contracts/script/01-Deploy.s.sol (Phase 02)."
+    echo "        This is the EXPECTED state for the seed-only dev stack — reported, not skipped."
 fi
 echo ""
 

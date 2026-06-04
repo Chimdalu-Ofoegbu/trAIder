@@ -46,7 +46,7 @@ make up
 #    - Runs Alembic migrations (both schemas)
 #    - Seeds 1M USDC + 1 ETH into each of the 4 operator addresses
 #    - Writes funded addresses to .env.local
-#    - GUARDED: deploys MockPerps if contracts/src/mocks/MockPerps.sol is present
+#    - Does NOT deploy MockPerps (deferred to 01-Deploy.s.sol — see "Seeding notes")
 make seed
 
 # 3. Assert all post-seed state is correct
@@ -55,6 +55,32 @@ make verify-stack
 # 4. When done for the day
 make down
 ```
+
+> **No `make`?** GNU `make` is optional. On hosts without it (e.g. Windows git-bash) run the
+> targets directly: `up` = `docker compose -f docker-compose.yml up -d --remove-orphans`,
+> `seed` = `bash scripts/seed.sh`, `verify-stack` = `bash scripts/verify-stack.sh`,
+> `down`/`reset` = the corresponding `docker compose down [--volumes] --remove-orphans`.
+
+### Seeding notes
+
+**USDC is seeded via `anvil_setStorageAt` on balance slot 9 — not `deal()`.**
+forge-std `deal()` is a cheatcode that only mutates forge's in-process EVM; via `forge script`
+it is never broadcast and does **not** persist to the live anvil container. So seed.sh writes the
+Circle FiatToken balances mapping directly: `slot = keccak256(abi.encode(addr, uint256(9)))`.
+This is a deliberate, documented supersession of the `T-0-seedslot`/Pattern 5 decision **for the
+live-anvil dev stack** (that decision targeted `forge test --fork`, where `deal()` works).
+
+- **Safety:** `verify-stack.sh` step [3/4] asserts balances via `balanceOf()` (the real accessor),
+  so a wrong slot reads `0` and fails **loud** — the silent-mis-seed risk `T-0-seedslot` warned about
+  is neutralised by the loud check.
+- **Dependency:** slot 9 is correct for the current USDC (`0xaf88…`) at the pinned fork block.
+  If `FORK_BLOCK` or the USDC implementation changes, re-verify the slot (verify-stack flags a mismatch).
+
+**MockPerps is NOT deployed by `seed.sh`.** Its authoritative deploy is
+`forge script contracts/script/01-Deploy.s.sol` (constructs MockPerps with the Chainlink feed args
+and wires it into SessionFactory), run when a session/Phase 02 needs it. `verify-stack.sh` step [4/4]
+therefore reports MockPerps as an explicit **`[DEFER]`** status (never a silent skip): `[OK]` if an
+address is recorded and has code, loud `[FAIL]` if recorded-but-codeless, `[DEFER]` if not seed-deployed.
 
 ### Full Reset (nuclear option)
 
