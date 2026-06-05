@@ -76,13 +76,16 @@ async def test_close_action_calls_close_position_not_open() -> None:
     # The decision is a close for ETH
     close_decision = _make_decision(action="close", side=None, market="ETH")
 
-    # Fake receipt with OrderCreated event (close path also emits OrderCreated)
+    # Fake receipt with OrderCreated event (close path also emits OrderCreated).
+    # Explicitly set status=1 (success) so the new receipt.get("status") == 0 guard passes.
     fake_order_key_bytes = bytes.fromhex("cd" * 32)
     fake_receipt = MagicMock()
+    fake_receipt.get = MagicMock(return_value=1)  # status=1 (success, not revert)
 
     web3 = AsyncMock()
     web3.eth.get_block_number = AsyncMock(return_value=10)
-    web3.eth.get_transaction_receipt = AsyncMock(return_value=fake_receipt)
+    # GAP-1a fix: driver now uses wait_for_transaction_receipt (not get_transaction_receipt)
+    web3.eth.wait_for_transaction_receipt = AsyncMock(return_value=fake_receipt)
 
     mock_perps = MagicMock()
     mock_perps.functions.executionDelay.return_value.call = AsyncMock(return_value=1)

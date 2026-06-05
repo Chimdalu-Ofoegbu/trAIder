@@ -350,7 +350,8 @@ async def run_cycle(
     # Recover orderKey from the OrderCreated event emitted in the open tx receipt (CR-01).
     # MockPerps emits OrderCreated(orderKey, positionKey, vault) in _openPosition and
     # closePosition — parsing the receipt is deterministic and cycle-safe (no stale-nonce risk).
-    open_receipt = await web3.eth.get_transaction_receipt(tx_hash)
+    # GAP-1a fix: use wait_for_transaction_receipt to avoid TransactionNotFound race on anvil.
+    open_receipt = await web3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
     created_events = mock_perps.events.OrderCreated().process_receipt(open_receipt)
     if not created_events:
         logger.error("Cycle %d: OrderCreated event not found in receipt %s", cycle, tx_hash)
@@ -361,7 +362,8 @@ async def run_cycle(
 
     # Execute the order (mimics GMX keeper)
     exec_tx = await mock_perps.functions.executeOrder(order_key_bytes).transact({"from": deployer})
-    exec_receipt = await web3.eth.get_transaction_receipt(exec_tx)
+    # GAP-1a fix: wait for receipt here too — same race as the open tx.
+    exec_receipt = await web3.eth.wait_for_transaction_receipt(exec_tx, timeout=30)
     exec_block = exec_receipt["blockNumber"]
 
     # Parse OrderExecuted event
