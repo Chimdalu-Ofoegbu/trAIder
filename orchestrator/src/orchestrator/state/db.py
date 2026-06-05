@@ -313,6 +313,7 @@ async def record_pending_order(
     order_key: str,
     session_id: str,
     execute_after_block: int,
+    status: str = "pending",
     decision_snapshot: dict | None = None,
 ) -> None:
     """Insert a pending_orders row recording a submitted-but-not-yet-executed order.
@@ -320,9 +321,9 @@ async def record_pending_order(
     Idempotency: UNIQUE(vault_address, order_key) + ON CONFLICT DO NOTHING
     ensures a restart cannot double-insert the same intent row (T-02-09, ORCH-08).
 
-    Call AFTER submitting the order to MockPerps (or GMX); the real order_key
-    returned by the chain is the idempotency key.  The status starts as 'pending'
-    (the keeper-poll window status — not 'intent').
+    Accepts an optional ``status`` parameter (default ``'pending'``).  Pass
+    ``status='intent'`` for the pre-submit intent row written BEFORE the MockPerps
+    call (ORCH-08 record-intent-before-submit pattern, Plan 05).
 
     Args:
         session: AsyncSession bound to orchestrator_user role.
@@ -330,6 +331,8 @@ async def record_pending_order(
         order_key: bytes32 orderKey (hex string). Forms the idempotency key with vault_address.
         session_id: Active session UUID (FK -> orchestrator.sessions.id).
         execute_after_block: Earliest block at which the keeper may execute this order.
+        status: One of 'intent' | 'pending' | 'executed' | 'reconciled' | 'cancelled'.
+                Default 'pending' (post-submit keeper-poll window status).
         decision_snapshot: Validated Decision dict stored verbatim as JSONB (optional).
     """
     await session.execute(
@@ -341,7 +344,7 @@ async def record_pending_order(
                  created_at, updated_at)
             VALUES
                 (:id, :vault_address, :order_key, CAST(:session_id AS uuid),
-                 :execute_after_block, 'pending', CAST(:decision_snapshot AS jsonb),
+                 :execute_after_block, :status, CAST(:decision_snapshot AS jsonb),
                  :created_at, :updated_at)
             ON CONFLICT (vault_address, order_key) DO NOTHING
             """
@@ -352,6 +355,7 @@ async def record_pending_order(
             "order_key": order_key,
             "session_id": session_id,
             "execute_after_block": execute_after_block,
+            "status": status,
             "decision_snapshot": json.dumps(decision_snapshot)
             if decision_snapshot is not None
             else None,
@@ -465,6 +469,49 @@ async def mark_pending_order_executed(
 
 
 # ---------------------------------------------------------------------------
+# mark_pending_order_reconciled — intent → reconciled status flip (ORCH-08)
+# ---------------------------------------------------------------------------
+
+
+async def mark_pending_order_reconciled(
+    session: AsyncSession,
+    *,
+    vault_address: str,
+    order_key: str,
+) -> None:
+    """Flip a pending_orders row from 'intent' (or 'pending') to 'reconciled'.
+
+    Called by the driver (Plan 05) after the pre-submit intent row has been
+    superseded by the real order_key row (step 8d of run_live_cycle).
+
+    The WHERE clause guards on status IN ('intent', 'pending') so a second call
+    after the row has already been reconciled is a silent no-op (idempotent).
+
+    Args:
+        session: AsyncSession bound to orchestrator_user role.
+        vault_address: Vault address part of the UNIQUE key.
+        order_key: orderKey part of the UNIQUE key (typically the intent-* key).
+    """
+    await session.execute(
+        text(
+            """
+            UPDATE orchestrator.pending_orders
+            SET status = 'reconciled', updated_at = :updated_at
+            WHERE vault_address = :vault_address
+              AND order_key = :order_key
+              AND status IN ('intent', 'pending')
+            """
+        ),
+        {
+            "vault_address": vault_address,
+            "order_key": order_key,
+            "updated_at": datetime.now(UTC),
+        },
+    )
+    await session.commit()
+
+
+# ---------------------------------------------------------------------------
 # get_unresolved_pending_orders — restart recovery query (ORCH-08, T-02-11)
 # ---------------------------------------------------------------------------
 
@@ -474,11 +521,14 @@ async def get_unresolved_pending_orders(
     *,
     vault_address: str,
 ) -> list[dict]:
-    """Return all status='pending' rows for a vault regardless of block number.
+    """Return all status='intent' or status='pending' rows for a vault.
 
     Called at orchestrator startup to discover orders that were submitted before
-    a crash.  The caller must reconcile these against the chain (check whether
-    each order_key is in a live position) before deciding to resubmit or cancel.
+    a crash (or pre-submit intent rows where the submit never landed).
+
+    - status='intent': pre-submit row — the MockPerps submit may or may not have
+      landed.  Caller checks chain state to decide whether to resubmit.
+    - status='pending': post-submit row — the order is on-chain; keeper will execute.
 
     Never double-resubmits: the caller checks chain state first; record_pending_order
     ON CONFLICT DO NOTHING prevents duplicate intent rows even if reconciliation
@@ -498,7 +548,7 @@ async def get_unresolved_pending_orders(
                    execute_after_block, status, decision_snapshot
             FROM orchestrator.pending_orders
             WHERE vault_address = :vault_address
-              AND status = 'pending'
+              AND status IN ('intent', 'pending')
             ORDER BY created_at ASC
             """
         ),
