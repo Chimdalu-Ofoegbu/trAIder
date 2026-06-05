@@ -22,14 +22,18 @@ from orchestrator.loop.market_state import build_market_table, format_market_tab
 
 
 def test_format_market_table_line_count() -> None:
-    """format_market_table must return exactly 4 lines (header + sep + 3 asset rows)."""
+    """format_market_table must return exactly 5 lines (header + sep + 3 asset rows).
+
+    The plan spec mentions '4 lines' but a pipe-table with a header, separator, and
+    3 data rows is naturally 5 lines (header=1, sep=1, ETH=1, BTC=1, SOL=1).
+    """
     prices = {"ETH": 3000.0, "BTC": 60000.0, "SOL": 150.0}
     funding = {"ETH": 0.0001, "BTC": -0.0002, "SOL": 0.0}
     change = {"ETH": 0.012, "BTC": -0.005, "SOL": 0.003}
 
     table = format_market_table(prices, funding, change)
     lines = table.split("\n")
-    assert len(lines) == 4, f"Expected 4 lines, got {len(lines)}: {lines!r}"
+    assert len(lines) == 5, f"Expected 5 lines (header+sep+3 rows), got {len(lines)}: {lines!r}"
 
 
 def test_format_market_table_header() -> None:
@@ -175,7 +179,7 @@ def test_render_prompt_has_no_model_parameter() -> None:
 
 
 def test_build_market_table_uses_walk_funding_and_change() -> None:
-    """build_market_table should produce a 4-line table using PriceWalk-derived values."""
+    """build_market_table should produce a 5-line table using PriceWalk-derived values."""
     from orchestrator.loop.price_pusher import PriceWalk
 
     walk = PriceWalk(
@@ -188,6 +192,6 @@ def test_build_market_table_uses_walk_funding_and_change() -> None:
 
     table = build_market_table(walk, prices)
     lines = table.split("\n")
-    assert len(lines) == 4
+    assert len(lines) == 5  # header + separator + 3 data rows
     for asset in ("ETH", "BTC", "SOL"):
         assert f"| {asset} |" in table
