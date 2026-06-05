@@ -150,7 +150,11 @@ async def push_price(
     tx_hash = await aggregator_contract.functions.setPrice(new_price_8dec).transact(
         {"from": from_address}
     )
-    await web3.eth.get_transaction_receipt(tx_hash)
+    # GAP-1b fix: use wait_for_transaction_receipt (not get_transaction_receipt) so the price
+    # is confirmed on-chain before the driver reads it via _markPrice. get_transaction_receipt
+    # races with anvil mining and returns None if the tx isn't yet in a block, which can leave
+    # the aggregator with a stale/zero price that triggers MockPerps._markPrice staleness revert.
+    await web3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
     logger.debug(
         "push_price: %s → %d (tx=%s)", aggregator_contract.address, new_price_8dec, tx_hash.hex()
     )

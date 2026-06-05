@@ -514,12 +514,38 @@ async def run_live_cycle(
         tx = await open_fn(decision.market, size_usd_1e30, leverage_1e4, slippage_bps).transact(
             {"from": vault}
         )
-    receipt = await web3.eth.get_transaction_receipt(tx)
+
+    # GAP-1a fix: use wait_for_transaction_receipt (not get_transaction_receipt) to avoid
+    # TransactionNotFound race on anvil, and wrap the entire receipt + event-recovery block
+    # in try/except so ANY on-chain revert (status==0) or timeout is journaled as a cycle
+    # error instead of crashing the session loop (SC-1 requires loop survives bad trades).
+    try:
+        receipt = await web3.eth.wait_for_transaction_receipt(tx, timeout=30)
+    except Exception as exc:  # noqa: BLE001
+        # TransactionNotFound, TimeExhausted, or unexpected web3 error — journal and continue
+        reason = f"receipt retrieval failed: {exc}"
+        logger.error("Cycle %d: %s (tx=%s)", cycle, reason, tx.hex() if hasattr(tx, "hex") else tx)
+        await mark_pending_order_reconciled(db, vault_address=vault, order_key=intent_key)
+        return {"status": "error", "reason": reason, "intent_key": intent_key}
+
+    # On-chain revert: status==0 means the transaction was included but reverted.
+    if receipt.get("status") == 0:
+        reason = f"on-chain revert (tx={receipt.get('transactionHash', b'').hex()[:10]})"
+        logger.error(
+            "Cycle %d: %s market=%s side=%s — journaling as cycle error, loop continues",
+            cycle,
+            reason,
+            decision.market,
+            decision.side,
+        )
+        await mark_pending_order_reconciled(db, vault_address=vault, order_key=intent_key)
+        return {"status": "error", "reason": reason, "intent_key": intent_key}
 
     # Recover the REAL order_key from the OrderCreated event (mock_harness CR-01 pattern):
     created = mock_perps.events.OrderCreated().process_receipt(receipt)
     if not created:
         logger.error("Cycle %d: OrderCreated event not found in receipt", cycle)
+        await mark_pending_order_reconciled(db, vault_address=vault, order_key=intent_key)
         return {
             "status": "error",
             "error": "OrderCreated event not found in open tx receipt",
