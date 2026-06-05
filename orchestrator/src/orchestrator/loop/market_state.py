@@ -108,6 +108,31 @@ def build_market_table(walk: Any, prices: dict) -> str:
     return format_market_table(prices, funding, change)
 
 
+def build_market_table_from_snapshot(snapshot: dict[str, dict[str, float]]) -> str:
+    """Build a market_table from a consistent per-step snapshot (CR-03 fix).
+
+    Use this in the driver when consuming snapshots published by run_price_pusher.
+    All three values (mark, funding, change_24h) come from the SAME walk step,
+    ensuring the prompt table is internally consistent.
+
+    Parameters
+    ----------
+    snapshot:
+        Dict keyed by asset with keys ``mark``, ``funding``, ``change_24h``.
+        Produced by ``price_pusher.build_consistent_snapshot(walk)`` immediately
+        after ``walk.step()`` — guarantees all three values are from one step.
+
+    Returns
+    -------
+    str
+        Same four-line pipe-table as ``format_market_table``.
+    """
+    prices = {asset: v["mark"] for asset, v in snapshot.items()}
+    funding = {asset: v["funding"] for asset, v in snapshot.items()}
+    change = {asset: v["change_24h"] for asset, v in snapshot.items()}
+    return format_market_table(prices, funding, change)
+
+
 # ---------------------------------------------------------------------------
 # Frozen-prompt render (Pitfall 6 — Jinja2, not str.format)
 # ---------------------------------------------------------------------------

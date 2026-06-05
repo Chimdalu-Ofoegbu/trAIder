@@ -156,6 +156,35 @@ async def push_price(
     )
 
 
+def build_consistent_snapshot(walk: PriceWalk) -> dict[str, dict[str, float]]:
+    """Produce a consistent market snapshot after walk.step() has been called.
+
+    Returns a dict keyed by asset with keys ``mark``, ``funding``, ``change_24h``
+    all derived from the SAME walk step.  This is the value published to the
+    snapshot_queue for driver.build_market_table consumption (CR-03 fix).
+
+    Parameters
+    ----------
+    walk:
+        A ``PriceWalk`` whose ``step()`` has already been called this cycle.
+        ``walk.prices`` holds the stepped mark prices; ``funding_rate`` and
+        ``change_24h`` read from the same ``_history`` that ``step()`` just updated.
+
+    Returns
+    -------
+    dict
+        Example: ``{"ETH": {"mark": 3001.2, "funding": 0.0001, "change_24h": 0.012}, ...}``
+    """
+    snapshot: dict[str, dict[str, float]] = {}
+    for asset in walk.prices:
+        snapshot[asset] = {
+            "mark": walk.prices[asset],
+            "funding": walk.funding_rate(asset),
+            "change_24h": walk.change_24h(asset),
+        }
+    return snapshot
+
+
 async def run_price_pusher(
     web3: Any,
     aggregators: dict[str, Any],
@@ -163,12 +192,17 @@ async def run_price_pusher(
     from_address: str,
     cadence_seconds: float,
     stop_event: asyncio.Event,
+    snapshot_queue: asyncio.Queue | None = None,
 ) -> None:
     """Price-pusher coroutine — runs as a separate asyncio.Task alongside loop_driver.
 
     Each cadence cycle:
     1. Advance the seeded walk by one step (deterministic, log-normal + floor).
     2. Push the new price for each asset to its MockChainlinkAggregator.
+    3. (CR-03) If snapshot_queue is provided, publish a consistent snapshot dict
+       ``{asset: {mark, funding, change_24h}}`` computed from the SAME step.
+       The driver reads this snapshot for build_market_table so mark/funding/24h%
+       all come from one consistent step, not an arbitrary concurrent step.
 
     Stops cleanly when ``stop_event`` is set (D-12 session-end signal).
 
@@ -187,6 +221,10 @@ async def run_price_pusher(
         Seconds between price pushes (matches ``SessionConfig.cadence_seconds``).
     stop_event:
         ``asyncio.Event`` that signals all coroutines to shut down (D-12).
+    snapshot_queue:
+        Optional asyncio.Queue for publishing consistent per-step market snapshots
+        to the driver (CR-03 fix).  Pass maxsize=1 so the driver always gets the
+        latest snapshot (older unread snapshots are discarded).
     """
     logger.info(
         "run_price_pusher: starting (cadence=%.1fs, assets=%s)",
@@ -194,11 +232,25 @@ async def run_price_pusher(
         list(aggregators.keys()),
     )
     while not stop_event.is_set():
+        # Step the walk and publish on-chain atomically — funding/24h derived from
+        # this exact step so build_consistent_snapshot is internally consistent (CR-03).
         prices = walk.step()
         for asset, contract in aggregators.items():
             price_8dec = to_8dec(prices[asset])
             await push_price(web3, contract, price_8dec, from_address)
             logger.debug("run_price_pusher: %s → $%.4f (%d 8dec)", asset, prices[asset], price_8dec)
+
+        # CR-03: publish consistent snapshot so driver's market_table uses the same step
+        if snapshot_queue is not None:
+            snapshot = build_consistent_snapshot(walk)
+            # Drain any stale snapshot so the driver always gets the latest step
+            if not snapshot_queue.empty():
+                try:
+                    snapshot_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            await snapshot_queue.put(snapshot)
+
         # NEVER time.sleep — must keep the event loop responsive (asyncio rule)
         await asyncio.sleep(cadence_seconds)
     logger.info("run_price_pusher: stop_event set — exiting")

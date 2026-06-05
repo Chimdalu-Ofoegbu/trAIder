@@ -55,7 +55,11 @@ from typing import Any
 from orchestrator.business_rules import validate_business_rules
 from orchestrator.loop.failure_tracker import FailureTracker
 from orchestrator.loop.keeper_monitor import run_keeper_monitor
-from orchestrator.loop.market_state import build_market_table, read_mark_prices
+from orchestrator.loop.market_state import (
+    build_market_table,
+    build_market_table_from_snapshot,
+    read_mark_prices,
+)
 from orchestrator.loop.price_pusher import PriceWalk, run_price_pusher
 from orchestrator.loop.session import SessionConfig, format_time_remaining
 from orchestrator.mock_harness import _make_envelope, _publish
@@ -156,6 +160,7 @@ async def run_live_cycle(
     positions_table: str,
     recent_decisions: str,
     elapsed_seconds: float,
+    market_snapshot: dict[str, dict[str, float]] | None = None,
 ) -> dict:
     """Execute one live trading cycle (ORCH-02 sequence).
 
@@ -179,6 +184,12 @@ async def run_live_cycle(
         positions_table: Pre-rendered positions table string for the prompt.
         recent_decisions: Last-N-cycles decision summary for the prompt.
         elapsed_seconds: Seconds elapsed since session start (for time_remaining).
+        market_snapshot: Optional consistent per-step snapshot from price_pusher
+            (CR-03 fix).  If provided, all market_table values (mark, funding,
+            change_24h) come from this snapshot's single step.  When None, falls
+            back to reading mark prices from the aggregator and deriving funding/24h
+            from the walk (may be one step behind price_pusher — only for backwards
+            compat / testing without a snapshot queue).
 
     Returns:
         Result dict with keys:
@@ -192,8 +203,17 @@ async def run_live_cycle(
     vault_channel = channel_for("ModelStatus", vault_address=vault)
 
     # ── Step 1–3: Build prompt ────────────────────────────────────────────────
-    prices = await read_mark_prices(aggregators)
-    market_table = build_market_table(walk, prices)
+    # CR-03: prefer market_snapshot (from price_pusher via snapshot_queue) so mark,
+    # funding, and 24h% all come from the same walk step.  Fall back to the legacy
+    # on-chain read + walk-derived path when no snapshot is available (backwards compat).
+    if market_snapshot is not None:
+        market_table = build_market_table_from_snapshot(market_snapshot)
+        # Still read mark prices for any downstream callers (unused in this path but
+        # kept for consistency with the existing function signature contract)
+        prices = {asset: v["mark"] for asset, v in market_snapshot.items()}
+    else:
+        prices = await read_mark_prices(aggregators)
+        market_table = build_market_table(walk, prices)
     time_remaining = format_time_remaining(elapsed_seconds, config.session_duration_seconds)
 
     from orchestrator.loop.market_state import render_prompt
@@ -695,6 +715,12 @@ async def run_session(
         config.volatility,
     )
 
+    # CR-03: snapshot queue for consistent market_table data.
+    # price_pusher publishes {asset: {mark, funding, change_24h}} after each step.
+    # maxsize=1 ensures the driver always reads the latest snapshot (stale snapshots
+    # are discarded by price_pusher before publishing a new one).
+    snapshot_queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+
     price_pusher_task = asyncio.create_task(
         run_price_pusher(
             web3,
@@ -703,6 +729,7 @@ async def run_session(
             deployer_address,
             config.cadence_seconds,
             stop_event,
+            snapshot_queue=snapshot_queue,
         ),
         name=f"price_pusher-{config.session_id[:8]}",
     )
@@ -758,6 +785,16 @@ async def run_session(
                 )
             )
 
+            # CR-03: Try to get the latest consistent snapshot published by price_pusher.
+            # If no snapshot yet (first cycle before price_pusher steps), fall back to
+            # None (run_live_cycle will use the legacy on-chain read + walk path).
+            current_snapshot: dict | None = None
+            if not snapshot_queue.empty():
+                try:
+                    current_snapshot = snapshot_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+
             result = await run_live_cycle(
                 web3,
                 mock_perps,
@@ -778,6 +815,7 @@ async def run_session(
                 positions_table=positions_table,
                 recent_decisions="\n".join(recent_decisions[-5:]) or "None",
                 elapsed_seconds=elapsed,
+                market_snapshot=current_snapshot,
             )
 
             # Keep last-5 decision summary
