@@ -219,16 +219,28 @@ async def run_keeper_monitor(
     _seq = 0
     while not stop_event.is_set():
         _seq += 1
-        await execute_ready_orders(
-            web3,
-            mock_perps,
-            db_session,
-            deployer_address=deployer_address,
-            vault_address=vault_address,
-            redis=redis,
-            session_id=session_id,
-            seq_counter=_seq,
-        )
+        # WR-05: wrap poll iteration in try/except so a transient web3 or DB error
+        # does not silently kill the keeper task.  execute_ready_orders already wraps
+        # individual order failures; this outer guard catches get_block_number() and
+        # get_pending_orders_ready() failures that would otherwise terminate the loop.
+        # asyncio.CancelledError is deliberately NOT caught — let cancellation propagate
+        # for clean shutdown (D-12 stop_event path).
+        try:
+            await execute_ready_orders(
+                web3,
+                mock_perps,
+                db_session,
+                deployer_address=deployer_address,
+                vault_address=vault_address,
+                redis=redis,
+                session_id=session_id,
+                seq_counter=_seq,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "run_keeper_monitor: unhandled exception in poll iteration (will retry): %s",
+                exc,
+            )
         # NEVER time.sleep — must keep the event loop responsive
         await asyncio.sleep(poll_seconds)
 
