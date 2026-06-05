@@ -358,16 +358,45 @@ async def pg_session(tmp_path):
 
 
 def _apply_migrations(db_url: str) -> None:
-    """Apply alembic upgrade head using a sync psycopg URL."""
-    sync_url = db_url.replace("+asyncpg", "+psycopg", 1)
+    """Apply alembic upgrade head using a migrator-role psycopg URL.
+
+    Migration DDL requires migrator_user privileges (CREATE SCHEMA, etc.).
+    Resolution order:
+      1. DATABASE_URL from env — set by Makefile / CI to migrator credentials.
+      2. Derive from the caller's db_url by substituting migrator_user credentials
+         (works when DATABASE_URL is not set in the environment).
+    """
+    # Prefer the explicit DATABASE_URL from environment (set by Makefile / CI
+    # to postgresql+psycopg://migrator_user:migrator_pass@...) since alembic
+    # env.py requires DDL privileges (CREATE SCHEMA) that orchestrator_user lacks.
+    migration_url = os.environ.get("DATABASE_URL", "")
+    if not migration_url:
+        # Derive migrator URL from the runtime URL: swap driver + credentials.
+        # This handles the dev case where only ORCHESTRATOR_DATABASE_URL is set.
+        sync_url = db_url.replace("+asyncpg", "+psycopg", 1)
+        migration_url = sync_url.replace(
+            "orchestrator_user:orchestrator_pass",
+            "migrator_user:migrator_pass",
+        )
+
     alembic_ini = _REPO_ROOT / "migrations" / "alembic.ini"
     result = subprocess.run(
-        ["uv", "run", "alembic", "-c", str(alembic_ini), "upgrade", "head"],
+        [
+            "uv",
+            "run",
+            "--project",
+            "orchestrator",
+            "alembic",
+            "-c",
+            str(alembic_ini),
+            "upgrade",
+            "head",
+        ],
         cwd=str(_REPO_ROOT),
         capture_output=True,
         text=True,
         timeout=60,
-        env={**os.environ, "DATABASE_URL": sync_url},
+        env={**os.environ, "DATABASE_URL": migration_url},
     )
     if result.returncode != 0:
         raise RuntimeError(f"alembic upgrade head failed:\n{result.stdout}\n{result.stderr}")

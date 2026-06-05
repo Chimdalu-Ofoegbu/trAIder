@@ -299,3 +299,288 @@ def _make_trade_hash(vault_address: str, order_key: str, block_number: int) -> s
     """
     payload = f"{vault_address.lower()}:{order_key.lower()}:{block_number}"
     return "0x" + hashlib.sha256(payload.encode()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# record_pending_order — insert with idempotency (ORCH-07/08, T-02-09)
+# ---------------------------------------------------------------------------
+
+
+async def record_pending_order(
+    session: AsyncSession,
+    *,
+    vault_address: str,
+    order_key: str,
+    session_id: str,
+    execute_after_block: int,
+    decision_snapshot: dict | None = None,
+) -> None:
+    """Insert a pending_orders row recording a submitted-but-not-yet-executed order.
+
+    Idempotency: UNIQUE(vault_address, order_key) + ON CONFLICT DO NOTHING
+    ensures a restart cannot double-insert the same intent row (T-02-09, ORCH-08).
+
+    Call AFTER submitting the order to MockPerps (or GMX); the real order_key
+    returned by the chain is the idempotency key.  The status starts as 'pending'
+    (the keeper-poll window status — not 'intent').
+
+    Args:
+        session: AsyncSession bound to orchestrator_user role.
+        vault_address: ERC-4626 vault address.
+        order_key: bytes32 orderKey (hex string). Forms the idempotency key with vault_address.
+        session_id: Active session UUID (FK -> orchestrator.sessions.id).
+        execute_after_block: Earliest block at which the keeper may execute this order.
+        decision_snapshot: Validated Decision dict stored verbatim as JSONB (optional).
+    """
+    await session.execute(
+        text(
+            """
+            INSERT INTO orchestrator.pending_orders
+                (id, vault_address, order_key, session_id,
+                 execute_after_block, status, decision_snapshot,
+                 created_at, updated_at)
+            VALUES
+                (:id, :vault_address, :order_key, CAST(:session_id AS uuid),
+                 :execute_after_block, 'pending', CAST(:decision_snapshot AS jsonb),
+                 :created_at, :updated_at)
+            ON CONFLICT (vault_address, order_key) DO NOTHING
+            """
+        ),
+        {
+            "id": str(uuid.uuid4()),
+            "vault_address": vault_address,
+            "order_key": order_key,
+            "session_id": session_id,
+            "execute_after_block": execute_after_block,
+            "decision_snapshot": json.dumps(decision_snapshot)
+            if decision_snapshot is not None
+            else None,
+            "created_at": datetime.now(UTC),
+            "updated_at": datetime.now(UTC),
+        },
+    )
+    await session.commit()
+
+
+# ---------------------------------------------------------------------------
+# get_pending_orders_ready — block-gated keeper query (T-02-10)
+# ---------------------------------------------------------------------------
+
+
+async def get_pending_orders_ready(
+    session: AsyncSession,
+    current_block: int,
+    *,
+    vault_address: str | None = None,
+) -> list[dict]:
+    """Return pending_orders rows that are eligible for keeper execution.
+
+    A row is eligible when:
+      - status = 'pending'  (not yet executed or cancelled)
+      - execute_after_block <= current_block  (the execution delay has elapsed)
+
+    Optionally filtered to a single vault (pass vault_address=None for all vaults).
+    Results are ordered by created_at ASC so the oldest intent is executed first.
+
+    Args:
+        session: AsyncSession bound to orchestrator_user role.
+        current_block: Current chain block number (from web3.eth.block_number).
+        vault_address: Optional filter; returns rows for all vaults when None.
+
+    Returns:
+        List of dicts with keys: id, vault_address, order_key, session_id,
+        execute_after_block, status, decision_snapshot.
+    """
+    if vault_address is not None:
+        result = await session.execute(
+            text(
+                """
+                SELECT id, vault_address, order_key, session_id,
+                       execute_after_block, status, decision_snapshot
+                FROM orchestrator.pending_orders
+                WHERE status = 'pending'
+                  AND execute_after_block <= :current_block
+                  AND vault_address = :vault_address
+                ORDER BY created_at ASC
+                """
+            ),
+            {"current_block": current_block, "vault_address": vault_address},
+        )
+    else:
+        result = await session.execute(
+            text(
+                """
+                SELECT id, vault_address, order_key, session_id,
+                       execute_after_block, status, decision_snapshot
+                FROM orchestrator.pending_orders
+                WHERE status = 'pending'
+                  AND execute_after_block <= :current_block
+                ORDER BY created_at ASC
+                """
+            ),
+            {"current_block": current_block},
+        )
+    return [dict(r._mapping) for r in result]
+
+
+# ---------------------------------------------------------------------------
+# mark_pending_order_executed — status flip (idempotent, T-02-09)
+# ---------------------------------------------------------------------------
+
+
+async def mark_pending_order_executed(
+    session: AsyncSession,
+    *,
+    vault_address: str,
+    order_key: str,
+) -> None:
+    """Flip a pending_orders row from 'pending' to 'executed'.
+
+    The WHERE clause includes status='pending' so a second call (e.g. on restart
+    after the keeper already flipped it) is a silent no-op — no error, no double
+    transition (idempotent by design).
+
+    Args:
+        session: AsyncSession bound to orchestrator_user role.
+        vault_address: Vault address part of the UNIQUE key.
+        order_key: orderKey part of the UNIQUE key.
+    """
+    await session.execute(
+        text(
+            """
+            UPDATE orchestrator.pending_orders
+            SET status = 'executed', updated_at = :updated_at
+            WHERE vault_address = :vault_address
+              AND order_key = :order_key
+              AND status = 'pending'
+            """
+        ),
+        {
+            "vault_address": vault_address,
+            "order_key": order_key,
+            "updated_at": datetime.now(UTC),
+        },
+    )
+    await session.commit()
+
+
+# ---------------------------------------------------------------------------
+# get_unresolved_pending_orders — restart recovery query (ORCH-08, T-02-11)
+# ---------------------------------------------------------------------------
+
+
+async def get_unresolved_pending_orders(
+    session: AsyncSession,
+    *,
+    vault_address: str,
+) -> list[dict]:
+    """Return all status='pending' rows for a vault regardless of block number.
+
+    Called at orchestrator startup to discover orders that were submitted before
+    a crash.  The caller must reconcile these against the chain (check whether
+    each order_key is in a live position) before deciding to resubmit or cancel.
+
+    Never double-resubmits: the caller checks chain state first; record_pending_order
+    ON CONFLICT DO NOTHING prevents duplicate intent rows even if reconciliation
+    runs twice (T-02-11 lost-order-history mitigation).
+
+    Args:
+        session: AsyncSession bound to orchestrator_user role.
+        vault_address: Vault to reconcile (one vault per model).
+
+    Returns:
+        List of dicts (same shape as get_pending_orders_ready) ordered by created_at ASC.
+    """
+    result = await session.execute(
+        text(
+            """
+            SELECT id, vault_address, order_key, session_id,
+                   execute_after_block, status, decision_snapshot
+            FROM orchestrator.pending_orders
+            WHERE vault_address = :vault_address
+              AND status = 'pending'
+            ORDER BY created_at ASC
+            """
+        ),
+        {"vault_address": vault_address},
+    )
+    return [dict(r._mapping) for r in result]
+
+
+# ---------------------------------------------------------------------------
+# create_session / end_session — session lifecycle (D-12, ORCH plan 05 startup)
+# ---------------------------------------------------------------------------
+
+
+async def create_session(
+    session: AsyncSession,
+    *,
+    session_id: str,
+    session_key: str,
+    duration_seconds: int,
+) -> None:
+    """Insert an orchestrator.sessions row for a new trading session.
+
+    Idempotent: ON CONFLICT (id) DO NOTHING — safe to call on restart without
+    creating a duplicate row.
+
+    Args:
+        session: AsyncSession bound to orchestrator_user role.
+        session_id: UUID string for the new session (PK).
+        session_key: Unique human-readable key (e.g. 'claude-s1-20260608').
+        duration_seconds: Planned session duration (used for the D-12 countdown).
+    """
+    now = datetime.now(UTC)
+    await session.execute(
+        text(
+            """
+            INSERT INTO orchestrator.sessions
+                (id, session_key, duration_seconds, state, started_at, created_at, updated_at)
+            VALUES
+                (CAST(:session_id AS uuid), :session_key, :duration_seconds,
+                 'active', :started_at, :created_at, :updated_at)
+            ON CONFLICT (id) DO NOTHING
+            """
+        ),
+        {
+            "session_id": session_id,
+            "session_key": session_key,
+            "duration_seconds": duration_seconds,
+            "started_at": now,
+            "created_at": now,
+            "updated_at": now,
+        },
+    )
+    await session.commit()
+
+
+async def end_session(
+    session: AsyncSession,
+    *,
+    session_id: str,
+) -> None:
+    """Mark an active session as ended (D-12 session-end lifecycle).
+
+    Sets state='ended' and records ended_at.  Does NOT close any open positions —
+    the settlement contract handles position draining separately.
+
+    Args:
+        session: AsyncSession bound to orchestrator_user role.
+        session_id: UUID string of the session to end.
+    """
+    now = datetime.now(UTC)
+    await session.execute(
+        text(
+            """
+            UPDATE orchestrator.sessions
+            SET state = 'ended', ended_at = :ended_at, updated_at = :updated_at
+            WHERE id = CAST(:session_id AS uuid)
+            """
+        ),
+        {
+            "session_id": session_id,
+            "ended_at": now,
+            "updated_at": now,
+        },
+    )
+    await session.commit()
