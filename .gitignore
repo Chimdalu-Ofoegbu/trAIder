@@ -20,6 +20,8 @@ contracts/cache/
 contracts/.cache/
 broadcast/*/31337/
 broadcast/*/421614/
+contracts/broadcast/*/31337/
+contracts/broadcast/*/421614/
 # keep lib/ submodules but ignore any cached downloads
 contracts/lib/.cache/
 
