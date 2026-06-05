@@ -57,4 +57,34 @@ backend = { path = "../backend", editable = true }
 [dependency-groups]
 dev = [
     "backend",
+    "pytest-cov>=7.1.0",
+]
+
+# ---------------------------------------------------------------------------
+# Coverage config — SC-5 / TEST-02 (≥80% gate, Plan 02-06)
+#
+# Rationale for omissions:
+#   - providers/anthropic_adapter.py: the call_claude() function makes live
+#     network calls to the Anthropic API and cannot be exercised in unit tests
+#     without a real API key. The pure classification helpers in the same module
+#     (extract_tool_input, classify_exception, validate_decision) ARE measured —
+#     they are unit-tested in tests/unit/test_anthropic_adapter.py (Plan 02-02).
+#     We use `# pragma: no cover` on the call_claude function body rather than
+#     omitting the whole module so the measurable helpers remain in scope.
+#   - tests/*: test code is excluded from coverage measurement (standard practice).
+# ---------------------------------------------------------------------------
+
+[tool.coverage.run]
+source = ["orchestrator"]
+omit = [
+    "*/tests/*",
+    "*/test_*",
+]
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
 ]
