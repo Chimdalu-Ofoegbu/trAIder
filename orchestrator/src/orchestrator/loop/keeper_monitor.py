@@ -91,7 +91,9 @@ async def execute_ready_orders(
             exec_tx = await mock_perps.functions.executeOrder(order_key_bytes).transact(
                 {"from": deployer_address}
             )
-            exec_receipt = await web3.eth.get_transaction_receipt(exec_tx)
+            # GAP-1a fix (same race as driver): use wait_for_transaction_receipt so
+            # the executeOrder tx is confirmed before we parse its events.
+            exec_receipt = await web3.eth.wait_for_transaction_receipt(exec_tx, timeout=30)
             exec_block = exec_receipt["blockNumber"]
 
             # ── Branch: OrderExecuted (D-02: record_trade ONLY here) ─────────
