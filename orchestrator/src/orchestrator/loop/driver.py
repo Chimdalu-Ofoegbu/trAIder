@@ -52,6 +52,8 @@ import logging
 import time
 from typing import Any
 
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from orchestrator.business_rules import validate_business_rules
 from orchestrator.loop.failure_tracker import FailureTracker
 from orchestrator.loop.keeper_monitor import run_keeper_monitor
@@ -758,6 +760,15 @@ async def run_session(
     # are discarded by price_pusher before publishing a new one).
     snapshot_queue: asyncio.Queue = asyncio.Queue(maxsize=1)
 
+    # CR-04: The keeper_monitor runs as a SEPARATE asyncio.Task concurrently with the
+    # cycle loop.  SQLAlchemy AsyncSession is NOT safe for concurrent access from
+    # multiple coroutines — sharing `db` between run_live_cycle and run_keeper_monitor
+    # causes "session is in prepared state" errors when both try to execute SQL at the
+    # same time.  Fix: create a dedicated AsyncSession for the keeper, bound to the
+    # same engine as the caller's session (db.bind is the AsyncEngine), so keeper
+    # writes never contend with the driver's writes.
+    keeper_db = AsyncSession(db.bind)
+
     price_pusher_task = asyncio.create_task(
         run_price_pusher(
             web3,
@@ -774,7 +785,7 @@ async def run_session(
         run_keeper_monitor(
             web3,
             mock_perps,
-            db,
+            keeper_db,
             deployer_address=deployer_address,
             vault_address=vault,
             redis=redis,
@@ -912,6 +923,13 @@ async def run_session(
                 await task
             except asyncio.CancelledError:
                 pass
+
+        # CR-04: Close the keeper's dedicated session now that the keeper task is done.
+        # This releases the DB connection back to the pool before end_session runs.
+        try:
+            await keeper_db.close()
+        except Exception:  # noqa: BLE001
+            pass  # best-effort close; don't mask shutdown errors
 
         await end_session(db, session_id=config.session_id)
 
