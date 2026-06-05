@@ -9,6 +9,7 @@ description = "trAIder orchestrator + verifier — autonomous LLM trading loop"
 requires-python = ">=3.11,<3.13"
 
 # Phase 0 dependencies: mock harness + schema validation (no live LLM in Phase 0, D-14)
+# Phase 2 live loop dependencies added (D-14 lifted for live provider loop)
 dependencies = [
     "pydantic>=2.13",
     "web3>=7.16",
@@ -16,19 +17,20 @@ dependencies = [
     "pytest-asyncio>=1.4",
     "ruff>=0.15",
     "httpx>=0.28",
+    "anthropic>=0.105",          # Claude Opus 4.7 — NO temperature param (HTTP 400)
+    "sqlalchemy[asyncio]>=2.0",  # async session; implied by db.py, missing from pyproject
+    "asyncpg>=0.29",             # async Postgres driver; implied by db.py DSN
+    "redis[asyncio]>=5.0",       # pub/sub; use redis.asyncio, not sync client
+    "jinja2>=3.1",               # prompt template rendering (system.md Jinja2 {{placeholders}})
 ]
-
-# Phase 2 provider SDKs — uncomment when live LLM loop lands (D-14)
-# NOTE: pin floors verified against PyPI on 2026-06-01 (see 00-RESEARCH.md Standard Stack)
-# "anthropic>=0.105",         # Claude Opus 4.7 — NO temperature param (400 error)
-# "openai>=2.38",             # GPT-5.5 (gpt-5.5-2026-04-23) — use reasoning_effort="none" for speed
-# "google-genai>=2.7",        # Gemini 3.1 Pro — from google import genai (NOT google-generativeai)
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=1.4",
     "ruff>=0.15",
+    "pytest-cov>=5.0",   # TEST-02 >=80% coverage gate
+    "freezegun>=1.4",    # mock wall-clock in loop driver tests (truthful-countdown D-11)
 ]
 
 [tool.hatch.build.targets.wheel]
