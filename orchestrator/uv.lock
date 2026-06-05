@@ -938,6 +938,7 @@ dev = [
 [package.dev-dependencies]
 dev = [
     { name = "backend" },
+    { name = "pytest-cov" },
 ]
 
 [package.metadata]
@@ -962,7 +963,10 @@ requires-dist = [
 provides-extras = ["dev"]
 
 [package.metadata.requires-dev]
-dev = [{ name = "backend", editable = "../backend" }]
+dev = [
+    { name = "backend", editable = "../backend" },
+    { name = "pytest-cov", specifier = ">=7.1.0" },
+]
 
 [[package]]
 name = "packaging"
