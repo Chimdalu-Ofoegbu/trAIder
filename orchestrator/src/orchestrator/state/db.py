@@ -242,6 +242,8 @@ async def record_model_status(
     model: str,
     status: str,
     consecutive_failures: int = 0,
+    api_failure_streak: int = 0,
+    malformed_streak: int = 0,
     reason: str | None = None,
     cycle_number: int | None = None,
 ) -> None:
@@ -258,7 +260,12 @@ async def record_model_status(
         session_id: Active session UUID.
         model: LLM model identifier string (e.g. 'claude-opus-4-7').
         status: 'active' | 'paused' | 'malformed'
-        consecutive_failures: Running failure count (resets on success).
+        consecutive_failures: max(api_failure_streak, malformed_streak) for display.
+            Written to the consecutive_failures column for backwards-compat.
+        api_failure_streak: Current api_failure_streak value from FailureTracker.
+            Persisted so the tracker can be rehydrated across restart (ORCH-06).
+        malformed_streak: Current malformed_streak value from FailureTracker.
+            Persisted so the tracker can be rehydrated across restart (ORCH-06).
         reason: Human-readable note (e.g. 'missing action field').
         cycle_number: Which cycle this status was recorded on.
     """
@@ -266,23 +273,73 @@ async def record_model_status(
         text(
             """
             INSERT INTO orchestrator.model_status_log
-                (id, vault_address, session_id, status, reason, cycle_number, created_at)
+                (id, vault_address, session_id, model, status,
+                 consecutive_failures, api_failure_streak, malformed_streak,
+                 reason, cycle_number, created_at)
             VALUES
-                (:id, :vault_address, CAST(:session_id AS uuid), :status, :reason,
-                 :cycle_number, :created_at)
+                (:id, :vault_address, CAST(:session_id AS uuid), :model, :status,
+                 :consecutive_failures, :api_failure_streak, :malformed_streak,
+                 :reason, :cycle_number, :created_at)
             """
         ),
         {
             "id": str(uuid.uuid4()),
             "vault_address": vault_address,
             "session_id": session_id,
+            "model": model,
             "status": status,
+            "consecutive_failures": consecutive_failures,
+            "api_failure_streak": api_failure_streak,
+            "malformed_streak": malformed_streak,
             "reason": reason,
             "cycle_number": cycle_number,
             "created_at": datetime.now(UTC),
         },
     )
     await session.commit()
+
+
+# ---------------------------------------------------------------------------
+# get_latest_model_status — rehydration query for FailureTracker restart (ORCH-06)
+# ---------------------------------------------------------------------------
+
+
+async def get_latest_model_status(
+    session: AsyncSession,
+    *,
+    vault_address: str,
+) -> dict | None:
+    """Return the most-recent model_status_log row for a vault, or None if empty.
+
+    Called on orchestrator startup to rehydrate the FailureTracker so a model
+    that was 2/3 of the way to pause before a SIGKILL resumes at 2, not 0
+    (ORCH-06 restart-safety requirement, CR-01 fix).
+
+    Args:
+        session: AsyncSession bound to orchestrator_user role.
+        vault_address: Vault to query (one vault per model).
+
+    Returns:
+        Dict with keys: status, api_failure_streak, malformed_streak,
+        consecutive_failures, model, cycle_number, created_at.
+        None if no rows exist for this vault.
+    """
+    result = await session.execute(
+        text(
+            """
+            SELECT id, vault_address, session_id, model, status,
+                   consecutive_failures, api_failure_streak, malformed_streak,
+                   reason, cycle_number, created_at
+            FROM orchestrator.model_status_log
+            WHERE vault_address = :vault_address
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        ),
+        {"vault_address": vault_address},
+    )
+    row = result.fetchone()
+    return dict(row._mapping) if row is not None else None
 
 
 # ---------------------------------------------------------------------------

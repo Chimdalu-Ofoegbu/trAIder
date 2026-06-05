@@ -72,6 +72,7 @@ from orchestrator.providers.anthropic_adapter import (
 from orchestrator.state.db import (
     create_session,
     end_session,
+    get_latest_model_status,
     get_unresolved_pending_orders,
     mark_pending_order_reconciled,
     record_journal_pending,
@@ -250,6 +251,8 @@ async def run_live_cycle(
             model=model,
             status=status_str,
             consecutive_failures=tracker.consecutive(),
+            api_failure_streak=tracker.api_failure_streak,
+            malformed_streak=tracker.malformed_streak,
             reason=f"api_failure: {exc}",
             cycle_number=cycle,
         )
@@ -285,6 +288,8 @@ async def run_live_cycle(
             model=model,
             status=status_str,
             consecutive_failures=tracker.consecutive(),
+            api_failure_streak=tracker.api_failure_streak,
+            malformed_streak=tracker.malformed_streak,
             reason=reason,
             cycle_number=cycle,
         )
@@ -327,6 +332,8 @@ async def run_live_cycle(
             model=model,
             status=status_str,
             consecutive_failures=tracker.consecutive(),
+            api_failure_streak=tracker.api_failure_streak,
+            malformed_streak=tracker.malformed_streak,
             reason=reason,
             cycle_number=cycle,
         )
@@ -360,6 +367,8 @@ async def run_live_cycle(
             model=model,
             status="active",
             consecutive_failures=0,
+            api_failure_streak=0,
+            malformed_streak=0,
             reason="auto-recovered",
             cycle_number=cycle,
         )
@@ -392,6 +401,8 @@ async def run_live_cycle(
             model=model,
             status="active",
             consecutive_failures=0,
+            api_failure_streak=0,
+            malformed_streak=0,
             reason=f"invalid decision: {rejection_reason}",
             cycle_number=cycle,
         )
@@ -749,7 +760,34 @@ async def run_session(
     )
 
     # Step 5: Cycle loop
+    # CR-01: Rehydrate FailureTracker from DB before loop starts so a model that was
+    # 2/3 of the way to pause before a SIGKILL resumes at the correct streak count
+    # (ORCH-06 restart-safety requirement).
     tracker = FailureTracker()
+    latest_status = await get_latest_model_status(db, vault_address=vault)
+    if latest_status is not None:
+        api_streak = latest_status.get("api_failure_streak") or 0
+        malformed_streak_val = latest_status.get("malformed_streak") or 0
+        if api_streak > 0 or malformed_streak_val > 0:
+            tracker.api_failure_streak = api_streak
+            tracker.malformed_streak = malformed_streak_val
+            from orchestrator.loop.failure_tracker import (
+                API_FAILURE_PAUSE_THRESHOLD,
+                MALFORMED_PAUSE_THRESHOLD,
+            )
+
+            if (
+                tracker.api_failure_streak >= API_FAILURE_PAUSE_THRESHOLD
+                or tracker.malformed_streak >= MALFORMED_PAUSE_THRESHOLD
+            ):
+                tracker.paused = True
+            logger.info(
+                "run_session: rehydrated FailureTracker from DB — "
+                "api_failure_streak=%d malformed_streak=%d paused=%s",
+                tracker.api_failure_streak,
+                tracker.malformed_streak,
+                tracker.paused,
+            )
     start = time.monotonic()
     cycle = 0
 
