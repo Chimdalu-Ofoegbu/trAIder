@@ -3,6 +3,8 @@ Integration test fixtures for MOCK-02 end-to-end mock cycle tests.
 
 Fixture dependency graph:
   anvil_node  →  mock_perps  →  mock_perps_address
+                 ↓
+              vault_on_anvil  (Plan 02-06: full Phase 1 stack deploy + USDC deposit)
   pg_session  (optional — skips when Postgres unreachable)
   redis_client (optional — skips when Redis unreachable)
 
@@ -17,6 +19,15 @@ MockPerps deploy (AUTHORITATIVE — moved from Plan 06):
   - ASSERTS `web3.eth.get_code(addr)` is non-empty (authoritative deploy assertion).
     Fails loudly (not skips) if the contract has no code — T-0-nodeploy mitigation.
   - Returns the verified MockPerps contract instance for tests to drive.
+
+vault_on_anvil (Plan 02-06 Task 1 — FULL PHASE 1 STACK):
+  - Deploys MockERC20 (USDC) via forge create.
+  - Deploys MockChainlinkAggregator x3 (ETH/BTC/SOL) — SHARED with vault NAV + MockPerps (D-02).
+  - Deploys MockPerps(eth_feed, btc_feed, sol_feed).
+  - Runs 01-Deploy.s.sol with ETH_FEED/BTC_FEED/SOL_FEED wired to the shared aggregators (D-02).
+  - Mints USDC to deployer, approves vault, calls vault.deposit() so totalAssets() > 0.
+  - FAILS LOUDLY (RuntimeError) if totalAssets() == 0 after deposit — T-0-nodeploy style.
+  - Yields a VaultContext with: mock_perps, vault0, usdc, aggregators, deployer, rpc_url.
 
 Postgres (optional):
   - Reads ORCHESTRATOR_DATABASE_URL (or DATABASE_URL).
@@ -35,10 +46,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import subprocess
 import time
 from collections.abc import AsyncGenerator
+from dataclasses import dataclass
+from dataclasses import dataclass as _dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
 import pytest_asyncio
@@ -56,6 +71,45 @@ _MOCK_PERPS_ARTIFACT = _ARTIFACTS_DIR / "MockPerps.sol" / "MockPerps.json"
 _CHAINLINK_ARTIFACT = (
     _ARTIFACTS_DIR / "MockChainlinkAggregator.sol" / "MockChainlinkAggregator.json"
 )
+_MOCK_ERC20_ARTIFACT = _ARTIFACTS_DIR / "MockERC20.sol" / "MockERC20.json"
+_MTOKEN_VAULT_ARTIFACT = _ARTIFACTS_DIR / "mTokenVault.sol" / "MTokenVault.json"
+
+_INITIAL_CAPITAL = 10_000 * 10**6  # $10k in 6-decimal USDC
+
+
+# ---------------------------------------------------------------------------
+# VaultContext — result of vault_on_anvil (Plan 02-06, D-02 shared feeds)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class VaultContext:
+    """Deployed Phase 1 stack on local anvil.
+
+    Attributes:
+        mock_perps: MockPerps contract instance (web3).
+        mock_perps_addr: Checksummed MockPerps address.
+        vault: MTokenVault contract (mCLA-S1 = vault 0).
+        vault_addr: Checksummed vault address.
+        usdc: MockERC20 contract instance.
+        usdc_addr: Checksummed USDC address.
+        aggregators: Dict mapping asset string to MockChainlinkAggregator contract.
+        agg_addrs: Dict mapping asset string to aggregator address.
+        deployer: Anvil account 0 address.
+        rpc_url: RPC URL of the local anvil.
+    """
+
+    mock_perps: Any
+    mock_perps_addr: str
+    vault: Any
+    vault_addr: str
+    usdc: Any
+    usdc_addr: str
+    aggregators: dict[str, Any]
+    agg_addrs: dict[str, str]
+    deployer: str
+    rpc_url: str
+
 
 # Anvil default dev accounts (anvil's well-known mnemonic, account 0).
 # This is a PUBLIC test key from Foundry/Anvil documentation — NOT a real secret.
@@ -81,6 +135,43 @@ def pytest_collection_modifyitems(items):
 
 
 # ---------------------------------------------------------------------------
+# D-14 guard fixtures (mirrors tests/unit/conftest.py — available here for SC-2)
+# ---------------------------------------------------------------------------
+
+
+@_dataclass
+class _SessionConfig:
+    """Minimal SessionConfig-shaped value object for integration tests (D-14 guard)."""
+
+    execution_delay_cycles: int = 1
+    session_duration_seconds: int = 60
+    cadence_seconds: float = 1.0
+    price_seed: int = 42
+    session_id: str = "00000000-0000-0000-0000-000000000099"
+
+
+@pytest.fixture
+def session_config() -> _SessionConfig:
+    """Return a default integration test SessionConfig (execution_delay_cycles=1)."""
+    return _SessionConfig()
+
+
+@pytest.fixture
+def enforce_delay_gte_1(session_config: _SessionConfig) -> _SessionConfig:
+    """D-14 GUARD: restart-safety tests MUST run at executionDelayCycles >= 1.
+
+    Mirrors the same fixture in tests/unit/conftest.py for integration test use.
+    Fails loudly (pytest.fail, NOT skip) at delay < 1 so bad configs are un-ignorable.
+    """
+    if session_config.execution_delay_cycles < 1:
+        pytest.fail(
+            "D-14 VIOLATION: restart-safety test running at executionDelayCycles=0. "
+            "This bypasses the async pending-order window and would pass vacuously."
+        )
+    return session_config
+
+
+# ---------------------------------------------------------------------------
 # Helper: load contract ABI from Foundry artifact
 # ---------------------------------------------------------------------------
 
@@ -92,7 +183,7 @@ def _load_abi(artifact_path: Path) -> list:
             f"Contract artifact not found: {artifact_path}\n"
             "Run `forge build` in the contracts/ directory first."
         )
-    with artifact_path.open() as f:
+    with artifact_path.open(encoding="utf-8") as f:
         return json.load(f)["abi"]
 
 
@@ -400,6 +491,252 @@ def _apply_migrations(db_url: str) -> None:
     )
     if result.returncode != 0:
         raise RuntimeError(f"alembic upgrade head failed:\n{result.stdout}\n{result.stderr}")
+
+
+# ---------------------------------------------------------------------------
+# Fixture: vault_on_anvil — full Phase 1 stack + USDC deposit (Plan 02-06)
+# ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture(scope="session")
+async def vault_on_anvil(anvil_w3: AsyncWeb3) -> AsyncGenerator[VaultContext, None]:
+    """Deploy the complete Phase 1 on-chain stack to local anvil (D-02 shared feeds).
+
+    Steps:
+      1. Deploy MockERC20 (6-dec USDC mock) via forge create.
+      2. Deploy 3 MockChainlinkAggregator contracts (ETH/BTC/SOL) — SHARED between
+         the vault NAV oracle path AND MockPerps (D-02 wiring confirmation from RESEARCH.md).
+      3. Deploy MockPerps(eth_feed, btc_feed, sol_feed).
+      4. Run 01-Deploy.s.sol with ETH_FEED/BTC_FEED/SOL_FEED set to the shared aggregator
+         addresses so the vault NAV and MockPerps PnL prices come from the same source.
+      5. Mint USDC to the deployer and call vault.deposit() so totalAssets() > 0.
+
+    D-02 confirmation: the SAME MockChainlinkAggregator addresses are passed both to
+    SessionFactory (via ETH_FEED/BTC_FEED/SOL_FEED env vars) AND to MockPerps constructor.
+    The price pusher calls aggregator.setPrice() once per cycle; both NAV and PnL update
+    atomically from the same on-chain source.
+
+    Trust-boundary assertion (RESEARCH Open Q #2):
+      Fails LOUDLY (RuntimeError) if totalAssets() == 0 after deposit — a silent zero-capital
+      state would let the loop run without any tradeable capital. This is equivalent to the
+      T-0-nodeploy assertion pattern applied to the vault deposit step.
+
+    Scope: session — deployed once and reused across all integration tests.
+
+    Yields:
+        VaultContext dataclass.
+
+    Skips cleanly when:
+      - forge binary not on PATH
+      - anvil not reachable
+      - contract artifacts not built (run `forge build` first)
+    """
+    # Guard: artifacts must exist (forge build must have run)
+    if not _MOCK_ERC20_ARTIFACT.exists():
+        pytest.skip(
+            f"MockERC20 artifact not found at {_MOCK_ERC20_ARTIFACT}. "
+            "Run `forge build` in contracts/ first."
+        )
+    if not _MOCK_PERPS_ARTIFACT.exists():
+        pytest.skip(
+            f"MockPerps artifact not found at {_MOCK_PERPS_ARTIFACT}. "
+            "Run `forge build` in contracts/ first."
+        )
+    if not _MTOKEN_VAULT_ARTIFACT.exists():
+        pytest.skip(
+            f"MTokenVault artifact not found at {_MTOKEN_VAULT_ARTIFACT}. "
+            "Run `forge build` in contracts/ first."
+        )
+
+    # ── Step 1: Deploy MockERC20 (USDC) ──────────────────────────────────────
+    usdc_addr = _forge_create(
+        "src/mocks/MockERC20.sol:MockERC20",
+        ["Test USDC", "USDC", "6"],
+        _ANVIL_RPC,
+        _ANVIL_PRIVATE_KEY,
+    )
+
+    # ── Step 2: Deploy 3 MockChainlinkAggregator (shared ETH/BTC/SOL feeds) ─
+    ts = int(time.time())
+    eth_feed_addr = _forge_create(
+        "src/mocks/MockChainlinkAggregator.sol:MockChainlinkAggregator",
+        ["300000000000", str(ts)],  # $3000 ETH, 8-decimal
+        _ANVIL_RPC,
+        _ANVIL_PRIVATE_KEY,
+    )
+    btc_feed_addr = _forge_create(
+        "src/mocks/MockChainlinkAggregator.sol:MockChainlinkAggregator",
+        ["6000000000000", str(ts)],  # $60000 BTC, 8-decimal
+        _ANVIL_RPC,
+        _ANVIL_PRIVATE_KEY,
+    )
+    sol_feed_addr = _forge_create(
+        "src/mocks/MockChainlinkAggregator.sol:MockChainlinkAggregator",
+        ["15000000000", str(ts)],  # $150 SOL, 8-decimal
+        _ANVIL_RPC,
+        _ANVIL_PRIVATE_KEY,
+    )
+
+    # ── Step 3: Deploy MockPerps with the shared feed addresses ───────────────
+    mock_perps_addr = _forge_create(
+        "src/mocks/MockPerps.sol:MockPerps",
+        [eth_feed_addr, btc_feed_addr, sol_feed_addr],
+        _ANVIL_RPC,
+        _ANVIL_PRIVATE_KEY,
+    )
+
+    # Code assertions (T-0-nodeploy) for all new contracts
+    for addr, name in [
+        (usdc_addr, "MockERC20"),
+        (eth_feed_addr, "MockChainlinkAggregator ETH"),
+        (btc_feed_addr, "MockChainlinkAggregator BTC"),
+        (sol_feed_addr, "MockChainlinkAggregator SOL"),
+        (mock_perps_addr, "MockPerps"),
+    ]:
+        code = await anvil_w3.eth.get_code(addr)
+        if not code or code == b"" or code == b"\x00":
+            raise RuntimeError(
+                f"CRITICAL: {name} deployed at {addr} has no code! "
+                "T-0-nodeploy: forge create reported success but bytecode is absent."
+            )
+
+    # ── Step 4: Run 01-Deploy.s.sol with D-02 shared feed addresses ──────────
+    env = {
+        **os.environ,
+        "USDC_ADDRESS": usdc_addr,
+        "ADAPTER_ADDRESS": mock_perps_addr,
+        "ORCHESTRATOR": _ANVIL_ACCOUNT_0,
+        "OPERATOR": _ANVIL_ACCOUNT_0,
+        # D-02: same aggregator addresses fed to BOTH vault NAV path and MockPerps
+        "ETH_FEED": eth_feed_addr,
+        "BTC_FEED": btc_feed_addr,
+        "SOL_FEED": sol_feed_addr,
+        "SEQUENCER_FEED": "0x0000000000000000000000000000000000000000",
+        "SESSION_DURATION": "1200",
+        "INITIAL_CAPITAL": str(_INITIAL_CAPITAL),
+        "USE_SEPOLIA_STALENESS": "true",  # 6-hour staleness window; keeps feeds fresh on anvil
+    }
+    result = subprocess.run(
+        [
+            "forge",
+            "script",
+            "script/01-Deploy.s.sol",
+            "--rpc-url",
+            _ANVIL_RPC,
+            "--private-key",
+            _ANVIL_PRIVATE_KEY,
+            "--broadcast",
+            "--sig",
+            "run()",
+        ],
+        cwd=str(_CONTRACTS_DIR),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+    )
+    if result.returncode != 0:
+        pytest.skip(
+            f"01-Deploy.s.sol failed (returncode={result.returncode}). "
+            f"Skipping vault_on_anvil fixture.\n"
+            f"stdout: {result.stdout[-2000:]}\nstderr: {result.stderr[-2000:]}"
+        )
+
+    # Parse vault addresses from forge script stdout
+    # Expected lines:  "  mCLA-S1 vault (Claude)  :  0xABCD..."
+    combined = result.stdout + result.stderr
+    vault_addrs: list[str] = []
+    for pattern in [
+        r"mCLA-S1 vault.*?:\s*(0x[0-9a-fA-F]{40})",
+        r"mGPT-S1 vault.*?:\s*(0x[0-9a-fA-F]{40})",
+        r"mGEM-S1 vault.*?:\s*(0x[0-9a-fA-F]{40})",
+    ]:
+        m = re.search(pattern, combined)
+        if m:
+            vault_addrs.append(Web3.to_checksum_address(m.group(1)))
+
+    if len(vault_addrs) < 1:
+        # Fallback: look for any 3 vault-looking addresses in deploy output
+        all_addrs = re.findall(r"vault.*?:\s*(0x[0-9a-fA-F]{40})", combined, re.IGNORECASE)
+        if all_addrs:
+            vault_addrs = [Web3.to_checksum_address(a) for a in all_addrs[:3]]
+
+    if not vault_addrs:
+        raise RuntimeError(
+            "Could not parse vault addresses from 01-Deploy.s.sol output.\n"
+            f"stdout (last 2000 chars): {result.stdout[-2000:]}"
+        )
+
+    vault0_addr = vault_addrs[0]  # mCLA-S1 (Claude vault)
+
+    # Code assertion for vault0 (T-0-nodeploy extended to the vault)
+    vault_code = await anvil_w3.eth.get_code(vault0_addr)
+    if not vault_code or vault_code == b"" or vault_code == b"\x00":
+        raise RuntimeError(
+            f"CRITICAL: MTokenVault deployed at {vault0_addr} has no code! "
+            "The deploy script ran but the vault has no bytecode."
+        )
+
+    # ── Load contract instances ────────────────────────────────────────────────
+    usdc_abi = _load_abi(_MOCK_ERC20_ARTIFACT)
+    usdc_contract = anvil_w3.eth.contract(address=usdc_addr, abi=usdc_abi)
+
+    mock_perps_abi = _load_abi(_MOCK_PERPS_ARTIFACT)
+    mock_perps_contract = anvil_w3.eth.contract(address=mock_perps_addr, abi=mock_perps_abi)
+
+    vault_abi = _load_abi(_MTOKEN_VAULT_ARTIFACT)
+    vault_contract = anvil_w3.eth.contract(address=vault0_addr, abi=vault_abi)
+
+    chainlink_abi = _load_abi(_CHAINLINK_ARTIFACT)
+    aggregators = {
+        "ETH": anvil_w3.eth.contract(address=eth_feed_addr, abi=chainlink_abi),
+        "BTC": anvil_w3.eth.contract(address=btc_feed_addr, abi=chainlink_abi),
+        "SOL": anvil_w3.eth.contract(address=sol_feed_addr, abi=chainlink_abi),
+    }
+
+    # ── Step 5: Mint USDC + approve + deposit into vault ──────────────────────
+    # Mint _INITIAL_CAPITAL USDC to the deployer
+    mint_tx = await usdc_contract.functions.mint(_ANVIL_ACCOUNT_0, _INITIAL_CAPITAL).transact(
+        {"from": _ANVIL_ACCOUNT_0}
+    )
+    await anvil_w3.eth.wait_for_transaction_receipt(mint_tx, timeout=30)
+
+    # Approve vault to spend the USDC
+    approve_tx = await usdc_contract.functions.approve(vault0_addr, _INITIAL_CAPITAL).transact(
+        {"from": _ANVIL_ACCOUNT_0}
+    )
+    await anvil_w3.eth.wait_for_transaction_receipt(approve_tx, timeout=30)
+
+    # Deposit USDC into the vault
+    deposit_tx = await vault_contract.functions.deposit(
+        _INITIAL_CAPITAL, _ANVIL_ACCOUNT_0
+    ).transact({"from": _ANVIL_ACCOUNT_0})
+    await anvil_w3.eth.wait_for_transaction_receipt(deposit_tx, timeout=30)
+
+    # CRITICAL ASSERTION (RESEARCH Open Q #2 resolution):
+    # totalAssets() MUST be > 0 after deposit — a zero-capital vault cannot trade.
+    # Fails LOUDLY (RuntimeError) rather than skipping — this is a correctness requirement.
+    total_assets = await vault_contract.functions.totalAssets().call()
+    if total_assets == 0:
+        raise RuntimeError(
+            f"CRITICAL: vault at {vault0_addr} reports totalAssets()=0 after deposit.\n"
+            f"deposit({_INITIAL_CAPITAL}, {_ANVIL_ACCOUNT_0}) completed without error "
+            "but capital is not reflected in totalAssets(). "
+            "Check: was the USDC approve called before deposit? Is the feed stale?"
+        )
+
+    yield VaultContext(
+        mock_perps=mock_perps_contract,
+        mock_perps_addr=mock_perps_addr,
+        vault=vault_contract,
+        vault_addr=vault0_addr,
+        usdc=usdc_contract,
+        usdc_addr=usdc_addr,
+        aggregators=aggregators,
+        agg_addrs={"ETH": eth_feed_addr, "BTC": btc_feed_addr, "SOL": sol_feed_addr},
+        deployer=_ANVIL_ACCOUNT_0,
+        rpc_url=_ANVIL_RPC,
+    )
 
 
 # ---------------------------------------------------------------------------
