@@ -316,7 +316,7 @@ async def anvil_w3() -> AsyncGenerator[AsyncWeb3, None]:
 # ---------------------------------------------------------------------------
 
 
-@pytest_asyncio.fixture(scope="session")
+@pytest_asyncio.fixture(scope="function")
 async def mock_perps(anvil_w3: AsyncWeb3):
     """Deploy MockChainlinkAggregator x3 + MockPerps to anvil, assert code is non-empty.
 
@@ -329,7 +329,8 @@ async def mock_perps(anvil_w3: AsyncWeb3):
       Fails setup loudly (RuntimeError) — NOT pytest.skip — if the contract
       has no code. A silent no-code deploy would produce incorrect test results.
 
-    Scope: session — deployed once and reused across all integration tests.
+    Scope: function — changed from session to match anvil_w3 function scope (GAP-2 fix).
+    Each test gets a fresh deploy; anvil state does not bleed across tests.
 
     Yields:
         Tuple (mock_perps_contract, mock_perps_address, deployer_address, rpc_url)
