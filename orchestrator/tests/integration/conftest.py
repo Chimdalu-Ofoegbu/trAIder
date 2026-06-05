@@ -253,7 +253,7 @@ def _forge_create(
 # ---------------------------------------------------------------------------
 
 
-@pytest_asyncio.fixture(scope="session")
+@pytest_asyncio.fixture(scope="function")
 async def anvil_w3() -> AsyncGenerator[AsyncWeb3, None]:
     """AsyncWeb3 connected to local anvil.
 
@@ -262,8 +262,11 @@ async def anvil_w3() -> AsyncGenerator[AsyncWeb3, None]:
       2. If not reachable, spawn a throwaway `anvil` subprocess.
       3. If anvil binary is not found, pytest.skip.
 
-    Scope: session — one anvil per test session (state accumulates across tests,
-    which is desirable: earlier tests deploy MockPerps that later tests reuse).
+    Scope: function — GAP-2 fix: each test gets its own web3 connection instance so
+    the fixture loop matches the test's event loop. The underlying anvil process is
+    shared (persistent Docker container); only the Python connection object is recreated.
+    This prevents "coroutine attached to different loop" errors when vault_on_anvil is
+    also function-scoped (SC-2 test isolation requirement).
     """
     _proc = None
 
@@ -498,7 +501,7 @@ def _apply_migrations(db_url: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest_asyncio.fixture(scope="session")
+@pytest_asyncio.fixture(scope="function")
 async def vault_on_anvil(anvil_w3: AsyncWeb3) -> AsyncGenerator[VaultContext, None]:
     """Deploy the complete Phase 1 on-chain stack to local anvil (D-02 shared feeds).
 
@@ -521,7 +524,12 @@ async def vault_on_anvil(anvil_w3: AsyncWeb3) -> AsyncGenerator[VaultContext, No
       state would let the loop run without any tradeable capital. This is equivalent to the
       T-0-nodeploy assertion pattern applied to the vault deposit step.
 
-    Scope: session — deployed once and reused across all integration tests.
+    Scope: function — GAP-2 fix (CR-04 resolution): each test gets a FRESH on-chain deploy
+    so SC-1 state (open positions, pending orders, nonces) does NOT contaminate SC-2.
+    When scope="session" both tests shared one MockPerps instance; SC-1's failed/reverted
+    transactions left stale nonces and pending orders that caused SC-2 to fail when run
+    after SC-1 (order-dependent pass). Making this function-scoped means 2-3 extra forge
+    deploys per run (~15-30s overhead) — acceptable for deterministic correctness.
 
     Yields:
         VaultContext dataclass.

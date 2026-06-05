@@ -38,10 +38,17 @@ packages = ["src/orchestrator"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# GAP-2 fix: set function scope so session-scoped and function-scoped async fixtures
+# do not collide ("coroutine attached to a different loop"). vault_on_anvil is now
+# function-scoped (CR-04 resolution), so function is the correct default here.
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+markers = [
+    "integration: marks integration tests (require anvil + Postgres; deselect with -m 'not integration')",
+]
 
 [tool.ruff]
 line-length = 100
