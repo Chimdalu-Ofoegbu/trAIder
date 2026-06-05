@@ -396,7 +396,8 @@ async def test_CR01_MultiCycle_OrderKeyIsFromCurrentOrder(mock_perps, anvil_w3):
     tx1 = await contract.functions.openLong("ETH", size_usd_1e30, leverage_1e4, 50).transact(
         {"from": vault}
     )
-    receipt1 = await anvil_w3.eth.get_transaction_receipt(tx1)
+    # GAP-1a: use wait_for_transaction_receipt to avoid TransactionNotFound race on anvil
+    receipt1 = await anvil_w3.eth.wait_for_transaction_receipt(tx1, timeout=30)
 
     # Parse OrderCreated from cycle 1 receipt
     created1 = contract.events.OrderCreated().process_receipt(receipt1)
@@ -416,7 +417,8 @@ async def test_CR01_MultiCycle_OrderKeyIsFromCurrentOrder(mock_perps, anvil_w3):
     tx2 = await contract.functions.openLong("BTC", size_usd_1e30, leverage_1e4, 50).transact(
         {"from": vault}
     )
-    receipt2 = await anvil_w3.eth.get_transaction_receipt(tx2)
+    # GAP-1a: same race fix
+    receipt2 = await anvil_w3.eth.wait_for_transaction_receipt(tx2, timeout=30)
 
     # Parse OrderCreated from cycle 2 receipt
     created2 = contract.events.OrderCreated().process_receipt(receipt2)
