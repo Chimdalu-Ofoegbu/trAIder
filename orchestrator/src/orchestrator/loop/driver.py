@@ -79,6 +79,58 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# _build_open_positions — on-chain position map (WR-03)
+# ---------------------------------------------------------------------------
+
+
+async def _build_open_positions(mock_perps: Any, vault: str) -> dict[str, Any]:
+    """Build a market→position dict from on-chain state for the vault.
+
+    Calls getOpenPositionKeys(vault) and reads each Position struct, producing
+    a dict keyed by market string.  This is restart-safe: it reflects actual
+    chain state rather than in-memory guesses, so the D-10 one-position-per-asset
+    check is authoritative even after a SIGKILL+restart.
+
+    Returns a dict:
+        {market: {"position_key": "0x...", "side": "long"|"short", "size_usd": float}}
+
+    Returns an empty dict if no positions are open.
+    """
+    try:
+        keys: list[bytes] = await mock_perps.functions.getOpenPositionKeys(vault).call()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("_build_open_positions: getOpenPositionKeys failed: %s", exc)
+        return {}
+
+    result: dict[str, Any] = {}
+    for key_bytes in keys:
+        key_hex = "0x" + key_bytes.hex()
+        try:
+            # positions(bytes32) returns the Position struct as a tuple:
+            # (market, signedSize, entryPrice, collateral, vault, closed)
+            pos = await mock_perps.functions.positions(key_bytes).call()
+            market: str = pos[0]
+            signed_size: int = pos[1]
+            closed: bool = pos[5]
+            if closed:
+                continue
+            side = "long" if signed_size > 0 else "short"
+            # sizeUsd is stored 1e30-scaled; convert to float USD
+            size_usd = abs(signed_size) / 1e30
+            result[market] = {
+                "position_key": key_hex,
+                "side": side,
+                "size_usd": size_usd,
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "_build_open_positions: failed to read position %s: %s", key_hex[:10], exc
+            )
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # run_live_cycle — single ORCH-02 cycle
 # ---------------------------------------------------------------------------
 
@@ -383,12 +435,54 @@ async def run_live_cycle(
         decision.leverage,
     )
 
-    open_fn = (
-        mock_perps.functions.openLong if decision.side == "long" else mock_perps.functions.openShort
-    )
-    tx = await open_fn(decision.market, size_usd_1e30, leverage_1e4, slippage_bps).transact(
-        {"from": vault}
-    )
+    # CR-02/WR-03: action-based dispatch — NEVER route close/adjust to openLong/openShort.
+    if decision.action == "close":
+        # Close requires an existing position; look it up from the on-chain map.
+        existing = open_positions.get(decision.market)
+        if existing is None:
+            reason = f"close requested but no open position for {decision.market}, no trade"
+            logger.warning("Cycle %d: %s", cycle, reason)
+            await record_journal_pending(
+                db,
+                vault_address=vault,
+                order_key=intent_key,
+                raw_request={"prompt": prompt},
+                raw_response=raw,
+                canonical_decision=decision.model_dump(),
+            )
+            # Flip the intent row to reconciled (no order created) so it won't linger
+            await mark_pending_order_reconciled(db, vault_address=vault, order_key=intent_key)
+            return {"status": "rejected", "reason": reason}
+        pos_key_hex: str = existing["position_key"]
+        pos_key_bytes = bytes.fromhex(pos_key_hex.removeprefix("0x"))
+        tx = await mock_perps.functions.closePosition(pos_key_bytes, size_usd_1e30).transact(
+            {"from": vault}
+        )
+    elif decision.action == "adjust":
+        # Adjust is not cleanly supported by MockPerps (no partial-size modification).
+        # Reject safely rather than silently opening a new position. (D-09 reject pattern)
+        reason = "adjust not supported this cycle, no trade"
+        logger.warning("Cycle %d: %s", cycle, reason)
+        await record_journal_pending(
+            db,
+            vault_address=vault,
+            order_key=intent_key,
+            raw_request={"prompt": prompt},
+            raw_response=raw,
+            canonical_decision=decision.model_dump(),
+        )
+        await mark_pending_order_reconciled(db, vault_address=vault, order_key=intent_key)
+        return {"status": "rejected", "reason": reason}
+    else:
+        # action == "open": proceed with openLong/openShort.
+        open_fn = (
+            mock_perps.functions.openLong
+            if decision.side == "long"
+            else mock_perps.functions.openShort
+        )
+        tx = await open_fn(decision.market, size_usd_1e30, leverage_1e4, slippage_bps).transact(
+            {"from": vault}
+        )
     receipt = await web3.eth.get_transaction_receipt(tx)
 
     # Recover the REAL order_key from the OrderCreated event (mock_harness CR-01 pattern):
@@ -631,7 +725,6 @@ async def run_session(
     tracker = FailureTracker()
     start = time.monotonic()
     cycle = 0
-    open_positions: dict[str, Any] = {}  # updated on successful submit
 
     # Simple NAV/positions state — in production these are read from the vault contract
     nav_table = "| Vault | NAV | mTOKEN Supply |\n|-------|-----|---------------|\n| mock | $10,000 | 10,000 |"
@@ -650,6 +743,11 @@ async def run_session(
                 # a success resets the tracker via tracker.record_success())
             else:
                 await asyncio.sleep(0)  # yield to event loop before cycle
+
+            # WR-03: Build open_positions from ON-CHAIN state each cycle (restart-safe).
+            # This reflects chain reality rather than in-memory guesses and makes
+            # the D-10 one-position-per-asset check authoritative.
+            open_positions = await _build_open_positions(mock_perps, vault)
 
             positions_table = (
                 "No open positions."
@@ -681,11 +779,6 @@ async def run_session(
                 recent_decisions="\n".join(recent_decisions[-5:]) or "None",
                 elapsed_seconds=elapsed,
             )
-
-            # Track open positions from submitted orders
-            # (In production these are read from the vault contract; here we note the submit)
-            if result.get("status") == "submitted" and result.get("action") == "open":
-                pass  # keeper_monitor will execute; position tracking deferred to Phase 3
 
             # Keep last-5 decision summary
             recent_decisions.append(
