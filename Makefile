@@ -17,7 +17,7 @@
 #   pnpm (make gen-types: frontend)
 # =============================================================================
 
-.PHONY: up seed verify-stack reset down db-reset gen-types coverage help
+.PHONY: up seed verify-stack reset down db-reset gen-types coverage deploy-sepolia deploy-sepolia-clean help
 
 # ── Environment ───────────────────────────────────────────────────────────────
 # Source .env.example for defaults (real values come from .env.* gitignored files)
@@ -113,16 +113,84 @@ gen-types:
 coverage:
 	cd contracts && FOUNDRY_PROFILE=coverage forge coverage --ir-minimum --report summary
 
+# ── deploy-sepolia ────────────────────────────────────────────────────────────
+# DEPLOY-01: Idempotent Arbitrum Sepolia deploy + Arbiscan auto-verify (D-14)
+#
+# Prerequisites (fill in .env / .env.deployer / .env.operator-trade / .env.operator-journal):
+#   SEPOLIA_RPC            Alchemy Arbitrum Sepolia HTTPS endpoint
+#   ARBISCAN_API_KEY       Arbiscan API key (https://arbiscan.io/apis)
+#   DEPLOYER_PRIVATE_KEY   Deployer EOA private key (funds Sepolia ETH for gas - SEC-01)
+#   OPERATOR_JOURNAL_KEY   Operator-journal EOA ADDRESS (not private key; becomes immutable in JournalRegistry)
+#   ORCHESTRATOR           Orchestrator EOA ADDRESS (not private key; submits trades via vault)
+#   OPERATOR               Operator EOA ADDRESS (not private key; funds session)
+#
+# Sepolia-specific env (override Arb One mainnet defaults in 01-Deploy.s.sol):
+#   DEPLOY_MOCK_SUBSTRATE=true   Deploy MockERC20 + MockPerps + 3x MockChainlinkAggregator + MockSequencerUptimeFeed
+#   USE_SEPOLIA_STALENESS=true   Use 6-hour staleness window (shorter than mainnet heartbeat)
+#   SEQUENCER_FEED=0x0000...     No real sequencer uptime feed on Arbitrum Sepolia - skip check
+#
+# Idempotency: reads deployments/sepolia.json; if sessionFactory is non-zero, deploy is skipped.
+# A second run of this target is always a no-op that confirms the manifest is still valid.
+#
+# Arbiscan verify: --verify + --etherscan-api-key submits source for every deployed contract.
+# Requires [etherscan] section in contracts/foundry.toml (already configured for chain 421614).
+#
+# Note: on Windows git-bash without make, run the forge command directly:
+#   cd contracts && forge script script/01-Deploy.s.sol \
+#     --rpc-url $SEPOLIA_RPC --broadcast --verify --etherscan-api-key $ARBISCAN_API_KEY \
+#     --private-key $DEPLOYER_PRIVATE_KEY --sig "run()"
+#
+# WARNING: --broadcast and --verify send real transactions to Arbitrum Sepolia and submit
+# source code to Arbiscan. This is an OUTWARD-FACING action requiring operator authorization.
+# DO NOT run with --broadcast in automated CI/CD without explicit approval.
+deploy-sepolia:
+	@echo "==> Deploying to Arbitrum Sepolia (idempotent + Arbiscan auto-verify)..."
+	@echo "    Chain: Arbitrum Sepolia (421614)"
+	@echo "    Manifest: deployments/sepolia.json"
+	cd contracts && \
+		DEPLOY_MOCK_SUBSTRATE=true \
+		USE_SEPOLIA_STALENESS=true \
+		SEQUENCER_FEED=0x0000000000000000000000000000000000000000 \
+		forge script script/01-Deploy.s.sol \
+			--rpc-url $(SEPOLIA_RPC) \
+			--broadcast \
+			--verify \
+			--etherscan-api-key $(ARBISCAN_API_KEY) \
+			--private-key $(DEPLOYER_PRIVATE_KEY) \
+			--sig "run()"
+	@echo "==> deploy-sepolia complete. Check deployments/sepolia.json for addresses."
+	@echo "    Verify Arbiscan links printed above show verified source (green check)."
+
+# ── deploy-sepolia-clean ──────────────────────────────────────────────────────
+# Remove the Sepolia manifest to allow a fresh deploy on next make deploy-sepolia.
+# Use this when you want to start a new session (e.g. after reset for a fresh demo).
+# The deploy script reads a non-zero sessionFactory as "already deployed" and skips.
+# Deleting the manifest resets that guard.
+#
+# NOTE: This deletes the canonical address manifest. The orchestrator and frontend
+# will lose the deployed addresses until make deploy-sepolia is re-run.
+deploy-sepolia-clean:
+	@echo "==> Removing deployments/sepolia.json (fresh deploy on next make deploy-sepolia)..."
+	rm -f deployments/sepolia.json
+	@echo "==> Creating empty manifest template..."
+	@printf '{\n  "sessionFactory": "0x0000000000000000000000000000000000000000",\n  "oracle": "0x0000000000000000000000000000000000000000",\n  "journal": "0x0000000000000000000000000000000000000000",\n  "vaultClaude": "0x0000000000000000000000000000000000000000",\n  "vaultGpt": "0x0000000000000000000000000000000000000000",\n  "vaultGem": "0x0000000000000000000000000000000000000000",\n  "adapter": "0x0000000000000000000000000000000000000000",\n  "mockUsdc": "0x0000000000000000000000000000000000000000",\n  "ethFeed": "0x0000000000000000000000000000000000000000",\n  "btcFeed": "0x0000000000000000000000000000000000000000",\n  "solFeed": "0x0000000000000000000000000000000000000000",\n  "sequencerFeed": "0x0000000000000000000000000000000000000000"\n}\n' > deployments/sepolia.json
+	@echo "==> deploy-sepolia-clean complete. Run make deploy-sepolia to deploy fresh."
+
 # ── help ──────────────────────────────────────────────────────────────────────
 help:
 	@echo "trAIder Makefile targets:"
-	@echo "  make up           Start dev stack (postgres + redis + anvil + pgadmin)"
-	@echo "  make seed         Idempotent seed (alembic + USDC/ETH + optional MockPerps)"
-	@echo "  make verify-stack Post-seed assertions (exit 1 on unconditional failure)"
-	@echo "  make reset        Full reset: down → up → seed → verify-stack"
-	@echo "  make down         Stop dev stack (preserves volumes)"
-	@echo "  make db-reset     Drop + recreate DB + alembic upgrade head"
-	@echo "  make gen-types    Regenerate frontend/types/api.ts from backend OpenAPI"
-	@echo "  make coverage     Run forge coverage on contracts/src/ (>= 90% gate, TEST-01)"
+	@echo "  make up                 Start dev stack (postgres + redis + anvil + pgadmin)"
+	@echo "  make seed               Idempotent seed (alembic + USDC/ETH + optional MockPerps)"
+	@echo "  make verify-stack       Post-seed assertions (exit 1 on unconditional failure)"
+	@echo "  make reset              Full reset: down -> up -> seed -> verify-stack"
+	@echo "  make down               Stop dev stack (preserves volumes)"
+	@echo "  make db-reset           Drop + recreate DB + alembic upgrade head"
+	@echo "  make gen-types          Regenerate frontend/types/api.ts from backend OpenAPI"
+	@echo "  make coverage           Run forge coverage on contracts/src/ (>= 90% gate, TEST-01)"
+	@echo "  make deploy-sepolia     Deploy full stack to Arbitrum Sepolia (DEPLOY-01, D-14)"
+	@echo "                          Idempotent: re-run skips if manifest already populated"
+	@echo "                          Requires: SEPOLIA_RPC, ARBISCAN_API_KEY, DEPLOYER_PRIVATE_KEY,"
+	@echo "                                    OPERATOR_JOURNAL_KEY, ORCHESTRATOR, OPERATOR"
+	@echo "  make deploy-sepolia-clean  Reset manifest to zeros (fresh deploy next run)"
 	@echo ""
 	@echo "Prerequisites: Docker Desktop, Foundry (cast/forge), uv, pnpm"

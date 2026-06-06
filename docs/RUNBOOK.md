@@ -17,10 +17,11 @@
 3. [Alert Tiering](#3-alert-tiering)
 4. [Journal Recovery](#4-journal-recovery)
 5. [Session Start and Settlement](#5-session-start-and-settlement)
-6. [Demo-Day Minute-by-Minute Timetable](#6-demo-day-minute-by-minute-timetable)
-7. [Provider Rate Limits — ACTIVE (no application required) (ORCH-09)](#7-provider-rate-limits--active-no-application-required-orch-09)
-8. [Judging Window (DEPLOY-04)](#8-judging-window-deploy-04)
-9. [Known Issues and Gotchas](#9-known-issues-and-gotchas)
+6. [Sepolia Deploy Operations](#6-sepolia-deploy-operations)
+7. [Demo-Day Minute-by-Minute Timetable](#7-demo-day-minute-by-minute-timetable)
+8. [Provider Rate Limits — ACTIVE (no application required) (ORCH-09)](#8-provider-rate-limits--active-no-application-required-orch-09)
+9. [Judging Window (DEPLOY-04)](#9-judging-window-deploy-04)
+10. [Known Issues and Gotchas](#10-known-issues-and-gotchas)
 
 ---
 
@@ -258,9 +259,159 @@ ORDER BY created_at ASC;
 
 ---
 
-## 6. Demo-Day Minute-by-Minute Timetable
+## 6. Sepolia Deploy Operations
 
-> **Filled in by:** Phase 6 (D-56 — judging-window-dependent)
+> **Filled in by:** Plan 03-07 (DEPLOY-01, D-12/D-14) - 2026-06-06
+
+### Sepolia Deploy Quick Reference
+
+```bash
+# Full Arbitrum Sepolia deploy (idempotent + Arbiscan auto-verify, DEPLOY-01)
+# Set env vars first: SEPOLIA_RPC, ARBISCAN_API_KEY, DEPLOYER_PRIVATE_KEY,
+#                     OPERATOR_JOURNAL_KEY, ORCHESTRATOR, OPERATOR
+make deploy-sepolia
+
+# On Windows git-bash (no make), run forge directly from contracts/:
+cd contracts && \
+  DEPLOY_MOCK_SUBSTRATE=true \
+  USE_SEPOLIA_STALENESS=true \
+  SEQUENCER_FEED=0x0000000000000000000000000000000000000000 \
+  forge script script/01-Deploy.s.sol \
+    --rpc-url $SEPOLIA_RPC \
+    --broadcast \
+    --verify \
+    --etherscan-api-key $ARBISCAN_API_KEY \
+    --private-key $DEPLOYER_PRIVATE_KEY \
+    --sig "run()"
+
+# Read the deployed addresses (populated after broadcast):
+cat deployments/sepolia.json
+
+# Reset manifest for a fresh session (undeploy guard - will re-deploy on next run):
+make deploy-sepolia-clean
+```
+
+### Required Environment Variables for Sepolia Deploy (SEC-01)
+
+The following must be set before `make deploy-sepolia`:
+
+| Variable               | Source                                                    | Purpose                                                    |
+| ---------------------- | --------------------------------------------------------- | ---------------------------------------------------------- |
+| `SEPOLIA_RPC`          | Alchemy dashboard (Arbitrum Sepolia app)                  | RPC endpoint for broadcast + Arbiscan verify               |
+| `ARBISCAN_API_KEY`     | https://arbiscan.io/apis (free tier)                      | Auto-verify source on Arbiscan                             |
+| `DEPLOYER_PRIVATE_KEY` | `.env.deployer` (gitignored)                              | Signs and broadcasts deploy transactions                   |
+| `OPERATOR_JOURNAL_KEY` | `.env.operator-journal` pubkey (address, not private key) | Becomes immutable in JournalRegistry (ecrecover gate)      |
+| `ORCHESTRATOR`         | `.env.operator-trade` pubkey (address)                    | Stored in factory; only address permitted to call openLong |
+| `OPERATOR`             | Operator EOA address                                      | Funds session; cannot withdraw vault USDC directly         |
+
+**SEC-01 — Sepolia ETH funding requirements:**
+
+All four EOAs need Sepolia ETH for gas. Faucet: https://faucets.chain.link (Chainlink-operated;
+supports Arbitrum Sepolia). Alternative: https://www.alchemy.com/faucets/arbitrum-sepolia
+
+| EOA              | Min Sepolia ETH | Notes                                             |
+| ---------------- | --------------- | ------------------------------------------------- |
+| Deployer         | 0.1 ETH         | Pays deploy gas for ~12 contracts + createSession |
+| Operator Trade   | 0.05 ETH        | Pays gas for trade submissions via vault.openLong |
+| Operator Journal | 0.02 ETH        | Pays gas for JournalRegistry.recordJournal calls  |
+| Gas/Keeper       | 0.05 ETH        | Pays gas for executeOrder + arbitrage (Phase 4)   |
+
+**Note:** WETH (wrapped ETH) is NOT needed for the mock-substrate Sepolia path. WETH is only
+required for the GMX execution fee path (Phase 6, real GMX). The mock-live path uses only
+plain Sepolia ETH for gas.
+
+### Idempotency Behavior (D-14)
+
+The deploy script reads `deployments/sepolia.json` before attempting a deploy. If `sessionFactory`
+is the zero address (or the file is absent), it deploys and writes a fresh manifest. If
+`sessionFactory` is non-zero, it skips all deploy steps and logs the existing addresses.
+
+**Re-run is always safe.** A second `make deploy-sepolia` with the same manifest = no-op.
+
+To deploy a fresh session (e.g., after TEST-03 for a demo re-run):
+
+1. `make deploy-sepolia-clean` (resets manifest to all-zeros)
+2. `make deploy-sepolia` (deploys fresh session)
+
+### What Gets Deployed (D-12/D-13)
+
+When `DEPLOY_MOCK_SUBSTRATE=true` (Sepolia default):
+
+| Contract                   | Purpose                                  | Notes                                                               |
+| -------------------------- | ---------------------------------------- | ------------------------------------------------------------------- |
+| MockERC20 (6-dec)          | Mock USDC underlying (D-12)              | Freely mintable; operator mints to seed vault + demo speculators    |
+| MockPerps                  | GMX-shape perps adapter (D-01)           | executionDelay=3 blocks; operator calls executeOrder                |
+| MockChainlinkAggregator x3 | ETH/BTC/SOL price feeds (D-06)           | Seeded at $3500/$95000/$180; operator pushes updates via setPrice() |
+| MockSequencerUptimeFeed    | Toggleable L2 sequencer feed (D-06/D-07) | Operator drills freeze/unfreeze via setDown()/setUp()               |
+| PerformanceOracle          | Coliseum Score + vault stats             | Owned by SessionFactory                                             |
+| JournalRegistry            | Per-trade IPFS CID registry              | OPERATOR_JOURNAL_KEY immutable ecrecover gate                       |
+| SessionFactory             | One-tx 3-vault deploy                    | Owns oracle + journal                                               |
+| MTokenVault x3             | mCLA-S1/mGPT-S1/mGEM-S1                  | mCLA-S1 driven (Claude); mGPT/mGEM idle                             |
+| SettlementContract x3      | Per-vault settlement                     | Deployed inside createSession                                       |
+
+**GMXAdapter:** NOT deployed on Sepolia. Its Phase 3 write path is deferred to Phase 6
+per the D-13 condition (GMXAdapter was NOT frozen after Phase 3). The `adapter` field in
+`deployments/sepolia.json` is `address(0)` until Phase 6.
+
+### Arbiscan Verification (D-14)
+
+The `--verify --etherscan-api-key $ARBISCAN_API_KEY` flags auto-submit source for every
+deployed contract. The `[etherscan]` section in `contracts/foundry.toml` points to:
+
+- URL: `https://api-sepolia.arbiscan.io/api`
+- Chain ID: 421614 (Arbitrum Sepolia)
+
+After the broadcast completes, forge prints Arbiscan links for each contract. Open each
+and confirm the source shows a green verified checkmark. This is the judge-credibility step.
+
+### D-05 Oracle-Outage Documented Limit
+
+An oracle outage (Chainlink feed stale or sequencer down) **freezes** vault NAV, mint, and burn.
+This is intentional: you cannot fairly price a redemption without a live price.
+
+**Operator response to an oracle outage during a live session:**
+
+1. The operator/factory may call `SessionFactory.endSession()` at any time to wind down early.
+2. After `endSession()`, the SettlementContract's `settleRedemption()` uses the last NAV snapshot
+   (oracle-independent once settled).
+3. Holders may then call `SettlementContract.claim()` to redeem proportionally.
+
+**Documented limits (v1 scope):**
+
+- Holder mid-session exit during an oracle outage is out of v1 scope.
+- The freeze is demonstrated by ticking a MockChainlinkAggregator stale in tests (not live).
+- The operator wind-down path (endSession) is oracle-free and always available.
+
+**Empty positions + oracle outage:** `positionValueUSDC()` returns 0 immediately (no Chainlink
+call) when the vault has no open positions. This ensures `endSession()` + drain + settle succeeds
+even during a Chainlink outage after all positions are closed (D-05 PLANNER CONSTRAINT).
+
+### D-11 Pinata Gateway Latency Measurement
+
+During the TEST-03 mini-session, measure the CID-fetch latency from both gateways:
+
+```bash
+# Pinata public gateway (default)
+time curl -s "https://gateway.pinata.cloud/ipfs/<CID>" > /dev/null
+
+# web3.storage / Filebase gateway (backup)
+time curl -s "https://w3s.link/ipfs/<CID>" > /dev/null
+```
+
+Target: both fetches complete in <10 seconds (Phase 5 verifier target).
+
+If Pinata public gateway latency consistently exceeds 10s, upgrade to a Pinata dedicated gateway
+(operator decision #6 per D-11). The gateway URL is a config parameter in the JournalPublisher
+(`PINATA_GATEWAY_URL` env var) — no code change needed, config-only swap.
+
+**Decision gate:** Measure during TEST-03. Upgrade only if data shows latency threatens the
+verifier target. Do not upgrade proactively (the free tier covers the 1h mini-session write volume).
+
+---
+
+## 7. Demo-Day Minute-by-Minute Timetable
+
+> **Filled in by:** Phase 6 (D-56 - judging-window-dependent)
 
 **Arbitrum Open House deadline:** June 14, 2026
 **ETHGlobal London Phase 2:** July 10–12, 2026 (Founder House)
@@ -285,7 +436,7 @@ ORDER BY created_at ASC;
 
 ---
 
-## 7. Provider Rate Limits — ACTIVE (no application required) (ORCH-09)
+## 8. Provider Rate Limits — ACTIVE (no application required) (ORCH-09)
 
 > **Filled in by:** Plan 00-07 (Task 2 operator confirmation, 2026-06-01)
 >
@@ -354,7 +505,7 @@ preserve that framing. Activate the fallback only under active pressure, not pro
 
 ---
 
-## 8. Judging Window (DEPLOY-04)
+## 9. Judging Window (DEPLOY-04)
 
 > **Filled in by:** Plan 00-07 (Task 2 operator confirmation, 2026-06-01)
 >
@@ -406,7 +557,7 @@ Phase 6 session-timing plan inputs:
 
 ---
 
-## 9. Known Issues and Gotchas
+## 10. Known Issues and Gotchas
 
 > **Append-only log.** Add new issues in reverse chronological order (newest first).
 > Never delete or edit existing entries — update by adding a new entry.
