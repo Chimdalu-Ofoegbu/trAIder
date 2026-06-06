@@ -30,6 +30,8 @@ import asyncio
 import logging
 from typing import Any
 
+from orchestrator.alerts.sink import AlertSeverity, send_alert
+from orchestrator.journal.publisher import publish_journal_entry
 from orchestrator.mock_harness import _make_envelope, _publish
 from orchestrator.state.db import (
     get_pending_orders_ready,
@@ -55,6 +57,16 @@ async def execute_ready_orders(
     redis: Any | None = None,
     session_id: str,
     seq_counter: int,
+    # Journal publisher params (PERPS-02 / D-08/D-09): optional to preserve
+    # backward-compat with existing callers (anvil tests, Phase-2 harness).
+    # When all three are provided, publish_journal_entry fires after OrderExecuted.
+    journal_registry: Any | None = None,
+    operator_journal_private_key: bytes | None = None,
+    pinata_jwt: str | None = None,
+    storacha_api_key: str | None = None,
+    operator_journal_key_address: str | None = None,
+    telegram_bot_token: str | None = None,
+    telegram_chat_id: str | None = None,
 ) -> list[dict]:
     """Execute all pending orders whose execute_after_block has elapsed.
 
@@ -67,6 +79,15 @@ async def execute_ready_orders(
         redis: Optional redis.asyncio client for TradeEvent publishing.
         session_id: Active trading session UUID string.
         seq_counter: Envelope sequence number for the TradeEvent.
+        journal_registry: JournalRegistry contract instance for onchain attestation.
+                          When provided together with operator_journal_private_key and
+                          pinata_jwt, publish_journal_entry fires after OrderExecuted.
+        operator_journal_private_key: Raw 32-byte private key for EIP-191 signing.
+        pinata_jwt: Pinata V3 JWT for IPFS pinning.
+        storacha_api_key: Optional Filebase backup key.
+        operator_journal_key_address: Hex address for the journal key (transact from).
+        telegram_bot_token: Optional Telegram bot token for alert sink.
+        telegram_chat_id: Optional Telegram chat ID for alert sink.
 
     Returns:
         List of result dicts, one per order attempted:
@@ -150,6 +171,45 @@ async def execute_ready_orders(
                     order_key_hex[:10],
                     exec_tx_hex[:10],
                 )
+
+                # ── PERPS-02 / JOURNAL-01: publish journal ONLY on OrderExecuted ──
+                # Wired here and NEVER in driver.py (front-running mitigation 9.1 /
+                # D-09 pin scope: trade entries only, gated on the confirmed event).
+                if journal_registry and operator_journal_private_key and pinata_jwt:
+                    # Build the journal payload from the trade snapshot
+                    journal_payload = dict(trade_payload)
+                    try:
+                        await publish_journal_entry(
+                            web3,
+                            journal_registry,
+                            db_session,
+                            vault_address=vault_address,
+                            trade_hash=trade_hash,
+                            order_key=order_key_hex,
+                            payload=journal_payload,
+                            operator_journal_private_key=operator_journal_private_key,
+                            pinata_jwt=pinata_jwt,
+                            storacha_api_key=storacha_api_key,
+                            operator_journal_key_address=operator_journal_key_address,
+                            telegram_bot_token=telegram_bot_token,
+                            telegram_chat_id=telegram_chat_id,
+                        )
+                    except Exception as pub_exc:  # noqa: BLE001
+                        # Pin/record failure: log + alert, do NOT crash the monitor.
+                        # The pending_pin DB row and reconcile backstop handle retry.
+                        logger.warning(
+                            "keeper: publish_journal_entry failed for order_key=%s (will retry): %s",
+                            order_key_hex[:10],
+                            pub_exc,
+                        )
+                        await send_alert(
+                            f"Journal publish failed for order_key={order_key_hex[:10]}: {pub_exc}",
+                            AlertSeverity.WARNING,
+                            context={"vault_address": vault_address, "order_key": order_key_hex},
+                            telegram_bot_token=telegram_bot_token,
+                            telegram_chat_id=telegram_chat_id,
+                        )
+
                 results.append({"status": "executed", "order_key": order_key_hex})
 
             else:
@@ -195,6 +255,14 @@ async def run_keeper_monitor(
     session_id: str,
     stop_event: asyncio.Event,
     poll_seconds: float = 2.0,
+    # Journal publisher params (PERPS-02): optional, forwarded to execute_ready_orders.
+    journal_registry: Any | None = None,
+    operator_journal_private_key: bytes | None = None,
+    pinata_jwt: str | None = None,
+    storacha_api_key: str | None = None,
+    operator_journal_key_address: str | None = None,
+    telegram_bot_token: str | None = None,
+    telegram_chat_id: str | None = None,
 ) -> None:
     """Poll pending_orders for block-ready orders and execute them.
 
@@ -212,6 +280,13 @@ async def run_keeper_monitor(
         stop_event: asyncio.Event — set by the session driver at session end (D-12).
         poll_seconds: Keeper poll interval in seconds (default 2.0 — much faster
                       than the 60s trading cadence so orders aren't left waiting).
+        journal_registry: JournalRegistry contract for onchain attestation (PERPS-02).
+        operator_journal_private_key: Raw key bytes for EIP-191 signing.
+        pinata_jwt: Pinata JWT for IPFS pinning.
+        storacha_api_key: Optional Filebase backup key.
+        operator_journal_key_address: Hex address for journal key transact from.
+        telegram_bot_token: Optional Telegram token for WARNING alerts.
+        telegram_chat_id: Optional Telegram chat ID.
     """
     logger.info(
         "run_keeper_monitor: starting (vault=%s poll=%.1fs)",
@@ -237,6 +312,13 @@ async def run_keeper_monitor(
                 redis=redis,
                 session_id=session_id,
                 seq_counter=_seq,
+                journal_registry=journal_registry,
+                operator_journal_private_key=operator_journal_private_key,
+                pinata_jwt=pinata_jwt,
+                storacha_api_key=storacha_api_key,
+                operator_journal_key_address=operator_journal_key_address,
+                telegram_bot_token=telegram_bot_token,
+                telegram_chat_id=telegram_chat_id,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
