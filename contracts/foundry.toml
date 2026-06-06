@@ -15,6 +15,11 @@ optimizer = true
 optimizer_runs = 200
 fuzz = { runs = 256 }
 invariant = { runs = 32, depth = 64 }
+# fs_permissions: allow deploy script to read the idempotency manifest and write the address manifest (D-14).
+# Paths are relative to this foundry.toml (i.e., contracts/). The deployments/ dir lives at repo root.
+fs_permissions = [
+  { access = "read-write", path = "../deployments/" },
+]
 
 # Per-test override for money-critical math (D-29):
 # Use: /// forge-config: default.fuzz.runs = 1000
