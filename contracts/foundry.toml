@@ -36,5 +36,12 @@ fork_block_number = 353000000
 [rpc_endpoints]
 # ARB_RPC: Alchemy Arbitrum One archive URL (USER SETUP — populate .env with real key)
 arbitrum = "${ARB_RPC}"
+# SEPOLIA_RPC: Alchemy Arbitrum Sepolia URL (USER SETUP — populate .env with real key)
+arbitrum_sepolia = "${SEPOLIA_RPC}"
+
+[etherscan]
+# ARBISCAN_API_KEY: Arbiscan API key for auto-verification (USER SETUP — populate .env)
+# Chain ID 421614 is Arbitrum Sepolia testnet.
+arbitrum-sepolia = { key = "${ARBISCAN_API_KEY}", url = "https://api-sepolia.arbiscan.io/api", chain = 421614 }
 
 # See more config options: https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
