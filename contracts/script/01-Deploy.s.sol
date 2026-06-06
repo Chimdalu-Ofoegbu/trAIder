@@ -50,6 +50,7 @@ import {SessionFactory} from "../src/SessionFactory.sol";
 ///        ADAPTER_ADDRESS     (required) IPerpsAdapter address (MockPerps or GMXAdapter)
 ///        ORCHESTRATOR        (required) Orchestrator wallet address
 ///        OPERATOR            (required) Operator wallet address
+///        OPERATOR_JOURNAL_KEY (required) Operator-journal EOA for ecrecover gate (D-10)
 ///        ETH_FEED            (optional) Chainlink ETH/USD feed; defaults to Arbitrum One mainnet
 ///        BTC_FEED            (optional) Chainlink BTC/USD feed; defaults to Arbitrum One mainnet
 ///        SOL_FEED            (optional) Chainlink SOL/USD feed; defaults to Arbitrum One mainnet
@@ -101,15 +102,19 @@ contract DeployPhase1 is Script {
         uint256 initialCapital = vm.envOr("INITIAL_CAPITAL", uint256(10_000e6)); // $10k in USDC
         bool useSepoliaStaleness = vm.envOr("USE_SEPOLIA_STALENESS", false);
 
+        // D-10: operator-journal key for the ecrecover gate (required — no default).
+        address operatorJournalKey = vm.envAddress("OPERATOR_JOURNAL_KEY");
+
         vm.startBroadcast();
 
         // ── Step 1: Deploy PerformanceOracle ─────────────────────────────────
         PerformanceOracle oracle = new PerformanceOracle();
         console2.log("PerformanceOracle deployed:", address(oracle));
 
-        // ── Step 2: Deploy JournalRegistry ───────────────────────────────────
-        JournalRegistry journal = new JournalRegistry();
+        // ── Step 2: Deploy JournalRegistry (with OPERATOR_JOURNAL_KEY ecrecover gate, D-10) ──
+        JournalRegistry journal = new JournalRegistry(operatorJournalKey);
         console2.log("JournalRegistry deployed:", address(journal));
+        console2.log("  OPERATOR_JOURNAL_KEY:", operatorJournalKey);
 
         // ── Step 3: Deploy SessionFactory ────────────────────────────────────
         //    The factory stores static config (feeds, sequencer, orchestrator, operator,

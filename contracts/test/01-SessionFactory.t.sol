@@ -101,8 +101,11 @@ contract SessionFactoryTest is Test {
         perps = new MockPerps(address(ethFeed), address(btcFeed), address(solFeed));
 
         // Deploy PerformanceOracle + JournalRegistry (owner = address(this) at this point).
+        // Phase 3 (D-10): JournalRegistry requires an OPERATOR_JOURNAL_KEY for the ecrecover gate.
+        // Use a deterministic test address derived from a well-known key.
+        address testOperatorJournalKey = vm.addr(0xA11CE);
         oracle = new PerformanceOracle();
-        journal = new JournalRegistry();
+        journal = new JournalRegistry(testOperatorJournalKey);
 
         // Deploy SessionFactory (owner = address(this) — the test contract IS the operator/deployer).
         factory = new SessionFactory(
