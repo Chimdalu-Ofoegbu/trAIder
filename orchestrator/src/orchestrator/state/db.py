@@ -661,6 +661,123 @@ async def create_session(
     await session.commit()
 
 
+# ---------------------------------------------------------------------------
+# update_journal_state — D-08 state machine transitions (JOURNAL-01)
+# ---------------------------------------------------------------------------
+
+
+async def update_journal_state(
+    session: AsyncSession,
+    *,
+    vault_address: str,
+    order_key: str,
+    new_state: str,
+    pinata_cid: str | None = None,
+    web3_storage_cid: str | None = None,
+    operator_sig: str | None = None,
+    onchain_tx: str | None = None,
+) -> None:
+    """Transition a journal_entries row to a new state (D-08 state machine).
+
+    D-08 state flow: pending_pin -> pinned_primary -> signed -> submitted -> recorded
+                              (async, non-blocking)         -> pinned_backup
+
+    COALESCE semantics: optional columns (pinata_cid, web3_storage_cid, operator_sig,
+    onchain_tx) are only updated when explicitly provided (non-None). Passing None
+    leaves the existing column value unchanged — safe to call at each transition with
+    only the relevant new data.
+
+    Reuses the existing 7-state journal_state ENUM from migration 0001 — no new
+    migration needed (Decision 03-06: reuse existing states).
+
+    Args:
+        session:         AsyncSession bound to orchestrator_user role.
+        vault_address:   Part of the UNIQUE(vault_address, order_key) key.
+        order_key:       Part of the UNIQUE(vault_address, order_key) key.
+        new_state:       One of the existing journal_state ENUM values:
+                         pending_pin | pinned_primary | pinned_backup | signed
+                         | submitted | recorded | failed
+        pinata_cid:      Pinata CID — set on -> pinned_primary transition.
+        web3_storage_cid: Filebase backup CID — set on -> pinned_backup transition.
+        operator_sig:    Hex-encoded EIP-191 signature — set on -> signed transition.
+        onchain_tx:      Onchain tx hash from recordJournal — set on -> recorded transition.
+    """
+    await session.execute(
+        text(
+            """
+            UPDATE orchestrator.journal_entries
+            SET state            = CAST(:new_state AS orchestrator.journal_state),
+                pinata_cid       = COALESCE(:pinata_cid, pinata_cid),
+                web3_storage_cid = COALESCE(:web3_storage_cid, web3_storage_cid),
+                operator_sig     = COALESCE(:operator_sig, operator_sig),
+                onchain_tx       = COALESCE(:onchain_tx, onchain_tx),
+                updated_at       = :updated_at
+            WHERE vault_address = :vault_address
+              AND order_key     = :order_key
+            """
+        ),
+        {
+            "vault_address": vault_address,
+            "order_key": order_key,
+            "new_state": new_state,
+            "pinata_cid": pinata_cid,
+            "web3_storage_cid": web3_storage_cid,
+            "operator_sig": operator_sig,
+            "onchain_tx": onchain_tx,
+            "updated_at": datetime.now(UTC),
+        },
+    )
+    await session.commit()
+
+
+# ---------------------------------------------------------------------------
+# get_pending_pin_entries — retry query for failed/pending_pin entries (D-08)
+# ---------------------------------------------------------------------------
+
+
+async def get_pending_pin_entries(
+    session: AsyncSession,
+    *,
+    vault_address: str,
+) -> list[dict]:
+    """Return journal_entries rows with state='pending_pin' for a vault.
+
+    Called by the reconcile path to retry entries that failed during Pinata pinning
+    (e.g. transient network error). Records advance to pinned_primary once Pinata
+    confirms. Only pending_pin is returned — partially advanced entries (pinned_primary,
+    signed) are not retried here (they have distinct reconciliation paths).
+
+    Args:
+        session:       AsyncSession bound to orchestrator_user role.
+        vault_address: Vault to query (one vault per model).
+
+    Returns:
+        List of dicts with keys: id, vault_address, order_key, trade_hash,
+        raw_request, raw_response, canonical_decision, state, pinata_cid,
+        onchain_tx, created_at. Ordered oldest-first for FIFO retry.
+    """
+    result = await session.execute(
+        text(
+            """
+            SELECT id, vault_address, order_key, trade_hash,
+                   raw_request, raw_response, canonical_decision,
+                   state, pinata_cid, onchain_tx, created_at
+            FROM orchestrator.journal_entries
+            WHERE vault_address = :vault_address
+              AND state = 'pending_pin'
+            ORDER BY created_at ASC
+            """
+        ),
+        {"vault_address": vault_address},
+    )
+    return [dict(row._mapping) for row in result.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# end_session — session lifecycle (D-12, ORCH plan 05 startup)
+# ---------------------------------------------------------------------------
+
+
 async def end_session(
     session: AsyncSession,
     *,
