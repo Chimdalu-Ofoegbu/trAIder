@@ -1,15 +1,15 @@
 """
-orchestrator.loop.driver — Per-cycle live ORCH-02 loop (Plan 02-05).
+orchestrator.loop.driver — Per-cycle live ORCH-02 loop (Plan 02-05 / 03-02).
 
 Composes the Wave-2 pieces into the live trade loop:
 
   run_live_cycle(...)
       Single ORCH-02 cycle: prompt → call_claude → validate → business-rules →
-      record-intent (BEFORE submit) → MockPerps open → promote intent row.
+      record-intent (BEFORE submit) → vault.openLong/openShort/closePosition → promote.
 
   reconcile_pending_orders(...)
       Startup ORCH-08 reconciliation: reads unresolved intent/pending rows and
-      checks each against MockPerps.pendingOrders to determine if the submit landed.
+      checks each against the adapter's pendingOrders to determine if the submit landed.
 
   run_session(...)
       Session driver: creates session, reconciles, launches price_pusher + keeper
@@ -21,7 +21,7 @@ SC-2 record-intent-before-submit ordering guarantee
 In run_live_cycle step 8, the order of operations is MANDATORY:
   8a. Compute intent_key (pure, no network).
   8b. record_journal_pending + record_pending_order(status='intent')  ← DB write FIRST
-  8c. MockPerps openLong/openShort.transact(...)                      ← network call SECOND
+  8c. vault_contract.openLong/openShort/closePosition.transact(...)   ← network call SECOND
   8d. Promote intent row to real order_key + mark_pending_order_reconciled(intent_key)
 
 A SIGKILL between 8b and 8c leaves an 'intent' row with no on-chain order.
@@ -41,8 +41,20 @@ D-12 session end
 stop_event.set() → price_pusher and keeper stop; end_session marks DB row ended;
 positions are LEFT OPEN (settlement contract drains them separately).
 
+D-16 REQUIRED-REGARDLESS (03-02): trade submission
+---------------------------------------------------
+Trades are submitted by calling vault_contract.functions.(openLong|openShort|closePosition)
+as the operator-trade EOA — NOT by direct adapter calls with anvil from-impersonation.
+The vault's onlyOrchestrator modifier requires msg.sender == operator-trade key.
+  - Trade SUBMISSION path: vault_contract.functions.* → operator_trade_address
+  - Event/read path: mock_perps / adapter contract object → unchanged (venue-agnostic)
+
+Signing middleware (SignAndSendRawMiddlewareBuilder, web3.py 7.x) is loaded once at
+startup in run_session.  On anvil, the operator-trade key is anvil account[N].  On
+Sepolia, it is the gitignored OPERATOR_TRADE_KEY from .env (SEC-01).
+
 FORBIDDEN in this module (D-13 / T-02-21):
-  MockPerps.executeOrder — that is the keeper_monitor's job.
+  adapter.executeOrder — that is the keeper_monitor's job.
 """
 
 from __future__ import annotations
@@ -53,6 +65,7 @@ import time
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
+from web3.middleware import SignAndSendRawMiddlewareBuilder
 
 from orchestrator.business_rules import validate_business_rules
 from orchestrator.loop.failure_tracker import FailureTracker
@@ -164,12 +177,16 @@ async def run_live_cycle(
     recent_decisions: str,
     elapsed_seconds: float,
     market_snapshot: dict[str, dict[str, float]] | None = None,
+    vault_contract: Any = None,
+    operator_trade_address: str | None = None,
 ) -> dict:
     """Execute one live trading cycle (ORCH-02 sequence).
 
     Args:
         web3: AsyncWeb3 instance.
-        mock_perps: MockPerps contract instance.
+        mock_perps: Adapter contract instance (MockPerps or GMXAdapter).
+                    Used for EVENT DECODING and READ CALLS only (D-16 split):
+                    getOpenPositionKeys, positions, pendingOrders, OrderCreated event.
         vault: Vault address string (checksummed hex).
         model: LLM model identifier (e.g. 'claude-opus-4-7').
         cycle: 1-based cycle number within the session.
@@ -193,6 +210,14 @@ async def run_live_cycle(
             back to reading mark prices from the aggregator and deriving funding/24h
             from the walk (may be one step behind price_pusher — only for backwards
             compat / testing without a snapshot queue).
+        vault_contract: MTokenVault contract instance (D-16). TRADE SUBMISSION goes
+            through this contract's openLong / openShort / closePosition (onlyOrchestrator
+            enforces msg.sender == operator_trade_address). When None (legacy/test),
+            falls back to calling the adapter directly with vault from-impersonation
+            (anvil-only path — NOT for Sepolia).
+        operator_trade_address: Checksummed address of the operator-trade EOA. Signing
+            middleware must already be loaded on web3 for this address before the first
+            cycle (see run_session). When None, falls back to the legacy vault from-impersonation.
 
     Returns:
         Result dict with keys:
@@ -468,6 +493,15 @@ async def run_live_cycle(
         decision.leverage,
     )
 
+    # D-16 REQUIRED-REGARDLESS (03-02): determine the trade submission contract.
+    # When vault_contract + operator_trade_address are provided (Sepolia-capable path):
+    #   → submit via vault_contract.functions.* as the operator-trade EOA
+    #     (signing middleware on web3 signs automatically)
+    # When not provided (legacy anvil-only from-impersonation fallback):
+    #   → submit via adapter directly with {"from": vault}
+    #     (only works when anvil has the vault address unlocked)
+    _use_vault_submit = vault_contract is not None and operator_trade_address is not None
+
     # CR-02/WR-03: action-based dispatch — NEVER route close/adjust to openLong/openShort.
     if decision.action == "close":
         # Close requires an existing position; look it up from the on-chain map.
@@ -488,9 +522,16 @@ async def run_live_cycle(
             return {"status": "rejected", "reason": reason}
         pos_key_hex: str = existing["position_key"]
         pos_key_bytes = bytes.fromhex(pos_key_hex.removeprefix("0x"))
-        tx = await mock_perps.functions.closePosition(pos_key_bytes, size_usd_1e30).transact(
-            {"from": vault}
-        )
+        # D-16: submit via vault_contract as operator-trade EOA (Sepolia-capable path)
+        if _use_vault_submit:
+            tx = await vault_contract.functions.closePosition(
+                pos_key_bytes, size_usd_1e30
+            ).transact({"from": operator_trade_address})
+        else:
+            # Legacy anvil from-impersonation (not for Sepolia)
+            tx = await mock_perps.functions.closePosition(pos_key_bytes, size_usd_1e30).transact(
+                {"from": vault}
+            )
     elif decision.action == "adjust":
         # Adjust is not cleanly supported by MockPerps (no partial-size modification).
         # Reject safely rather than silently opening a new position. (D-09 reject pattern)
@@ -508,14 +549,26 @@ async def run_live_cycle(
         return {"status": "rejected", "reason": reason}
     else:
         # action == "open": proceed with openLong/openShort.
-        open_fn = (
-            mock_perps.functions.openLong
-            if decision.side == "long"
-            else mock_perps.functions.openShort
-        )
-        tx = await open_fn(decision.market, size_usd_1e30, leverage_1e4, slippage_bps).transact(
-            {"from": vault}
-        )
+        # D-16: submit via vault_contract as operator-trade EOA (Sepolia-capable path)
+        if _use_vault_submit:
+            open_fn = (
+                vault_contract.functions.openLong
+                if decision.side == "long"
+                else vault_contract.functions.openShort
+            )
+            tx = await open_fn(decision.market, size_usd_1e30, leverage_1e4, slippage_bps).transact(
+                {"from": operator_trade_address}
+            )
+        else:
+            # Legacy anvil from-impersonation (not for Sepolia)
+            open_fn = (
+                mock_perps.functions.openLong
+                if decision.side == "long"
+                else mock_perps.functions.openShort
+            )
+            tx = await open_fn(decision.market, size_usd_1e30, leverage_1e4, slippage_bps).transact(
+                {"from": vault}
+            )
 
     # GAP-1a fix: use wait_for_transaction_receipt (not get_transaction_receipt) to avoid
     # TransactionNotFound race on anvil, and wrap the entire receipt + event-recovery block
@@ -607,7 +660,7 @@ async def reconcile_pending_orders(
     *,
     vault: str,
 ) -> int:
-    """Check unresolved DB rows against MockPerps.pendingOrders before any resubmit.
+    """Check unresolved DB rows against the adapter's pendingOrders before any resubmit.
 
     On startup the driver calls this BEFORE the first cycle to determine which
     pending_orders rows represent orders that actually landed on-chain.
@@ -616,14 +669,18 @@ async def reconcile_pending_orders(
     - intent-* key (starts with "intent-"): synthetic pre-submit key.  The submit
       either never landed or landed under a real key.  We cannot look it up on-chain
       by this key.  Safe to resubmit once on the next cycle.
-    - Real hex key (0x...): check MockPerps.pendingOrders(key_bytes).vault.
+    - Real hex key (0x...): check adapter.pendingOrders(key_bytes).vault.
       If vault != address(0): order is on-chain → do NOT resubmit (keeper will execute).
       If vault == address(0): order not found on-chain → submit never landed → safe to
       resubmit once (ORCH-08 / T-02-17 Pitfall 4).
 
+    Note: reconciliation reads from the ADAPTER (mock_perps / GMXAdapter) — it reads
+    on-chain pending order state.  It does NOT interact with vault_contract (which is
+    for trade SUBMISSION only, per the D-16 adapter-for-reads / vault-for-writes split).
+
     Args:
         web3: AsyncWeb3 instance (unused in this implementation; available for GMX).
-        mock_perps: MockPerps contract instance.
+        mock_perps: Adapter contract instance (MockPerps or GMXAdapter) — READ side only.
         db: AsyncSession for DB reads.
         vault: Vault address to reconcile.
 
@@ -695,23 +752,27 @@ async def run_session(
     db: Any,
     redis: Any | None,
     deployer_address: str,
+    vault_contract: Any = None,
+    operator_trade_account: Any = None,
 ) -> dict:
-    """Run the full trading session loop (ORCH-02 / D-12).
+    """Run the full trading session loop (ORCH-02 / D-12 / D-16).
 
     Sequence:
     1. create_session in DB (idempotent — safe on restart).
-    2. reconcile_pending_orders (ORCH-08 startup check).
-    3. Seed=logged prominently (D-01 replay requirement).
-    4. Launch price_pusher + keeper_monitor as separate asyncio.Tasks.
-    5. Cycle loop until session_duration_seconds elapsed.
+    2. Load signing middleware for operator-trade EOA (D-16 — once at startup).
+    3. reconcile_pending_orders (ORCH-08 startup check).
+    4. Seed=logged prominently (D-01 replay requirement).
+    5. Launch price_pusher + keeper_monitor as separate asyncio.Tasks.
+    6. Cycle loop until session_duration_seconds elapsed.
        - Paused → back off to paused_poll_interval_seconds (D-16).
        - Run run_live_cycle for each active cycle.
-    6. Session end: stop_event.set(), cancel/await tasks, end_session (D-12).
+    7. Session end: stop_event.set(), cancel/await tasks, end_session (D-12).
        Positions are left open — settlement contract handles draining.
 
     Args:
         web3: AsyncWeb3 instance.
-        mock_perps: MockPerps contract instance.
+        mock_perps: Adapter contract instance (MockPerps or GMXAdapter).
+                    Used for event decoding + read calls (D-16 split).
         aggregators: Mapping of asset → MockChainlinkAggregator contract.
         vault: Vault address.
         model: LLM model identifier.
@@ -719,6 +780,14 @@ async def run_session(
         db: AsyncSession for DB writes.
         redis: Optional redis.asyncio client.
         deployer_address: Deployer EOA (used by keeper_monitor for executeOrder).
+        vault_contract: MTokenVault contract instance (D-16). When provided, trade
+            submission goes through vault.openLong/openShort/closePosition as the
+            operator-trade EOA.  When None, falls back to legacy adapter impersonation
+            (anvil-only).  Do NOT put the private key in SessionConfig (SEC-01).
+        operator_trade_account: LocalAccount from eth_account.Account.from_key(...).
+            The private key is used ONLY to load signing middleware (once at startup).
+            The address is derived as operator_trade_account.address and threaded into
+            transact calls.  When None, signing middleware is not loaded (legacy path).
 
     Returns:
         Summary dict: {"cycles": int, "seed": int, "session_id": str}
@@ -731,10 +800,37 @@ async def run_session(
         duration_seconds=config.session_duration_seconds,
     )
 
-    # Step 2: Startup reconciliation (ORCH-08)
+    # Step 2: Load signing middleware for operator-trade EOA (D-16 REQUIRED-REGARDLESS).
+    # construct_sign_and_send_raw_middleware intercepts .transact() calls whose "from"
+    # matches the account address and auto-signs + submits the raw transaction.
+    # This is the ONLY place the private key crosses into web3 — SEC-01 compliance.
+    # On anvil: operator_trade_account is anvil account[N] (well-known dev key).
+    # On Sepolia: operator_trade_account is loaded from gitignored OPERATOR_TRADE_KEY env var.
+    operator_trade_address: str | None = None
+    if operator_trade_account is not None:
+        # web3.py 7.x API: SignAndSendRawMiddlewareBuilder.build is @curry-decorated.
+        # Calling build(account) WITHOUT w3 returns a curry partial that the middleware
+        # onion will call with (w3) during initialization.  This is the correct injection
+        # pattern — passing the fully-built instance (build(account, w3)) causes a
+        # TypeError because the onion then calls the instance as if it were a class.
+        # Replaces the web3.py 6.x construct_sign_and_send_raw_middleware function.
+        signing_mw_partial = SignAndSendRawMiddlewareBuilder.build(operator_trade_account)
+        web3.middleware_onion.inject(signing_mw_partial, layer=0)
+        operator_trade_address = operator_trade_account.address
+        logger.info(
+            "run_session: signing middleware loaded for operator-trade EOA %s (D-16)",
+            operator_trade_address,
+        )
+    else:
+        logger.warning(
+            "run_session: no operator_trade_account provided — "
+            "falling back to legacy vault from-impersonation (anvil only, NOT Sepolia)"
+        )
+
+    # Step 3: Startup reconciliation (ORCH-08)
     await reconcile_pending_orders(web3, mock_perps, db, vault=vault)
 
-    # Step 3: Log seed prominently (D-01 — session is fully replayable from seed)
+    # Step 4: Log seed prominently (D-01 — session is fully replayable from seed)
     logger.warning(
         "SESSION START seed=%s session_id=%s duration=%ss cadence=%ss model=%s vault=%s",
         config.price_seed,
@@ -745,7 +841,7 @@ async def run_session(
         vault[:10],
     )
 
-    # Step 4: Launch background tasks
+    # Step 5: Launch background tasks
     stop_event = asyncio.Event()
     walk = PriceWalk(
         config.price_seed,
@@ -796,7 +892,7 @@ async def run_session(
         name=f"keeper-{config.session_id[:8]}",
     )
 
-    # Step 5: Cycle loop
+    # Step 6: Cycle loop
     # CR-01: Rehydrate FailureTracker from DB before loop starts so a model that was
     # 2/3 of the way to pause before a SIGKILL resumes at the correct streak count
     # (ORCH-06 restart-safety requirement).
@@ -891,6 +987,8 @@ async def run_session(
                 recent_decisions="\n".join(recent_decisions[-5:]) or "None",
                 elapsed_seconds=elapsed,
                 market_snapshot=current_snapshot,
+                vault_contract=vault_contract,
+                operator_trade_address=operator_trade_address,
             )
 
             # Keep last-5 decision summary
@@ -905,7 +1003,7 @@ async def run_session(
                 await asyncio.sleep(config.cadence_seconds)
 
     finally:
-        # Step 6: D-12 session end — stop background tasks, mark session ended
+        # Step 7: D-12 session end — stop background tasks, mark session ended
         stop_event.set()
         elapsed_total = time.monotonic() - start
         logger.warning(

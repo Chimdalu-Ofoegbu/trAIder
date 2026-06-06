@@ -57,8 +57,9 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
+from eth_account import Account
 from web3 import AsyncWeb3, Web3
-from web3.middleware import ExtraDataToPOAMiddleware
+from web3.middleware import ExtraDataToPOAMiddleware, SignAndSendRawMiddlewareBuilder
 
 # ---------------------------------------------------------------------------
 # Path constants
@@ -87,16 +88,19 @@ class VaultContext:
     """Deployed Phase 1 stack on local anvil.
 
     Attributes:
-        mock_perps: MockPerps contract instance (web3).
+        mock_perps: MockPerps contract instance (web3). Used for event decoding + reads.
         mock_perps_addr: Checksummed MockPerps address.
-        vault: MTokenVault contract (mCLA-S1 = vault 0).
+        vault: MTokenVault contract (mCLA-S1 = vault 0). Used for TRADE SUBMISSION (D-16).
         vault_addr: Checksummed vault address.
         usdc: MockERC20 contract instance.
         usdc_addr: Checksummed USDC address.
         aggregators: Dict mapping asset string to MockChainlinkAggregator contract.
         agg_addrs: Dict mapping asset string to aggregator address.
-        deployer: Anvil account 0 address.
+        deployer: Anvil account 0 address. Also the operator-trade EOA on anvil.
         rpc_url: RPC URL of the local anvil.
+        operator_trade_address: Checksummed EOA for trade submission via vault (D-16).
+            On anvil, this is the deployer (account 0), which is also the vault's
+            orchestrator immutable (ORCHESTRATOR env var in 01-Deploy.s.sol).
     """
 
     mock_perps: Any
@@ -109,6 +113,7 @@ class VaultContext:
     agg_addrs: dict[str, str]
     deployer: str
     rpc_url: str
+    operator_trade_address: str = ""  # set by vault_on_anvil after signing middleware is loaded
 
 
 # Anvil default dev accounts (anvil's well-known mnemonic, account 0).
@@ -734,6 +739,21 @@ async def vault_on_anvil(anvil_w3: AsyncWeb3) -> AsyncGenerator[VaultContext, No
             "Check: was the USDC approve called before deposit? Is the feed stale?"
         )
 
+    # ── D-16 REQUIRED-REGARDLESS: load signing middleware for the operator-trade EOA ──
+    # On anvil, the operator-trade key is the well-known anvil account 0 private key
+    # (same key used to deploy all contracts and set as ORCHESTRATOR in 01-Deploy.s.sol).
+    # The signing middleware intercepts .transact({"from": <address>}) calls for this EOA
+    # and auto-signs + sends raw transactions — required for the Sepolia-capable code path
+    # and exercised here so integration tests run the same signed path.
+    #
+    # web3.py 7.x pattern: SignAndSendRawMiddlewareBuilder.build is @curry-decorated.
+    # Calling .build(account) without w3 returns a curry partial; the middleware onion
+    # calls partial(w3) during initialization.  DO NOT pass w3 here — that would produce
+    # a fully-built instance that the onion then tries to call as a class, causing TypeError.
+    operator_trade_account = Account.from_key(_ANVIL_PRIVATE_KEY)
+    signing_mw_partial = SignAndSendRawMiddlewareBuilder.build(operator_trade_account)
+    anvil_w3.middleware_onion.inject(signing_mw_partial, layer=0)
+
     yield VaultContext(
         mock_perps=mock_perps_contract,
         mock_perps_addr=mock_perps_addr,
@@ -745,6 +765,7 @@ async def vault_on_anvil(anvil_w3: AsyncWeb3) -> AsyncGenerator[VaultContext, No
         agg_addrs={"ETH": eth_feed_addr, "BTC": btc_feed_addr, "SOL": sol_feed_addr},
         deployer=_ANVIL_ACCOUNT_0,
         rpc_url=_ANVIL_RPC,
+        operator_trade_address=operator_trade_account.address,
     )
 
 
