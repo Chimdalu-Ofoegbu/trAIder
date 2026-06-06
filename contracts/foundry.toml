@@ -30,8 +30,19 @@ fuzz = { runs = 16 }
 [profile.fork]
 # Fork profile: pinned Arbitrum One block for deterministic replay (D-39)
 # FORK_BLOCK = 353000000 (pinned 2026-06-01; bump only on dep-contract upgrade)
+# NOTE: Do NOT use this profile for GMX fork tests — GMX V2 contracts were
+# redeployed after block ~401000000. Use the [profile.gmx-fork] profile instead.
 via_ir = true
 fork_block_number = 353000000
+
+[profile.gmx-fork]
+# GMX-specific fork profile: block >= 402000000 required.
+# Decision 00-00 FORK_BLOCK=353000000 is SUPERSEDED for GMX tests (03-01 spike).
+# GMX V2 ExchangeRouter/Reader/OrderHandler redeployed after block ~401000000.
+# At block 353000000 those addresses have NO code — a false-green trap.
+# Use: FOUNDRY_PROFILE=gmx-fork forge test --match-path "test/fork/GMXAdapterForkTest.t.sol" --fork-url $ARB_RPC
+via_ir = true
+fork_block_number = 405000000
 
 [rpc_endpoints]
 # ARB_RPC: Alchemy Arbitrum One archive URL (USER SETUP — populate .env with real key)
