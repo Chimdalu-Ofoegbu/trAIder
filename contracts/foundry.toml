@@ -58,6 +58,7 @@ arbitrum_sepolia = "${SEPOLIA_RPC}"
 [etherscan]
 # ARBISCAN_API_KEY: Arbiscan API key for auto-verification (USER SETUP — populate .env)
 # Chain ID 421614 is Arbitrum Sepolia testnet.
-arbitrum-sepolia = { key = "${ARBISCAN_API_KEY}", url = "https://api-sepolia.arbiscan.io/api", chain = 421614 }
+# Etherscan V2 unified endpoint (V1 api-sepolia.arbiscan.io deprecated).
+arbitrum-sepolia = { key = "${ARBISCAN_API_KEY}", url = "https://api.etherscan.io/v2/api", chain = 421614 }
 
 # See more config options: https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
