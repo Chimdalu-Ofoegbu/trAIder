@@ -754,6 +754,16 @@ async def run_session(
     deployer_address: str,
     vault_contract: Any = None,
     operator_trade_account: Any = None,
+    # Journal publisher params (PERPS-02 / D-08/D-09/D-10): optional, forwarded
+    # to run_keeper_monitor so the keeper can publish_journal_entry on OrderExecuted.
+    # All default None to preserve backward-compat with Phase-2 anvil tests.
+    journal_registry: Any | None = None,
+    operator_journal_private_key: bytes | None = None,
+    pinata_jwt: str | None = None,
+    storacha_api_key: str | None = None,
+    operator_journal_key_address: str | None = None,
+    telegram_bot_token: str | None = None,
+    telegram_chat_id: str | None = None,
 ) -> dict:
     """Run the full trading session loop (ORCH-02 / D-12 / D-16).
 
@@ -788,6 +798,15 @@ async def run_session(
             The private key is used ONLY to load signing middleware (once at startup).
             The address is derived as operator_trade_account.address and threaded into
             transact calls.  When None, signing middleware is not loaded (legacy path).
+        journal_registry: JournalRegistry contract instance (D-10). When provided
+            together with operator_journal_private_key and pinata_jwt, the keeper
+            publishes journal entries on OrderExecuted (PERPS-02).
+        operator_journal_private_key: Raw 32-byte private key for EIP-191 signing.
+        pinata_jwt: Pinata V3 JWT for IPFS pinning (JOURNAL-02).
+        storacha_api_key: Optional Filebase backup API key (D-08).
+        operator_journal_key_address: Hex address for operator-journal key transact from.
+        telegram_bot_token: Optional Telegram bot token for alert sink (D-15).
+        telegram_chat_id: Optional Telegram chat ID for alert sink (D-15).
 
     Returns:
         Summary dict: {"cycles": int, "seed": int, "session_id": str}
@@ -888,6 +907,17 @@ async def run_session(
             session_id=config.session_id,
             stop_event=stop_event,
             poll_seconds=2.0,
+            # Journal publisher params (PERPS-02 / D-08/D-09/D-10).
+            # All default None — backward-compat with Phase-2 anvil tests.
+            # When all three required params are non-None, the keeper publishes
+            # journal entries on OrderExecuted (wired here once at session start).
+            journal_registry=journal_registry,
+            operator_journal_private_key=operator_journal_private_key,
+            pinata_jwt=pinata_jwt,
+            storacha_api_key=storacha_api_key,
+            operator_journal_key_address=operator_journal_key_address,
+            telegram_bot_token=telegram_bot_token,
+            telegram_chat_id=telegram_chat_id,
         ),
         name=f"keeper-{config.session_id[:8]}",
     )

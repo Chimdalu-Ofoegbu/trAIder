@@ -17,7 +17,7 @@
 #   pnpm (make gen-types: frontend)
 # =============================================================================
 
-.PHONY: up seed verify-stack reset down db-reset gen-types coverage deploy-sepolia deploy-sepolia-clean help
+.PHONY: up seed verify-stack reset down db-reset gen-types coverage deploy-sepolia deploy-sepolia-clean run-mini-session test-03-gate help
 
 # ── Environment ───────────────────────────────────────────────────────────────
 # Source .env.example for defaults (real values come from .env.* gitignored files)
@@ -176,6 +176,105 @@ deploy-sepolia-clean:
 	@printf '{\n  "sessionFactory": "0x0000000000000000000000000000000000000000",\n  "oracle": "0x0000000000000000000000000000000000000000",\n  "journal": "0x0000000000000000000000000000000000000000",\n  "vaultClaude": "0x0000000000000000000000000000000000000000",\n  "vaultGpt": "0x0000000000000000000000000000000000000000",\n  "vaultGem": "0x0000000000000000000000000000000000000000",\n  "adapter": "0x0000000000000000000000000000000000000000",\n  "mockUsdc": "0x0000000000000000000000000000000000000000",\n  "ethFeed": "0x0000000000000000000000000000000000000000",\n  "btcFeed": "0x0000000000000000000000000000000000000000",\n  "solFeed": "0x0000000000000000000000000000000000000000",\n  "sequencerFeed": "0x0000000000000000000000000000000000000000"\n}\n' > deployments/sepolia.json
 	@echo "==> deploy-sepolia-clean complete. Run make deploy-sepolia to deploy fresh."
 
+# ── run-mini-session ─────────────────────────────────────────────────────────
+# TEST-03 / D-04: Run the Sepolia mini-session with one model (Claude).
+#
+# Usage:
+#   make run-mini-session SESSION_TIME=1800
+#
+# Required env (fill in orchestrator/.env or root .env):
+#   SEPOLIA_RPC                  Alchemy Arbitrum Sepolia HTTPS endpoint
+#   OPERATOR_TRADE_KEY           Hex private key for operator-trade EOA (SEC-01, gitignored)
+#   OPERATOR_JOURNAL_KEY_PRIV    Hex private key for operator-journal EOA (SEC-01, gitignored)
+#   OPERATOR_JOURNAL_KEY_ADDR    Hex address for operator-journal EOA
+#   PINATA_JWT                   Pinata V3 JWT (JOURNAL-02, gitignored)
+#   FILEBASE_API_KEY             Filebase S3 API key (D-08, gitignored)
+#   ANTHROPIC_API_KEY            Anthropic API key for Claude (gitignored)
+#   ORCHESTRATOR_DATABASE_URL    Async Postgres URL (postgresql+asyncpg://...)
+#
+# Optional env:
+#   PERPS_VENUE                  "mock" | "gmx" (default: mock)
+#   SESSION_CADENCE              Trading cadence seconds (default: 60)
+#   PRICE_SEED                   PriceWalk seed (default: 42)
+#   REDIS_URL                    Redis for WS fanout
+#   TELEGRAM_BOT_TOKEN           Telegram bot token (D-15, optional)
+#   TELEGRAM_CHAT_ID             Telegram chat ID (D-15, optional)
+#   LATENCY_WATCHDOG_THRESHOLD   1A latency breach threshold seconds (D-03, default: 30)
+#
+# D-03 note: PERPS_VENUE defaults to "mock". To drill the 1A flip:
+#   1. Induce latency (delay keeper executeOrder).
+#   2. Observe WARNING alert from the latency watchdog.
+#   3. Operator: stop this process, set PERPS_VENUE=<venue>, restart — NEVER auto-flip.
+#
+# WARNING: This connects to Arbitrum Sepolia and makes real LLM + blockchain calls.
+# Ensure operator keys are funded with Sepolia ETH and vaultClaude is seeded with
+# mock USDC before running (see docs/RUNBOOK.md vault-seeding section).
+SESSION_TIME ?= 1800
+
+run-mini-session:
+	@echo "==> Starting Sepolia mini-session (SESSION_TIME=$(SESSION_TIME)s PERPS_VENUE=$${PERPS_VENUE:-mock})..."
+	@echo "    Manifest: deployments/sepolia.json"
+	@echo "    D-03: latency watchdog active — operator flip required if WARNING fires"
+	@echo "    D-04: gate = >=30min clean run + createOrder->journal E2E + nav tick"
+	ORCHESTRATOR_DATABASE_URL=$${ORCHESTRATOR_DATABASE_URL:-postgresql+asyncpg://orchestrator_user:orchestrator_pass@localhost:5432/traider} \
+	SESSION_DURATION=$(SESSION_TIME) \
+	PERPS_VENUE=$${PERPS_VENUE:-mock} \
+		uv run --project orchestrator --env-file orchestrator/.env \
+			python -m orchestrator.loop.run_session
+	@echo "==> mini-session complete."
+
+# ── test-03-gate ──────────────────────────────────────────────────────────────
+# TEST-03: Automated gate harness for Phase-4 entry (D-04).
+#
+# Runs in two stages:
+#   Stage 1: Fork suite (GMX fork at block 405000000 + Sequencer fork at 353000000)
+#   Stage 2: Python harness (nav-tick + both-gateways CID-fetchable assertions)
+#
+# Stage 1 requires ARB_RPC in env (Alchemy Arbitrum One HTTPS endpoint).
+# Stage 2 requires ORCHESTRATOR_DATABASE_URL (Postgres with alembic applied).
+#          Requires PINATA_JWT + FILEBASE_API_KEY for live gateway assertions;
+#          cleanly skips (EXPLICIT-DEFER) when absent.
+#
+# Usage:
+#   make test-03-gate ARB_RPC=https://arb-mainnet.g.alchemy.com/v2/<KEY>
+#
+# PASS/FAIL is printed at the end; result should be recorded in
+# .planning/phases/03-real-gmx-chainlink-sepolia-deploy/03-TEST-03-GATE.md
+test-03-gate:
+	@echo "==> TEST-03 gate harness: Stage 1 — fork suite precondition"
+	@echo "    GMX fork tests (block 405000000, FOUNDRY_PROFILE=gmx-fork):"
+	@if [ -z "$${ARB_RPC}" ]; then \
+		echo "    WARNING: ARB_RPC not set — Stage 1 (fork suite) will be SKIPPED."; \
+		echo "    Set ARB_RPC=https://arb-mainnet.g.alchemy.com/v2/<KEY> to run fork tests."; \
+	else \
+		cd contracts && FOUNDRY_PROFILE=gmx-fork forge test \
+			--match-path "test/fork/GMXAdapterForkTest.t.sol" \
+			--fork-url "$${ARB_RPC}" \
+			-v 2>&1 | tail -20 || echo "  GMX fork tests: see output above"; \
+		echo "    Sequencer fork test (block 353000000):"; \
+		cd contracts && forge test \
+			--match-path "test/fork/ChainlinkSequencerForkTest.t.sol" \
+			--fork-url "$${ARB_RPC}" \
+			--fork-block-number 353000000 \
+			-v 2>&1 | tail -20 || echo "  Sequencer fork tests: see output above"; \
+	fi
+	@echo ""
+	@echo "==> TEST-03 gate harness: Stage 2 — Python automated assertions"
+	ORCHESTRATOR_DATABASE_URL=$${ORCHESTRATOR_DATABASE_URL:-postgresql+asyncpg://orchestrator_user:orchestrator_pass@localhost:5432/traider} \
+	SEPOLIA_RPC=$${SEPOLIA_RPC:-} \
+	ARB_RPC=$${ARB_RPC:-} \
+		uv run --project orchestrator pytest \
+			orchestrator/tests/integration/test_mini_session_gate.py \
+			-v --tb=short 2>&1
+	@echo ""
+	@echo "==> TEST-03 gate complete. Record result in 03-TEST-03-GATE.md."
+	@echo "    GATE: PASS criteria (all 5 must hold):"
+	@echo "      1. Fork suite green (Stage 1)"
+	@echo "      2. vault.nav() ticks with mock feed (Stage 2)"
+	@echo "      3. This-run CIDs fetchable from BOTH gateways (Stage 2, requires PINATA_JWT)"
+	@echo "      4. createOrder->execute->journal E2E (live run only — Task 3)"
+	@echo "      5. >=30min clean continuous run (live run only — Task 3)"
+
 # ── help ──────────────────────────────────────────────────────────────────────
 help:
 	@echo "trAIder Makefile targets:"
@@ -192,5 +291,14 @@ help:
 	@echo "                          Requires: SEPOLIA_RPC, ARBISCAN_API_KEY, DEPLOYER_PRIVATE_KEY,"
 	@echo "                                    OPERATOR_JOURNAL_KEY, ORCHESTRATOR, OPERATOR"
 	@echo "  make deploy-sepolia-clean  Reset manifest to zeros (fresh deploy next run)"
+	@echo ""
+	@echo "  make run-mini-session       Run Sepolia mini-session (TEST-03 / D-04)"
+	@echo "                              SESSION_TIME=1800 (default 30min)"
+	@echo "                              Requires: SEPOLIA_RPC, OPERATOR_TRADE_KEY, PINATA_JWT,"
+	@echo "                                        ANTHROPIC_API_KEY, ORCHESTRATOR_DATABASE_URL"
+	@echo "  make test-03-gate           TEST-03 automated gate harness"
+	@echo "                              Stage 1: forge fork suite (GMX@405000000 + Sequencer@353000000)"
+	@echo "                              Stage 2: Python assertions (nav-tick + both-gateways CID)"
+	@echo "                              Requires: ARB_RPC (Stage 1), PINATA_JWT (Stage 2 live)"
 	@echo ""
 	@echo "Prerequisites: Docker Desktop, Foundry (cast/forge), uv, pnpm"

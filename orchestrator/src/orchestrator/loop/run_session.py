@@ -1,0 +1,664 @@
+"""
+orchestrator.loop.run_session — Sepolia mini-session entrypoint (03-08 / TEST-03).
+
+Wires all Phase-3 pieces into a single runnable session:
+  - Reads addresses from deployments/sepolia.json (D-14: NO hardcoded addresses).
+  - Connects AsyncWeb3 to SEPOLIA_RPC.
+  - Loads operator-trade key → signing middleware (D-16).
+  - Loads operator-journal key for publish_journal_entry (D-10).
+  - Selects venue via PERPS_VENUE (default "mock" per D-01, D-03).
+  - Builds vault_contract (mCLA-S1) + adapter via adapter_factory.
+  - Launches driver.run_session + run_keeper_monitor as concurrent asyncio.Tasks.
+  - Runs a 1A latency watchdog (D-03): WARNING at threshold, NEVER auto-flips.
+  - Wires journal params (Pinata JWT, Filebase key, operator-journal key).
+
+Usage (via make run-mini-session or directly):
+  uv run --project orchestrator --env-file orchestrator/.env \
+      python -m orchestrator.loop.run_session
+
+Environment variables read (from .env files — secrets never hardcoded):
+  SEPOLIA_RPC                  Arbitrum Sepolia HTTPS RPC URL
+  OPERATOR_TRADE_KEY           Hex private key for operator-trade EOA (SEC-01)
+  OPERATOR_JOURNAL_KEY_PRIV    Hex private key for operator-journal EOA (SEC-01)
+  OPERATOR_JOURNAL_KEY_ADDR    Hex address of operator-journal EOA (for transact from)
+  PINATA_JWT                   Pinata V3 JWT for IPFS pinning (JOURNAL-02)
+  FILEBASE_API_KEY             Filebase S3 API key for backup pinning (D-08)
+  FILEBASE_BUCKET              Filebase IPFS bucket name (default: traider-journals)
+  PERPS_VENUE                  "mock" | "gmx" (default: "mock", D-01/D-03)
+  SESSION_DURATION             Session duration in seconds (default: 1800 = 30min)
+  SESSION_CADENCE              Trading cadence in seconds (default: 60)
+  PRICE_SEED                   PriceWalk seed (default: 42, D-01)
+  ORCHESTRATOR_DATABASE_URL    Async Postgres URL (postgresql+asyncpg://...)
+  REDIS_URL                    Redis URL for WS fanout (optional)
+  TELEGRAM_BOT_TOKEN           Telegram bot token for alert sink (D-15, optional)
+  TELEGRAM_CHAT_ID             Telegram chat ID for alert sink (D-15, optional)
+  LATENCY_WATCHDOG_THRESHOLD   createOrder→OrderExecuted latency threshold in seconds
+                               (default: 30 for drill / 300 for spec, D-03)
+
+Security (SEC-01 / T-03-31): private keys read from gitignored .env files, passed
+as parameters, NEVER logged verbatim. run_session.py reads them ONCE from env and
+passes them down — no downstream module re-reads os.environ.
+
+D-03 1A Latency Watchdog rule (T-03-30):
+  The watchdog monitors createOrder→OrderExecuted latency. If a pending order
+  exceeds LATENCY_WATCHDOG_THRESHOLD seconds, it fires send_alert(WARNING).
+  The watchdog NEVER auto-flips PERPS_VENUE. Flipping requires the operator to
+  set PERPS_VENUE=<venue> and restart the orchestrator (D-03 restart-flip).
+  This is enforced at the code level: no PERPS_VENUE mutation inside the watchdog.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import time
+from pathlib import Path
+from typing import Any
+
+from eth_account import Account
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from web3 import AsyncWeb3
+from web3.middleware import ExtraDataToPOAMiddleware
+
+from orchestrator.alerts.sink import AlertSeverity, send_alert
+from orchestrator.loop.adapter_factory import build_perps_adapter
+from orchestrator.loop.driver import run_session as driver_run_session
+from orchestrator.loop.session import SessionConfig
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Manifest path (D-14: single source of truth, no hardcoded addresses)
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).parent.parent.parent.parent.parent  # repo root
+_MANIFEST_PATH = _REPO_ROOT / "deployments" / "sepolia.json"  # deployments/sepolia.json
+
+# ---------------------------------------------------------------------------
+# Contract artifact paths (for ABI loading)
+# ---------------------------------------------------------------------------
+
+_CONTRACTS_OUT = _REPO_ROOT / "contracts" / "out"
+_MTOKEN_VAULT_ARTIFACT = _CONTRACTS_OUT / "mTokenVault.sol" / "MTokenVault.json"
+_MOCK_PERPS_ARTIFACT = _CONTRACTS_OUT / "MockPerps.sol" / "MockPerps.json"
+_JOURNAL_REGISTRY_ARTIFACT = _CONTRACTS_OUT / "JournalRegistry.sol" / "JournalRegistry.json"
+
+
+def _load_abi(artifact_path: Path) -> list:
+    """Load ABI from a Foundry JSON artifact."""
+    if not artifact_path.exists():
+        raise FileNotFoundError(
+            f"Contract artifact not found: {artifact_path}\nRun `forge build` in contracts/ first."
+        )
+    with artifact_path.open(encoding="utf-8") as f:
+        return json.load(f)["abi"]
+
+
+# ---------------------------------------------------------------------------
+# 1A Latency Watchdog helpers — for external callers to notify the watchdog (D-03)
+# ---------------------------------------------------------------------------
+
+
+def register_pending_order(order_key: str, watchdog_queue: asyncio.Queue | None) -> None:
+    """Register a new pending order with the latency watchdog.
+
+    Called by external callers (e.g. driver/keeper) to notify the watchdog
+    that a new pending order was submitted. The watchdog starts tracking
+    this order's age from this moment.
+
+    Args:
+        order_key: Hex order key string.
+        watchdog_queue: asyncio.Queue shared with the watchdog coroutine.
+                        If None, the watchdog is not active (no-op).
+    """
+    if watchdog_queue is not None:
+        try:
+            watchdog_queue.put_nowait(("pending", order_key, time.monotonic()))
+        except asyncio.QueueFull:
+            pass  # Non-blocking — watchdog is best-effort
+
+
+def notify_order_executed(order_key: str, watchdog_queue: asyncio.Queue | None) -> None:
+    """Notify the watchdog that a pending order was executed (clear from tracking).
+
+    Args:
+        order_key: Hex order key string.
+        watchdog_queue: asyncio.Queue shared with the watchdog coroutine.
+                        If None, the watchdog is not active (no-op).
+    """
+    if watchdog_queue is not None:
+        try:
+            watchdog_queue.put_nowait(("executed", order_key, time.monotonic()))
+        except asyncio.QueueFull:
+            pass  # Non-blocking — watchdog is best-effort
+
+
+# ---------------------------------------------------------------------------
+# Queue-based latency watchdog (richer version — processes events from driver/keeper)
+# ---------------------------------------------------------------------------
+
+
+async def _latency_watchdog_queue_driven(
+    *,
+    vault_address: str,
+    threshold_seconds: float,
+    stop_event: asyncio.Event,
+    event_queue: asyncio.Queue,
+    telegram_bot_token: str | None,
+    telegram_chat_id: str | None,
+) -> None:
+    """Queue-driven 1A latency watchdog (D-03 / T-03-30).
+
+    Processes ("pending", order_key, mono_ts) and ("executed", order_key, mono_ts)
+    events from the driver/keeper. Fires WARNING when a pending order exceeds threshold.
+    NEVER auto-flips PERPS_VENUE.
+    """
+    logger.info(
+        "latency_watchdog_queue: starting (vault=%s threshold=%.0fs)",
+        vault_address[:10],
+        threshold_seconds,
+    )
+
+    # {order_key: first_seen_monotonic}
+    _pending: dict[str, float] = {}
+    _alerted: set[str] = set()
+
+    while not stop_event.is_set():
+        # Drain all available events
+        while True:
+            try:
+                event_type, order_key, mono_ts = event_queue.get_nowait()
+                if event_type == "pending":
+                    _pending[order_key] = mono_ts
+                    logger.debug("watchdog: tracking order %s", order_key[:10])
+                elif event_type == "executed":
+                    _pending.pop(order_key, None)
+                    _alerted.discard(order_key)
+                    logger.debug("watchdog: order executed %s — cleared", order_key[:10])
+            except asyncio.QueueEmpty:
+                break
+
+        # Check all tracked pending orders for threshold breach
+        now = time.monotonic()
+        for order_key, first_seen in list(_pending.items()):
+            elapsed = now - first_seen
+            if elapsed > threshold_seconds and order_key not in _alerted:
+                _alerted.add(order_key)
+                logger.warning(
+                    "latency_watchdog: 1A BREACH — order_key=%s pending %.0fs "
+                    "(threshold=%.0fs). D-03: operator flip required (NEVER auto-flip).",
+                    order_key[:10],
+                    elapsed,
+                    threshold_seconds,
+                )
+                # D-03 / T-03-30: WARNING alert only — NEVER auto-flip PERPS_VENUE
+                await send_alert(
+                    f"1A latency breach: createOrder→OrderExecuted = {elapsed:.0f}s "
+                    f"(threshold {threshold_seconds:.0f}s). "
+                    "Operator: set PERPS_VENUE=<venue> and restart — do NOT auto-flip.",
+                    AlertSeverity.WARNING,
+                    context={
+                        "order_key": order_key,
+                        "elapsed_s": f"{elapsed:.0f}",
+                        "threshold_s": f"{threshold_seconds:.0f}",
+                        "vault": vault_address,
+                        "action_required": "MANUAL: set PERPS_VENUE + restart orchestrator",
+                    },
+                    telegram_bot_token=telegram_bot_token,
+                    telegram_chat_id=telegram_chat_id,
+                )
+
+        await asyncio.sleep(2.0)  # watchdog tick
+
+    logger.info("latency_watchdog_queue: stop_event set — exiting")
+
+
+# ---------------------------------------------------------------------------
+# load_manifest — D-14: single source of truth for Sepolia addresses
+# ---------------------------------------------------------------------------
+
+
+def load_manifest(manifest_path: Path | str | None = None) -> dict:
+    """Load the Sepolia deployment manifest (deployments/sepolia.json).
+
+    D-14: the manifest is the ONLY source of addresses. No hardcoded addresses
+    anywhere in run_session.py.
+
+    Args:
+        manifest_path: Override manifest path. If None, uses _MANIFEST_PATH.
+
+    Returns:
+        Dict with keys: sessionFactory, oracle, journal, vaultClaude, vaultGpt,
+        vaultGem, adapter, mockUsdc, ethFeed, btcFeed, solFeed, sequencerFeed.
+
+    Raises:
+        FileNotFoundError: If the manifest file does not exist.
+        ValueError: If the manifest is missing required fields.
+    """
+    path = Path(manifest_path) if manifest_path else _MANIFEST_PATH
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Sepolia manifest not found: {path}\n"
+            "Run `make deploy-sepolia` to deploy and generate the manifest."
+        )
+    with path.open(encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    required_keys = [
+        "vaultClaude",
+        "journal",
+        "ethFeed",
+        "btcFeed",
+        "solFeed",
+    ]
+    missing = [k for k in required_keys if k not in manifest]
+    if missing:
+        raise ValueError(
+            f"Sepolia manifest missing required fields: {missing}\nManifest path: {path}"
+        )
+    return manifest
+
+
+# ---------------------------------------------------------------------------
+# run_mini_session — the top-level Sepolia mini-session entrypoint
+# ---------------------------------------------------------------------------
+
+
+async def run_mini_session(
+    *,
+    manifest_path: Path | str | None = None,
+    sepolia_rpc: str | None = None,
+    operator_trade_private_key: str | None = None,
+    operator_journal_private_key_hex: str | None = None,
+    operator_journal_key_address: str | None = None,
+    pinata_jwt: str | None = None,
+    filebase_api_key: str | None = None,
+    filebase_bucket: str = "traider-journals",
+    perps_venue: str = "mock",
+    session_duration_seconds: int = 1800,
+    cadence_seconds: float = 60.0,
+    price_seed: int = 42,
+    database_url: str | None = None,
+    redis_url: str | None = None,
+    telegram_bot_token: str | None = None,
+    telegram_chat_id: str | None = None,
+    latency_watchdog_threshold: float = 30.0,
+    model: str = "claude-opus-4-7",
+) -> dict:
+    """Run the Sepolia mini-session end-to-end (TEST-03 hard gate / D-04).
+
+    Sequence:
+    1. Load manifest (D-14: deployments/sepolia.json).
+    2. Connect AsyncWeb3 to SEPOLIA_RPC.
+    3. Load operator-trade + operator-journal accounts.
+    4. Build adapter via adapter_factory (PERPS_VENUE switch point, D-01/D-03).
+    5. Build vault_contract (mCLA-S1) + journal_registry.
+    6. Build aggregator contracts (mock Chainlink feeds for price walk).
+    7. Launch driver.run_session + run_keeper_monitor + latency_watchdog as Tasks.
+    8. Return summary.
+
+    Args:
+        manifest_path:                    Override manifest path (None → deployments/sepolia.json).
+        sepolia_rpc:                      Arbitrum Sepolia RPC URL.
+        operator_trade_private_key:       Hex private key string for operator-trade EOA.
+        operator_journal_private_key_hex: Hex private key string for operator-journal EOA.
+        operator_journal_key_address:     Checksummed address of operator-journal EOA.
+        pinata_jwt:                       Pinata V3 JWT for IPFS pinning.
+        filebase_api_key:                 Filebase S3 API key for backup pinning.
+        filebase_bucket:                  Filebase IPFS bucket name.
+        perps_venue:                      "mock" or "gmx" (D-01/D-03).
+        session_duration_seconds:         Session run length (default 1800 = 30min).
+        cadence_seconds:                  Trading cadence (default 60s).
+        price_seed:                       PriceWalk seed (D-01).
+        database_url:                     Async Postgres URL.
+        redis_url:                        Redis URL for WS fanout (optional).
+        telegram_bot_token:               Telegram bot token (D-15, optional).
+        telegram_chat_id:                 Telegram chat ID (D-15, optional).
+        latency_watchdog_threshold:       1A latency alert threshold in seconds (D-03).
+        model:                            LLM model string (default claude-opus-4-7).
+
+    Returns:
+        Summary dict: {cycles, seed, session_id, vault_address, model}.
+    """
+    # ── Step 1: Load manifest (D-14 — no hardcoded addresses) ────────────────
+    logger.info("run_mini_session: loading manifest from %s", manifest_path or _MANIFEST_PATH)
+    manifest = load_manifest(manifest_path)
+    vault_claude_addr = manifest["vaultClaude"]
+    journal_addr = manifest["journal"]
+    eth_feed_addr = manifest["ethFeed"]
+    btc_feed_addr = manifest["btcFeed"]
+    sol_feed_addr = manifest["solFeed"]
+    mock_perps_addr = manifest.get("adapter")  # zero-address if not deployed
+    # mock_usdc_addr available for seeding steps (not used in the session loop itself)
+    _ = manifest.get("mockUsdc")
+    logger.info(
+        "run_mini_session: manifest loaded — vaultClaude=%s journal=%s adapter=%s",
+        vault_claude_addr,
+        journal_addr,
+        mock_perps_addr,
+    )
+
+    # ── Step 2: AsyncWeb3 connection ──────────────────────────────────────────
+    rpc = sepolia_rpc or os.environ.get("SEPOLIA_RPC", "")
+    if not rpc:
+        raise ValueError("SEPOLIA_RPC not set — provide sepolia_rpc or set the env var")
+    logger.info("run_mini_session: connecting to Sepolia at %s", rpc[:40])
+    web3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(rpc))
+    # Arbitrum Sepolia uses PoA-style headers (extra data) — inject middleware for safety
+    web3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+
+    # ── Step 3: Load operator accounts ───────────────────────────────────────
+    # Operator-trade key (submits trades via vault.openLong/openShort/closePosition, D-16)
+    trade_key_hex = operator_trade_private_key or os.environ.get("OPERATOR_TRADE_KEY", "")
+    if not trade_key_hex:
+        raise ValueError(
+            "OPERATOR_TRADE_KEY not set — provide operator_trade_private_key or set the env var. "
+            "SEC-01: this key must be in gitignored .env.operator-trade"
+        )
+    # Normalize: ensure 0x prefix
+    if not trade_key_hex.startswith("0x"):
+        trade_key_hex = "0x" + trade_key_hex
+    operator_trade_account = Account.from_key(trade_key_hex)
+    logger.info(
+        "run_mini_session: operator-trade EOA=%s (D-16 signing middleware will be loaded)",
+        operator_trade_account.address,
+    )
+
+    # Operator-journal key (signs journal entries for ecrecover gate, D-10)
+    journal_key_hex = operator_journal_private_key_hex or os.environ.get(
+        "OPERATOR_JOURNAL_KEY_PRIV", ""
+    )
+    operator_journal_private_key_bytes: bytes | None = None
+    if journal_key_hex:
+        if not journal_key_hex.startswith("0x"):
+            journal_key_hex = "0x" + journal_key_hex
+        operator_journal_private_key_bytes = bytes.fromhex(journal_key_hex.removeprefix("0x"))
+        logger.info("run_mini_session: operator-journal key loaded (D-10 ecrecover gate)")
+    else:
+        logger.warning(
+            "run_mini_session: OPERATOR_JOURNAL_KEY_PRIV not set — "
+            "journals will NOT be published (ecrecover gate requires the key)"
+        )
+
+    journal_key_addr = operator_journal_key_address or os.environ.get(
+        "OPERATOR_JOURNAL_KEY_ADDR", ""
+    )
+
+    # ── Step 4: Build adapter (PERPS_VENUE switch point, D-01/D-03) ──────────
+    # D-03: PERPS_VENUE is read from env or parameter — NEVER modified at runtime.
+    # The watchdog alerts on latency; the operator flips env + restarts (restart-flip).
+    venue = perps_venue or os.environ.get("PERPS_VENUE", "mock")
+    logger.info("run_mini_session: PERPS_VENUE=%s", venue)
+
+    mock_perps_abi: list = []
+    try:
+        mock_perps_abi = _load_abi(_MOCK_PERPS_ARTIFACT)
+    except FileNotFoundError:
+        logger.warning(
+            "run_mini_session: MockPerps artifact not found — using empty ABI. "
+            "Run `forge build` in contracts/ if needed."
+        )
+
+    adapter = build_perps_adapter(
+        web3,
+        venue=venue,
+        mock_perps_address=mock_perps_addr if mock_perps_addr else None,
+        mock_perps_abi=mock_perps_abi,
+    )
+
+    # ── Step 5: Build vault_contract (mCLA-S1) and JournalRegistry ───────────
+    vault_abi: list = []
+    try:
+        vault_abi = _load_abi(_MTOKEN_VAULT_ARTIFACT)
+    except FileNotFoundError:
+        logger.warning(
+            "run_mini_session: MTokenVault artifact not found — using empty ABI. "
+            "Run `forge build` in contracts/ if needed."
+        )
+
+    vault_contract = web3.eth.contract(address=vault_claude_addr, abi=vault_abi)
+
+    journal_registry = None
+    if journal_addr and journal_addr != "0x" + "0" * 40:
+        journal_abi: list = []
+        try:
+            journal_abi = _load_abi(_JOURNAL_REGISTRY_ARTIFACT)
+        except FileNotFoundError:
+            logger.warning("run_mini_session: JournalRegistry artifact not found — using empty ABI")
+        journal_registry = web3.eth.contract(address=journal_addr, abi=journal_abi)
+        logger.info("run_mini_session: JournalRegistry at %s", journal_addr)
+
+    # ── Step 6: Build aggregator contracts (mock Chainlink feeds) ─────────────
+    chainlink_abi: list = []
+    _chainlink_artifact = (
+        _CONTRACTS_OUT / "MockChainlinkAggregator.sol" / "MockChainlinkAggregator.json"
+    )
+    try:
+        chainlink_abi = _load_abi(_chainlink_artifact)
+    except FileNotFoundError:
+        logger.warning(
+            "run_mini_session: MockChainlinkAggregator artifact not found — using empty ABI"
+        )
+
+    aggregators = {
+        "ETH": web3.eth.contract(address=eth_feed_addr, abi=chainlink_abi),
+        "BTC": web3.eth.contract(address=btc_feed_addr, abi=chainlink_abi),
+        "SOL": web3.eth.contract(address=sol_feed_addr, abi=chainlink_abi),
+    }
+    logger.info(
+        "run_mini_session: aggregators loaded — ETH=%s BTC=%s SOL=%s",
+        eth_feed_addr,
+        btc_feed_addr,
+        sol_feed_addr,
+    )
+
+    # ── Step 7: Build DB session + Redis client ───────────────────────────────
+    db_url = database_url or os.environ.get("ORCHESTRATOR_DATABASE_URL", "")
+    if not db_url:
+        raise ValueError(
+            "ORCHESTRATOR_DATABASE_URL not set — provide database_url or set the env var"
+        )
+    if "+asyncpg" not in db_url and "+psycopg" not in db_url:
+        db_url = db_url.replace("postgresql://", "postgresql+asyncpg://", 1).replace(
+            "postgres://", "postgresql+asyncpg://", 1
+        )
+
+    engine = create_async_engine(db_url)
+    db = AsyncSession(engine)
+
+    redis_client = None
+    _redis_url = redis_url or os.environ.get("REDIS_URL", "")
+    if _redis_url:
+        try:
+            import redis.asyncio as aioredis
+
+            redis_client = aioredis.from_url(_redis_url)
+            logger.info("run_mini_session: Redis connected at %s", _redis_url[:30])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("run_mini_session: Redis connection failed (optional): %s", exc)
+
+    # ── Step 8: Build SessionConfig ───────────────────────────────────────────
+    config = SessionConfig(
+        session_duration_seconds=session_duration_seconds,
+        cadence_seconds=cadence_seconds,
+        price_seed=price_seed,
+        execution_delay_cycles=1,  # D-13 default
+    )
+    logger.warning(
+        "SESSION CONFIG: duration=%ss cadence=%ss seed=%s model=%s venue=%s vault=%s",
+        session_duration_seconds,
+        cadence_seconds,
+        price_seed,
+        model,
+        venue,
+        vault_claude_addr[:10],
+    )
+
+    # ── Step 9: Launch background tasks + main session ────────────────────────
+    # D-03 / T-03-30: Latency watchdog uses a queue for event-driven tracking.
+    # It is a SEPARATE asyncio.Task; it never writes to PERPS_VENUE.
+    stop_event = asyncio.Event()
+    watchdog_queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+
+    watchdog_task = asyncio.create_task(
+        _latency_watchdog_queue_driven(
+            vault_address=vault_claude_addr,
+            threshold_seconds=latency_watchdog_threshold,
+            stop_event=stop_event,
+            event_queue=watchdog_queue,
+            telegram_bot_token=telegram_bot_token,
+            telegram_chat_id=telegram_chat_id,
+        ),
+        name=f"latency_watchdog-{config.session_id[:8]}",
+    )
+
+    # Resolve pinata / filebase credentials
+    _pinata_jwt = pinata_jwt or os.environ.get("PINATA_JWT", "") or None
+    _filebase_key = filebase_api_key or os.environ.get("FILEBASE_API_KEY", "") or None
+    _filebase_bucket = filebase_bucket or os.environ.get("FILEBASE_BUCKET", "traider-journals")
+
+    logger.info(
+        "run_mini_session: journal_params — pinata_jwt=%s filebase_key=%s journal_key_addr=%s",
+        "SET" if _pinata_jwt else "NOT SET",
+        "SET" if _filebase_key else "NOT SET",
+        journal_key_addr or "NOT SET",
+    )
+
+    # The deployer address for keeper_monitor (executes orders on MockPerps).
+    # On Sepolia, the operator-trade EOA plays the keeper role for MockPerps.
+    deployer_address = operator_trade_account.address
+
+    # Launch the main driver.run_session (which internally launches price_pusher + keeper).
+    # We also launch a separate keeper_monitor with journal params wired.
+    # driver.run_session already creates a keeper_monitor internally; for Sepolia we need
+    # journal params wired to it. We use driver.run_session which passes these through
+    # via the internal run_keeper_monitor call.
+    #
+    # Note: driver.run_session manages price_pusher + keeper internally.
+    # The 1A watchdog is a SEPARATE additional task we add here (D-03).
+
+    try:
+        result = await driver_run_session(
+            web3,
+            adapter,
+            aggregators,
+            vault_claude_addr,
+            model,
+            config=config,
+            db=db,
+            redis=redis_client,
+            deployer_address=deployer_address,
+            vault_contract=vault_contract,
+            operator_trade_account=operator_trade_account,
+            # Journal publisher params (PERPS-02 / D-08/D-09/D-10) — forwarded to keeper.
+            # When all three required params are non-None, the keeper publishes
+            # journal entries on OrderExecuted (wired once at session start).
+            journal_registry=journal_registry,
+            operator_journal_private_key=operator_journal_private_key_bytes,
+            pinata_jwt=_pinata_jwt,
+            storacha_api_key=_filebase_key,
+            operator_journal_key_address=journal_key_addr or None,
+            telegram_bot_token=telegram_bot_token,
+            telegram_chat_id=telegram_chat_id,
+        )
+    finally:
+        # Stop the latency watchdog
+        stop_event.set()
+        watchdog_task.cancel()
+        try:
+            await watchdog_task
+        except asyncio.CancelledError:
+            pass
+
+        # Cleanup DB + Redis
+        try:
+            await db.close()
+        except Exception:  # noqa: BLE001
+            pass
+        await engine.dispose()
+        if redis_client:
+            try:
+                await redis_client.aclose()
+            except Exception:  # noqa: BLE001
+                pass
+
+    return {
+        **result,
+        "vault_address": vault_claude_addr,
+        "model": model,
+        "venue": venue,
+    }
+
+
+# ---------------------------------------------------------------------------
+# run_session — alias for the entrypoint name referenced in PLAN.md acceptance
+# ---------------------------------------------------------------------------
+
+
+async def run_session(
+    *,
+    manifest_path: Path | str | None = None,
+    **kwargs: Any,
+) -> dict:
+    """Alias for run_mini_session — used by tests and make targets.
+
+    See run_mini_session for full documentation.
+    """
+    return await run_mini_session(manifest_path=manifest_path, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# main — CLI entrypoint (python -m orchestrator.loop.run_session)
+# ---------------------------------------------------------------------------
+
+
+async def _async_main() -> None:
+    """Async main: read env, call run_mini_session, print summary."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+    )
+
+    # Read all params from environment (SEC-01: keys from gitignored .env files)
+    session_duration = int(os.environ.get("SESSION_DURATION", "1800"))
+    cadence = float(os.environ.get("SESSION_CADENCE", "60.0"))
+    seed = int(os.environ.get("PRICE_SEED", "42"))
+    venue = os.environ.get("PERPS_VENUE", "mock")
+    threshold = float(os.environ.get("LATENCY_WATCHDOG_THRESHOLD", "30.0"))
+
+    logger.info(
+        "run_session.main: SESSION_DURATION=%ds PERPS_VENUE=%s LATENCY_THRESHOLD=%.0fs",
+        session_duration,
+        venue,
+        threshold,
+    )
+
+    result = await run_mini_session(
+        session_duration_seconds=session_duration,
+        cadence_seconds=cadence,
+        price_seed=seed,
+        perps_venue=venue,
+        latency_watchdog_threshold=threshold,
+        # All secret params read from env inside run_mini_session
+        telegram_bot_token=os.environ.get("TELEGRAM_BOT_TOKEN") or None,
+        telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID") or None,
+    )
+
+    logger.warning(
+        "SESSION COMPLETE: cycles=%d seed=%s session_id=%s vault=%s",
+        result.get("cycles", 0),
+        result.get("seed"),
+        result.get("session_id"),
+        result.get("vault_address", "")[:10],
+    )
+
+
+def main() -> None:
+    """Synchronous entry point for CLI / make targets."""
+    asyncio.run(_async_main())
+
+
+if __name__ == "__main__":
+    main()
