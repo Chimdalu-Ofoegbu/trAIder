@@ -976,6 +976,155 @@ def run_verification(
             )
         )
 
+    print()
+    print("=" * 78)
+    print("RUNTIME PREFLIGHT CELLS  [GAP #11 — signing middleware signability]")
+    print("=" * 78)
+
+    # ── RUNTIME-1: operator-journal authorizedPublisher + recordJournal eth_call ──
+    # GAP #11: the static harness missed the missing-signing-middleware gap because
+    # it only checked on-chain state (authorizedPublishers == true), not whether the
+    # orchestrator's web3 instance would actually sign the transaction (vs fall back to
+    # eth_sendTransaction which Alchemy rejects with 400).
+    #
+    # This cell is a STATIC PROXY for the runtime-signing check:
+    # 1. Confirm operator-journal EOA is in authorizedPublishers (GAP #5 check — already
+    #    in AUTH-3, included here for the combined RUNTIME narrative).
+    # 2. Confirm the OPERATOR_JOURNAL_KEY_PRIV env var is present (key must be loaded for
+    #    signing middleware to be injected at session start). If the env var is absent,
+    #    the middleware injection step in run_session.py is skipped → 400 at runtime.
+    # 3. Confirm OPERATOR_JOURNAL_KEY_ADDR matches OPERATOR_JOURNAL_KEY_ADDR from EOA dict
+    #    (address mismatch means transact({"from": X}) targets a different EOA than the one
+    #    with middleware → Alchemy 400).
+    #
+    # A TRUE runtime simulation (build AsyncWeb3, inject middleware, call eth_estimateGas)
+    # requires the full async stack and the private key — out of scope for a CLI harness.
+    # The three proxy checks above catch the two classes of failure that caused the 400:
+    #   (a) key env var absent → middleware not injected
+    #   (b) address env var mismatch → transact targets wrong EOA
+
+    journal_key_priv_present = bool(os.environ.get("OPERATOR_JOURNAL_KEY_PRIV", "").strip())
+    journal_key_addr_env = os.environ.get("OPERATOR_JOURNAL_KEY_ADDR", "").strip()
+
+    # Sub-check A: env var for private key present
+    report.add(
+        CellResult(
+            "RUNTIME-1a",
+            "OPERATOR_JOURNAL_KEY_PRIV present in env (signing middleware can be loaded)",
+            passed=journal_key_priv_present,
+            expected="env var set (non-empty)",
+            actual="SET" if journal_key_priv_present else "NOT SET",
+            note=(
+                "GAP #11: missing key → no signing middleware → recordJournal 400. "
+                "Set OPERATOR_JOURNAL_KEY_PRIV in orchestrator/.env"
+                if not journal_key_priv_present
+                else "GAP #11 fix: key present — middleware will be loaded at session start"
+            ),
+        )
+    )
+
+    # Sub-check B: if both key and addr env vars are set, the derived address must match
+    _addr_match_ok = True
+    _addr_match_note = ""
+    if journal_key_priv_present and journal_key_addr_env:
+        try:
+            from eth_account import Account as _Account
+
+            _raw_priv = os.environ["OPERATOR_JOURNAL_KEY_PRIV"].strip()
+            if not _raw_priv.startswith("0x"):
+                _raw_priv = "0x" + _raw_priv
+            _derived_addr = _Account.from_key(_raw_priv).address
+            _env_addr_cs = w3.to_checksum_address(journal_key_addr_env)
+            _addr_match_ok = _derived_addr.lower() == _env_addr_cs.lower()
+            _addr_match_note = (
+                f"derived={_derived_addr} env={_env_addr_cs}"
+                if not _addr_match_ok
+                else f"both resolve to {_derived_addr}"
+            )
+        except Exception as _exc:  # noqa: BLE001
+            _addr_match_ok = False
+            _addr_match_note = f"address derivation error: {_exc}"
+
+        report.add(
+            CellResult(
+                "RUNTIME-1b",
+                "OPERATOR_JOURNAL_KEY_PRIV derives same address as OPERATOR_JOURNAL_KEY_ADDR",
+                passed=_addr_match_ok,
+                expected="derived address == OPERATOR_JOURNAL_KEY_ADDR",
+                actual=_addr_match_note,
+                note=(
+                    "GAP #11: address mismatch → transact() targets wrong EOA → "
+                    "middleware miss → 400"
+                    if not _addr_match_ok
+                    else "OK"
+                ),
+            )
+        )
+    elif journal_key_priv_present and not journal_key_addr_env:
+        report.add(
+            CellResult(
+                "RUNTIME-1b",
+                "OPERATOR_JOURNAL_KEY_PRIV derives same address as OPERATOR_JOURNAL_KEY_ADDR",
+                passed=False,
+                expected="OPERATOR_JOURNAL_KEY_ADDR env var set",
+                actual="NOT SET",
+                note=(
+                    "GAP #11: OPERATOR_JOURNAL_KEY_ADDR missing — run_session falls back "
+                    "to OPERATOR_JOURNAL_KEY_ADDR env var; if also absent, transact 'from' "
+                    "will be empty → Alchemy 400"
+                ),
+            )
+        )
+    else:
+        # Key not present — already flagged in RUNTIME-1a; skip the addr derivation check
+        report.add(
+            CellResult(
+                "RUNTIME-1b",
+                "OPERATOR_JOURNAL_KEY_PRIV derives same address as OPERATOR_JOURNAL_KEY_ADDR",
+                passed=False,
+                expected="OPERATOR_JOURNAL_KEY_PRIV present (prerequisite for this check)",
+                actual="SKIPPED — OPERATOR_JOURNAL_KEY_PRIV not set",
+                note="Fix RUNTIME-1a first",
+            )
+        )
+
+    # Sub-check C: authorizedPublishers (GAP #5 — already in AUTH-3; repeat here for
+    # the combined RUNTIME narrative so a single cell failure flags the whole send path)
+    if _has_function(journal, "authorizedPublishers"):
+        val_rt, err_rt = safe_call(journal, "authorizedPublishers", operator_journal_addr)
+        if err_rt:
+            is_auth_rt = False
+            rt_actual = f"ERROR: {err_rt}"
+        else:
+            is_auth_rt = bool(val_rt)
+            rt_actual = str(is_auth_rt)
+        report.add(
+            CellResult(
+                "RUNTIME-1c",
+                "journal.authorizedPublishers(operator-journal) == true (send path gate)",
+                passed=is_auth_rt,
+                expected="true",
+                actual=rt_actual,
+                note=(
+                    "GAP #5+#11: even with signing middleware, Alchemy submits the tx → "
+                    "JournalRegistry.recordJournal will revert if not authorized"
+                    if not is_auth_rt
+                    else "GAP #5 FIXED + #11 proxy OK"
+                ),
+            )
+        )
+    else:
+        report.add(
+            CellResult(
+                "RUNTIME-1c",
+                "journal.authorizedPublishers(operator-journal) == true (send path gate)",
+                passed=False,
+                expected="true",
+                actual="authorizedPublishers function not in ABI",
+                note="Redeploy required",
+            )
+        )
+
     return report
 
 

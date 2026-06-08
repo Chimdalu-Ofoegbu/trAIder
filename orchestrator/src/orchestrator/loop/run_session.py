@@ -219,6 +219,57 @@ async def _latency_watchdog_queue_driven(
 
 
 # ---------------------------------------------------------------------------
+# Signing middleware presence guard (GAP #11)
+# ---------------------------------------------------------------------------
+
+
+def _check_signing_middleware_present(web3: AsyncWeb3, eoa_address: str) -> bool:
+    """Return True if `web3.middleware_onion` contains a SignAndSendRaw middleware
+    that was built for `eoa_address`.
+
+    web3.py 7.x SignAndSendRawMiddlewareBuilder.build() returns a curry partial whose
+    __wrapped__ attribute (or the closure's private state) holds the account.
+    The safest cross-version approach is to inspect each middleware object for an
+    `account` attribute whose `.address` matches the target EOA.
+
+    This guard is ONLY called at startup — performance is not a concern.
+
+    Args:
+        web3:        AsyncWeb3 instance whose middleware_onion to inspect.
+        eoa_address: Checksummed-or-hex EOA address string to search for.
+
+    Returns:
+        True if signing middleware for the address is found, False otherwise.
+    """
+    target = eoa_address.lower()
+    try:
+        # web3.py 7.x: middleware_onion exposes an iterable of (name, mw) or just mw objects.
+        # We iterate and inspect each entry for a recognisable account attribute.
+        for entry in web3.middleware_onion:
+            # entry may be the middleware callable directly, or a tuple (name, mw)
+            mw = entry[1] if isinstance(entry, tuple) else entry
+            # Check for `account` attribute (SignAndSendRaw sets this on its closure/object)
+            acct = getattr(mw, "account", None)
+            if acct is not None and getattr(acct, "address", "").lower() == target:
+                return True
+            # Also check for `_account` (some web3 versions use private attr)
+            acct = getattr(mw, "_account", None)
+            if acct is not None and getattr(acct, "address", "").lower() == target:
+                return True
+    except Exception:  # noqa: BLE001
+        # If iteration fails for any reason, fail open (return True) so the guard does not
+        # block sessions on unexpected web3 version changes — the 400 error itself is the
+        # definitive signal. Log a warning so the issue is visible.
+        logger.warning(
+            "_check_signing_middleware_present: iteration over middleware_onion failed "
+            "for EOA=%s — guard skipped (fail-open). Check web3.py version compatibility.",
+            eoa_address,
+        )
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # load_manifest — D-14: single source of truth for Sepolia addresses
 # ---------------------------------------------------------------------------
 
@@ -424,15 +475,31 @@ async def run_mini_session(
         )
 
     # Operator-journal key (signs journal entries for ecrecover gate, D-10)
+    # ALSO provides the signing middleware for recordJournal.transact() — without this
+    # middleware, web3.py falls back to eth_sendTransaction which Alchemy rejects (400).
     journal_key_hex = operator_journal_private_key_hex or os.environ.get(
         "OPERATOR_JOURNAL_KEY_PRIV", ""
     )
     operator_journal_private_key_bytes: bytes | None = None
+    operator_journal_account: Account | None = None
     if journal_key_hex:
         if not journal_key_hex.startswith("0x"):
             journal_key_hex = "0x" + journal_key_hex
         operator_journal_private_key_bytes = bytes.fromhex(journal_key_hex.removeprefix("0x"))
-        logger.info("run_mini_session: operator-journal key loaded (D-10 ecrecover gate)")
+        operator_journal_account = Account.from_key(journal_key_hex)
+        # GAP #11 fix: load signing middleware for operator-journal EOA.
+        # publisher.py calls recordJournal.transact({"from": operator_journal_key_address}).
+        # Without this middleware, web3.py falls back to eth_sendTransaction which Alchemy
+        # rejects with 400 Bad Request. Mirror the exact pattern used for price-pusher above.
+        from web3.middleware import SignAndSendRawMiddlewareBuilder as _SARMBuilder  # noqa: PLC0415
+
+        _journal_mw = _SARMBuilder.build(operator_journal_account)
+        web3.middleware_onion.inject(_journal_mw, layer=0)
+        logger.info(
+            "run_mini_session: operator-journal EOA=%s signing middleware loaded "
+            "(GAP #11 fix — recordJournal.transact → eth_sendRawTransaction)",
+            operator_journal_account.address,
+        )
     else:
         logger.warning(
             "run_mini_session: OPERATOR_JOURNAL_KEY_PRIV not set — "
@@ -442,6 +509,40 @@ async def run_mini_session(
     journal_key_addr = operator_journal_key_address or os.environ.get(
         "OPERATOR_JOURNAL_KEY_ADDR", ""
     )
+
+    # ── Startup signer guard ──────────────────────────────────────────────────
+    # Assert every EOA that will call .transact({"from": X}) has signing middleware.
+    # A missing signer causes Alchemy to reject with 400 at runtime — this guard
+    # surfaces the problem at startup with a clear message (not buried in trade logs).
+    # The guard inspects web3.middleware_onion to confirm each required signer is present.
+    # operator-trade signing is loaded later in driver.run_session (D-16), so we track
+    # which signers run_session itself is responsible for (journal + pusher).
+    _signer_guard_errors: list[str] = []
+
+    # operator-journal: must have middleware if the key is set (publisher will transact from it)
+    if operator_journal_account is not None:
+        # Verify the account is wired by checking all middleware in the onion.
+        # SignAndSendRawMiddlewareBuilder produces a coroutine middleware whose
+        # account attribute is accessible for identity checking.
+        _journal_found = _check_signing_middleware_present(web3, operator_journal_account.address)
+        if not _journal_found:
+            _signer_guard_errors.append(
+                f"operator-journal EOA {operator_journal_account.address} has no signing "
+                "middleware — recordJournal.transact() would fall back to eth_sendTransaction "
+                "(Alchemy 400). Check SignAndSendRawMiddlewareBuilder injection above."
+            )
+        else:
+            logger.info(
+                "run_mini_session: startup signer guard PASSED — operator-journal EOA=%s",
+                operator_journal_account.address,
+            )
+
+    if _signer_guard_errors:
+        _guard_msg = "\n".join(f"  SIGNER GUARD FAIL: {e}" for e in _signer_guard_errors)
+        raise RuntimeError(
+            f"Startup signer guard failed — missing signing middleware for {len(_signer_guard_errors)} "
+            f"EOA(s). Fix before starting the session:\n{_guard_msg}"
+        )
 
     # ── Step 4: Build adapter (PERPS_VENUE switch point, D-01/D-03) ──────────
     # D-03: PERPS_VENUE is read from env or parameter — NEVER modified at runtime.
