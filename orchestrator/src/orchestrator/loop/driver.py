@@ -641,6 +641,77 @@ async def run_live_cycle(
     #     than the .transact(...) below.  Keep this ordering — it is grep-verifiable
     #     (acceptance_criteria: first record_pending_order( line < first .transact( line).
 
+    # 8b-pre. PRE-TRADE FEED-AGE CHECK (GAP #1/#7): before submitting, verify that the
+    # relevant Chainlink aggregator for decision.market is not stale. MockPerps has
+    # MAX_STALENESS=3600s; submitting into a stale feed → guaranteed revert "stale price".
+    # We use a 3000s conservative buffer (600s headroom under the 3600s limit).
+    # If the feed is stale: mark the intent row reconciled, fire WARNING alert, skip trade.
+    # Market → aggregator mapping uses the aggregators dict from the session.
+    _STALE_THRESHOLD_S = 3000  # conservative buffer under MAX_STALENESS=3600s
+    _feed_aggr = aggregators.get(decision.market)
+    if _feed_aggr is not None:
+        try:
+            _block = await web3.eth.get_block("latest")
+            _block_ts: int = int(_block["timestamp"])
+            # latestRoundData() → (roundId, answer, startedAt, updatedAt, answeredInRound)
+            _round_data = await _feed_aggr.functions.latestRoundData().call()
+            _feed_updated_at: int = int(_round_data[3])  # index 3 = updatedAt
+            _feed_age_s: int = _block_ts - _feed_updated_at
+            if _feed_age_s > _STALE_THRESHOLD_S:
+                # Feed is too stale — submitting will revert "MockPerps: stale price"
+                stale_reason = (
+                    f"pre-trade staleness check FAILED: {decision.market} feed age "
+                    f"{_feed_age_s}s > threshold {_STALE_THRESHOLD_S}s "
+                    f"(MockPerps MAX_STALENESS=3600s) — skipping trade this cycle (GAP #1/#7)"
+                )
+                logger.warning("Cycle %d: %s", cycle, stale_reason)
+                from orchestrator.alerts.sink import AlertSeverity
+                from orchestrator.alerts.sink import send_alert as _send_alert
+
+                await _send_alert(
+                    stale_reason,
+                    AlertSeverity.WARNING,
+                    context={
+                        "market": decision.market,
+                        "feed_age_s": str(_feed_age_s),
+                        "threshold_s": str(_STALE_THRESHOLD_S),
+                        "vault_address": vault,
+                        "cycle": str(cycle),
+                    },
+                )
+                # Clear the intent row — no trade this cycle
+                await mark_pending_order_reconciled(db, vault_address=vault, order_key=intent_key)
+                _emit_diagnostic(
+                    capture_path=_diag_path,
+                    cycle=cycle,
+                    prompt=prompt,
+                    raw_response=raw,
+                    parsed_decision=decision.model_dump(),
+                    rationale=getattr(decision, "rationale", None),
+                    outcome="skipped_stale_feed",
+                    malformed_reason=stale_reason,
+                )
+                return {
+                    "status": "skipped_stale_feed",
+                    "action": decision.action,
+                    "reason": stale_reason,
+                    "intent_key": intent_key,
+                }
+        except Exception as stale_exc:  # noqa: BLE001
+            # Staleness check error (e.g. aggregator not wired in tests) — log WARNING
+            # and CONTINUE (fail open on the check, not on the trade).
+            logger.warning(
+                "Cycle %d: pre-trade staleness check raised (non-fatal, submitting anyway): %s",
+                cycle,
+                stale_exc,
+            )
+    else:
+        logger.debug(
+            "Cycle %d: no aggregator for market=%s — skipping pre-trade staleness check",
+            cycle,
+            decision.market,
+        )
+
     # 8c. ONLY NOW submit to MockPerps (the network call):
     size_usd_1e30 = int(decision.sizeUsd * 1e30)
     leverage_1e4 = int(decision.leverage * 1e4)
@@ -879,7 +950,13 @@ async def run_live_cycle(
         }
     order_key_hex = "0x" + created[0]["args"]["orderKey"].hex()
 
+    # Normalize submit tx hash to 0x-prefixed hex string (GAP #10: stored for reconcile).
+    _raw_tx_hex = tx.hex() if hasattr(tx, "hex") else str(tx)
+    submit_tx_hash_hex = _raw_tx_hex if _raw_tx_hex.startswith("0x") else "0x" + _raw_tx_hex
+
     # 8d. PROMOTE the intent row: insert the real-key row and mark intent reconciled.
+    # submit_tx_hash is stored so reconcile_pending_orders can detect a pending-in-mempool
+    # tx on restart and suppress duplicate resubmission (GAP #10).
     await record_pending_order(
         db,
         vault_address=vault,
@@ -888,6 +965,7 @@ async def run_live_cycle(
         execute_after_block=execute_after_block,
         status="pending",
         decision_snapshot=decision.model_dump(),
+        submit_tx_hash=submit_tx_hash_hex,
     )
     await record_journal_pending(
         db,
@@ -941,6 +1019,8 @@ async def reconcile_pending_orders(
     db: Any,
     *,
     vault: str,
+    vault_contract: Any = None,
+    orchestrator_address: str | None = None,
 ) -> int:
     """Check unresolved DB rows against the adapter's pendingOrders before any resubmit.
 
@@ -948,36 +1028,72 @@ async def reconcile_pending_orders(
     pending_orders rows represent orders that actually landed on-chain.
 
     Reconciliation logic:
-    - intent-* key (starts with "intent-"): synthetic pre-submit key.  The submit
-      either never landed or landed under a real key.  We cannot look it up on-chain
-      by this key.  Safe to resubmit once on the next cycle.
+    - intent-* key (starts with "intent-"): synthetic pre-submit key.
+      GAP #10 fix: if the DB row has a submit_tx_hash, call eth_getTransactionByHash
+      first — if the tx is pending OR mined, do NOT resubmit (it will/did land).
+      Only resubmit if the tx is truly absent (returns None).
+      If no submit_tx_hash on the row, it is safe to resubmit once.
     - Real hex key (0x...): check adapter.pendingOrders(key_bytes).vault.
-      If vault != address(0): order is on-chain → do NOT resubmit (keeper will execute).
-      If vault == address(0): order not found on-chain → submit never landed → safe to
-      resubmit once (ORCH-08 / T-02-17 Pitfall 4).
+      If vault != address(0): order is on-chain.
+        GAP #2 fix: if pendingOrders(key)[4] (executed==true), the order was
+        executed on-chain but clearTradingLock was never called (SIGKILL race).
+        Call vault.clearTradingLock(orderKey) unconditionally as a startup heal.
+      If vault == address(0): order not found on-chain → submit never landed →
+        GAP #10: check submit_tx_hash first before marking resubmittable.
 
     Note: reconciliation reads from the ADAPTER (mock_perps / GMXAdapter) — it reads
-    on-chain pending order state.  It does NOT interact with vault_contract (which is
-    for trade SUBMISSION only, per the D-16 adapter-for-reads / vault-for-writes split).
+    on-chain pending order state.  It does NOT interact with vault_contract for reads
+    (D-16 adapter-for-reads / vault-for-writes split), but DOES call vault_contract
+    for the clearTradingLock startup heal (GAP #2).
 
     Args:
-        web3: AsyncWeb3 instance (unused in this implementation; available for GMX).
+        web3: AsyncWeb3 instance (for eth_getTransactionByHash, GAP #10).
         mock_perps: Adapter contract instance (MockPerps or GMXAdapter) — READ side only.
         db: AsyncSession for DB reads.
         vault: Vault address to reconcile.
+        vault_contract: MTokenVault contract instance (GAP #2 startup heal). Optional —
+            when provided together with orchestrator_address, clearTradingLock is called
+            for any executed-on-chain orders whose lock was never cleared (SIGKILL race).
+        orchestrator_address: Checksummed operator-trade EOA address. Required for
+            clearTradingLock (onlyOrchestrator modifier). Signing middleware must already
+            be loaded on web3 (D-16).
 
     Returns:
         Number of rows that are safe to resubmit (the driver will re-drive them
         on the next cycle via normal run_live_cycle logic).
     """
+    from orchestrator.alerts.sink import AlertSeverity, send_alert
+
     unresolved = await get_unresolved_pending_orders(db, vault_address=vault)
     resubmittable = 0
     for order in unresolved:
         key: str = order["order_key"]
         if key.startswith("intent-"):
-            # Synthetic intent key — NOT an on-chain key.  The submit either never
-            # landed or landed under a real key (which may or may not be in DB).
-            # Flag as resubmittable so the driver re-drives it.
+            # Synthetic intent key — NOT an on-chain key.
+            # GAP #10: check submit_tx_hash before marking resubmittable.
+            submit_tx = order.get("submit_tx_hash")
+            if submit_tx:
+                try:
+                    tx_data = await web3.eth.get_transaction(submit_tx)
+                    if tx_data is not None:
+                        # Tx is pending OR already mined — do NOT resubmit
+                        logger.info(
+                            "reconcile: intent %s has submit_tx=%s still in mempool/mined — "
+                            "skipping resubmit (GAP #10 duplicate-prevention)",
+                            key,
+                            submit_tx[:12],
+                        )
+                        continue
+                except Exception as exc:  # noqa: BLE001
+                    # eth_getTransactionByHash returned error (not just None) —
+                    # treat as "tx absent" (safe to resubmit) and log at WARNING.
+                    logger.warning(
+                        "reconcile: eth_getTransactionByHash failed for submit_tx=%s key=%s: %s — "
+                        "treating tx as absent (safe to resubmit once)",
+                        submit_tx[:12] if submit_tx else "None",
+                        key,
+                        exc,
+                    )
             resubmittable += 1
             logger.info(
                 "reconcile: intent %s has no resolved on-chain order — safe to resubmit once",
@@ -988,20 +1104,93 @@ async def reconcile_pending_orders(
         # Real hex key: check on-chain
         try:
             key_bytes = bytes.fromhex(key.removeprefix("0x"))
-            # pendingOrders(bytes32) returns struct: (positionKey, executeAfterBlock, vault, ...)
-            # onchain[2] is the vault field
+            # pendingOrders(bytes32) struct: (positionKey[0], executeAfterBlock[1], vault[2],
+            #                                 isClose[3], executed[4])
             onchain = await mock_perps.functions.pendingOrders(key_bytes).call()
             vault_on_chain: str = onchain[2]
+            order_executed: bool = bool(onchain[4]) if len(onchain) > 4 else False
             zero_addr = "0x" + "0" * 40
             if vault_on_chain.lower() != zero_addr.lower():
-                # Order IS on-chain — keeper will execute it; do NOT resubmit
-                logger.info(
-                    "reconcile: order %s already on-chain (vault=%s), skipping resubmit",
-                    key[:10],
-                    vault_on_chain[:10],
-                )
+                # Order IS on-chain — keeper will execute it (or already executed it).
+                if order_executed:
+                    # GAP #2: Order was executed on-chain but SIGKILL prevented
+                    # clearTradingLock from firing → _tradingLocked stays true forever.
+                    # Startup heal: call clearTradingLock unconditionally (idempotent).
+                    logger.info(
+                        "reconcile: order %s executed on-chain but lock not cleared "
+                        "(SIGKILL race) — firing clearTradingLock startup heal (GAP #2)",
+                        key[:10],
+                    )
+                    if vault_contract is not None and orchestrator_address is not None:
+                        try:
+                            heal_tx = await vault_contract.functions.clearTradingLock(
+                                key_bytes
+                            ).transact({"from": orchestrator_address})
+                            heal_receipt = await web3.eth.wait_for_transaction_receipt(
+                                heal_tx, timeout=30
+                            )
+                            if heal_receipt.get("status") == 0:
+                                logger.error(
+                                    "reconcile: clearTradingLock startup heal REVERTED for "
+                                    "order_key=%s — vault may still be locked",
+                                    key[:10],
+                                )
+                            else:
+                                logger.info(
+                                    "reconcile: clearTradingLock startup heal OK for order_key=%s",
+                                    key[:10],
+                                )
+                        except Exception as heal_exc:  # noqa: BLE001
+                            logger.error(
+                                "reconcile: clearTradingLock startup heal FAILED for order_key=%s: %s",
+                                key[:10],
+                                heal_exc,
+                            )
+                            await send_alert(
+                                f"Startup heal: clearTradingLock failed for order_key={key[:10]}: "
+                                f"{heal_exc}. Vault may still be locked.",
+                                AlertSeverity.CRITICAL,
+                                context={"vault_address": vault, "order_key": key},
+                            )
+                    else:
+                        logger.warning(
+                            "reconcile: order %s executed+locked but vault_contract not wired "
+                            "— cannot fire clearTradingLock startup heal (GAP #2). "
+                            "Pass vault_contract + orchestrator_address to reconcile.",
+                            key[:10],
+                        )
+                else:
+                    # Order on-chain, not yet executed — keeper will execute it; do NOT resubmit
+                    logger.info(
+                        "reconcile: order %s already on-chain (vault=%s), skipping resubmit",
+                        key[:10],
+                        vault_on_chain[:10],
+                    )
             else:
-                # Order NOT on-chain — submit never landed; safe to resubmit once
+                # Order NOT found on-chain (vault==address(0)).
+                # GAP #10: check submit_tx_hash before marking resubmittable.
+                submit_tx = order.get("submit_tx_hash")
+                if submit_tx:
+                    try:
+                        tx_data = await web3.eth.get_transaction(submit_tx)
+                        if tx_data is not None:
+                            # Tx is pending in mempool or already mined — do NOT resubmit
+                            logger.info(
+                                "reconcile: order %s not found on-chain yet but submit_tx=%s "
+                                "still exists (pending/mined) — skipping resubmit (GAP #10)",
+                                key[:10],
+                                submit_tx[:12],
+                            )
+                            continue
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "reconcile: eth_getTransactionByHash failed for submit_tx=%s "
+                            "order_key=%s: %s — treating as absent",
+                            submit_tx[:12] if submit_tx else "None",
+                            key[:10],
+                            exc,
+                        )
+                # Submit never landed (or tx absent) — safe to resubmit once
                 resubmittable += 1
                 logger.info(
                     "reconcile: order %s not found on-chain — submit never landed, safe to resubmit",
@@ -1036,6 +1225,11 @@ async def run_session(
     deployer_address: str,
     vault_contract: Any = None,
     operator_trade_account: Any = None,
+    # GAP #4/#6: price_pusher_address separates price-push signing from trade-submission
+    # signing (SEC-01 key separation). Defaults to deployer_address for backward compat.
+    # When set, the price pusher uses this address to sign setPrice() calls instead of
+    # reusing the operator-trade EOA. Wire via PRICE_PUSHER_KEY in run_session.py.
+    price_pusher_address: str | None = None,
     # Journal publisher params (PERPS-02 / D-08/D-09/D-10): optional, forwarded
     # to run_keeper_monitor so the keeper can publish_journal_entry on OrderExecuted.
     # All default None to preserve backward-compat with Phase-2 anvil tests.
@@ -1073,6 +1267,8 @@ async def run_session(
         db: AsyncSession for DB writes.
         redis: Optional redis.asyncio client.
         deployer_address: Deployer EOA (used by keeper_monitor for executeOrder).
+        price_pusher_address: Optional address for price-push signing (GAP #4/#6 SEC-01
+            key separation). When None, defaults to deployer_address (backward compat).
         vault_contract: MTokenVault contract instance (D-16). When provided, trade
             submission goes through vault.openLong/openShort/closePosition as the
             operator-trade EOA.  When None, falls back to legacy adapter impersonation
@@ -1131,7 +1327,16 @@ async def run_session(
         )
 
     # Step 3: Startup reconciliation (ORCH-08)
-    await reconcile_pending_orders(web3, mock_perps, db, vault=vault)
+    # GAP #2: pass vault_contract + orchestrator_address so reconcile can fire
+    # clearTradingLock startup heal for orders executed on-chain with lock not cleared.
+    await reconcile_pending_orders(
+        web3,
+        mock_perps,
+        db,
+        vault=vault,
+        vault_contract=vault_contract,
+        orchestrator_address=operator_trade_address,
+    )
 
     # Step 4: Log seed prominently (D-01 — session is fully replayable from seed)
     logger.warning(
@@ -1168,12 +1373,20 @@ async def run_session(
     # writes never contend with the driver's writes.
     keeper_db = AsyncSession(db.bind)
 
+    # GAP #4/#6: use price_pusher_address for price-push signing when set;
+    # fall back to deployer_address for backward compat (SEC-01 key separation).
+    _price_pusher_from = price_pusher_address or deployer_address
+    logger.info(
+        "run_session: price_pusher from_address=%s%s (GAP #4/#6 key separation)",
+        _price_pusher_from[:10],
+        " (PRICE_PUSHER_KEY)" if price_pusher_address else " (OPERATOR_TRADE_KEY fallback)",
+    )
     price_pusher_task = asyncio.create_task(
         run_price_pusher(
             web3,
             aggregators,
             walk,
-            deployer_address,
+            _price_pusher_from,
             config.cadence_seconds,
             stop_event,
             snapshot_queue=snapshot_queue,

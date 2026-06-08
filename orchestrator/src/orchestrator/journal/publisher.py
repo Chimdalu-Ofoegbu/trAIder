@@ -381,7 +381,68 @@ async def publish_journal_entry(
     if not tx_hex.startswith("0x"):
         tx_hex = "0x" + tx_hex
 
-    # ── Step 5: DB transition: pinned_primary → recorded ────────────────────
+    # GAP #8 fix: await the receipt BEFORE transitioning DB state.
+    # transact() returns the tx hash immediately (not mined). If we transition
+    # to 'recorded' before the tx mines and it reverts (status==0), the DB
+    # falsely shows 'recorded' with no valid onchain attestation.
+    # Fix: wait for the receipt, check status==1, only then mark 'recorded'.
+    # On revert (status==0): keep state at 'pinned_primary', log ERROR + alert.
+    logger.info(
+        "publisher: awaiting recordJournal receipt tx=%s vault=%s",
+        tx_hex[:12],
+        vault_address[:10],
+    )
+    try:
+        record_receipt = await web3.eth.wait_for_transaction_receipt(tx_hex, timeout=30)
+    except Exception as receipt_exc:  # noqa: BLE001
+        # Timeout or unexpected error — keep state at pinned_primary for retry
+        logger.error(
+            "publisher: recordJournal receipt wait failed for tx=%s vault=%s order_key=%s: %s",
+            tx_hex[:12],
+            vault_address[:10],
+            order_key[:10],
+            receipt_exc,
+        )
+        await send_alert(
+            f"recordJournal receipt wait failed for order_key={order_key[:10]} tx={tx_hex[:12]}: "
+            f"{receipt_exc}. State kept at pinned_primary for reconcile retry.",
+            AlertSeverity.WARNING,
+            context={
+                "vault_address": vault_address,
+                "order_key": order_key,
+                "tx": tx_hex,
+                "error": str(receipt_exc),
+            },
+            telegram_bot_token=telegram_bot_token,
+            telegram_chat_id=telegram_chat_id,
+        )
+        return  # Do NOT advance to 'recorded' — reconcile will retry
+
+    if record_receipt.get("status") == 0:
+        # Transaction reverted on-chain — keep at pinned_primary, log + alert
+        logger.error(
+            "publisher: recordJournal REVERTED (status=0) tx=%s vault=%s order_key=%s — "
+            "state kept at pinned_primary for reconcile retry",
+            tx_hex[:12],
+            vault_address[:10],
+            order_key[:10],
+        )
+        await send_alert(
+            f"recordJournal REVERTED for order_key={order_key[:10]} tx={tx_hex[:12]}. "
+            "State kept at pinned_primary. Check ecrecover gate / registry registration.",
+            AlertSeverity.CRITICAL,
+            context={
+                "vault_address": vault_address,
+                "order_key": order_key,
+                "tx": tx_hex,
+                "receipt_status": 0,
+            },
+            telegram_bot_token=telegram_bot_token,
+            telegram_chat_id=telegram_chat_id,
+        )
+        return  # Do NOT advance to 'recorded'
+
+    # ── Step 5: DB transition: pinned_primary → recorded (only on status==1) ──
     await update_journal_state(
         db_session,
         vault_address=vault_address,

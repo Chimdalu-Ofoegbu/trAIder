@@ -295,6 +295,10 @@ async def run_mini_session(
     telegram_chat_id: str | None = None,
     latency_watchdog_threshold: float = 120.0,
     model: str = "claude-opus-4-7",
+    # GAP #4/#6: price_pusher_private_key separates price-push signing from trade-submission
+    # signing (SEC-01 key separation). When None, reads PRICE_PUSHER_KEY from env;
+    # if that is also unset, falls back to OPERATOR_TRADE_KEY.
+    price_pusher_private_key: str | None = None,
 ) -> dict:
     """Run the Sepolia mini-session end-to-end (TEST-03 hard gate / D-04).
 
@@ -390,6 +394,34 @@ async def run_mini_session(
         "run_mini_session: operator-trade EOA=%s (D-16 signing middleware will be loaded)",
         operator_trade_account.address,
     )
+
+    # GAP #4/#6: PRICE_PUSHER_KEY — key separation for price-push vs trade-submission.
+    # SEC-01: setPrice() calls are permissionless (any EOA can push) so using a separate
+    # key reduces attack surface on the operator-trade EOA. Falls back to OPERATOR_TRADE_KEY
+    # for backward compatibility so existing deployments need no env changes.
+    # Priority: function parameter > PRICE_PUSHER_KEY env > OPERATOR_TRADE_KEY fallback.
+    price_pusher_key_hex = price_pusher_private_key or os.environ.get("PRICE_PUSHER_KEY", "")
+    price_pusher_address: str | None = None
+    if price_pusher_key_hex:
+        if not price_pusher_key_hex.startswith("0x"):
+            price_pusher_key_hex = "0x" + price_pusher_key_hex
+        price_pusher_account = Account.from_key(price_pusher_key_hex)
+        price_pusher_address = price_pusher_account.address
+        logger.info(
+            "run_mini_session: PRICE_PUSHER_KEY set — price pusher EOA=%s (GAP #4/#6 key separation)",
+            price_pusher_address,
+        )
+        # Load signing middleware for price-pusher key (price pusher calls setPrice transact).
+        from web3.middleware import SignAndSendRawMiddlewareBuilder as _SARMBuilder
+
+        _pusher_mw = _SARMBuilder.build(price_pusher_account)
+        web3.middleware_onion.inject(_pusher_mw, layer=0)
+    else:
+        logger.info(
+            "run_mini_session: PRICE_PUSHER_KEY not set — price pusher uses OPERATOR_TRADE_KEY "
+            "fallback (operator_trade_address=%s)",
+            operator_trade_account.address,
+        )
 
     # Operator-journal key (signs journal entries for ecrecover gate, D-10)
     journal_key_hex = operator_journal_private_key_hex or os.environ.get(
@@ -628,6 +660,9 @@ async def run_mini_session(
             deployer_address=deployer_address,
             vault_contract=vault_contract,
             operator_trade_account=operator_trade_account,
+            # GAP #4/#6: price_pusher_address uses PRICE_PUSHER_KEY when set;
+            # falls back to OPERATOR_TRADE_KEY (None → deployer_address fallback in driver).
+            price_pusher_address=price_pusher_address,
             # Journal publisher params (PERPS-02 / D-08/D-09/D-10) — forwarded to keeper.
             # When all required params are non-None, the keeper publishes
             # journal entries on OrderExecuted (wired once at session start).

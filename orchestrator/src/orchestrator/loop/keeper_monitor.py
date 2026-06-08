@@ -154,46 +154,18 @@ async def execute_ready_orders(
                     block_number=exec_block,
                 )
 
-                await mark_pending_order_executed(
-                    db_session,
-                    vault_address=vault_address,
-                    order_key=order_key_hex,
-                )
-
-                # Publish TradeEvent envelope
-                trade_payload = {
-                    "vault_address": vault_address,
-                    "order_key": order_key_hex,
-                    "action": decision_snap.get("action", "open"),
-                    "market": decision_snap.get("market", "UNKNOWN"),
-                    "side": decision_snap.get("side", "long"),
-                    "size_usd": str(decision_snap.get("sizeUsd", 0.0)),
-                    "leverage": decision_snap.get("leverage", 1.0),
-                    "tx_hash": exec_tx_hex,
-                    "block_number": exec_block,
-                    "trade_hash": trade_hash,
-                }
-                envelope = _make_envelope(
-                    "TradeEvent",
-                    trade_payload,
-                    seq=seq_counter,
-                    block_number=exec_block,
-                )
-                trade_channel = channel_for("TradeEvent", vault_address=vault_address)
-                await _publish(redis, trade_channel, envelope)
-
-                logger.info(
-                    "keeper: OrderExecuted block=%d order_key=%s tx=%s",
-                    exec_block,
-                    order_key_hex[:10],
-                    exec_tx_hex[:10],
-                )
-
-                # ── VAULT-06: clearTradingLock so next cycle can trade ────────────
+                # ── VAULT-06: clearTradingLock FIRST, THEN DB unlock (GAP #3 fix) ──
                 # The vault sets _tradingLocked=true when openLong/openShort/closePosition
                 # is called. Without this call, every subsequent trade reverts with
                 # "Vault: order in flight" — bricking the session after its first trade.
                 # Must be signed by the orchestrator EOA (onlyOrchestrator modifier).
+                #
+                # ORDERING REQUIREMENT (GAP #3):
+                #   clearTradingLock (on-chain unlock) MUST be called and receipt awaited
+                #   BEFORE mark_pending_order_executed (DB unlock). If the DB releases the
+                #   in-flight lock before the vault is unlocked, the driver can submit at
+                #   short cadence and hit "Vault: order in flight" on the very next cycle.
+                #
                 # Failure is logged LOUDLY at ERROR + alert; a stuck lock bricks trading.
                 if vault_contract is not None and orchestrator_address is not None:
                     try:
@@ -243,6 +215,44 @@ async def execute_ready_orders(
                         "clearTradingLock skipped (legacy/test path). "
                         "Wire vault_contract + orchestrator_address in production (VAULT-06)."
                     )
+
+                # DB unlock AFTER vault unlock (GAP #3): mark_pending_order_executed
+                # transitions the DB row to 'executed' only after the vault lock is cleared.
+                # This prevents the driver from re-submitting while the vault is still locked.
+                await mark_pending_order_executed(
+                    db_session,
+                    vault_address=vault_address,
+                    order_key=order_key_hex,
+                )
+
+                # Publish TradeEvent envelope
+                trade_payload = {
+                    "vault_address": vault_address,
+                    "order_key": order_key_hex,
+                    "action": decision_snap.get("action", "open"),
+                    "market": decision_snap.get("market", "UNKNOWN"),
+                    "side": decision_snap.get("side", "long"),
+                    "size_usd": str(decision_snap.get("sizeUsd", 0.0)),
+                    "leverage": decision_snap.get("leverage", 1.0),
+                    "tx_hash": exec_tx_hex,
+                    "block_number": exec_block,
+                    "trade_hash": trade_hash,
+                }
+                envelope = _make_envelope(
+                    "TradeEvent",
+                    trade_payload,
+                    seq=seq_counter,
+                    block_number=exec_block,
+                )
+                trade_channel = channel_for("TradeEvent", vault_address=vault_address)
+                await _publish(redis, trade_channel, envelope)
+
+                logger.info(
+                    "keeper: OrderExecuted block=%d order_key=%s tx=%s",
+                    exec_block,
+                    order_key_hex[:10],
+                    exec_tx_hex[:10],
+                )
 
                 # ── PERPS-02 / JOURNAL-01: publish journal ONLY on OrderExecuted ──
                 # Wired here and NEVER in driver.py (front-running mitigation 9.1 /

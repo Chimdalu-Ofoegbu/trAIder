@@ -372,6 +372,7 @@ async def record_pending_order(
     execute_after_block: int,
     status: str = "pending",
     decision_snapshot: dict | None = None,
+    submit_tx_hash: str | None = None,
 ) -> None:
     """Insert a pending_orders row recording a submitted-but-not-yet-executed order.
 
@@ -391,6 +392,10 @@ async def record_pending_order(
         status: One of 'intent' | 'pending' | 'executed' | 'reconciled' | 'cancelled'.
                 Default 'pending' (post-submit keeper-poll window status).
         decision_snapshot: Validated Decision dict stored verbatim as JSONB (optional).
+        submit_tx_hash: Raw tx hash returned by vault.openLong/openShort/closePosition.transact()
+                        (GAP #10). Stored so reconcile can call eth_getTransactionByHash on restart
+                        to detect pending-in-mempool txs and prevent duplicate submissions.
+                        None for intent rows (written before submit) and pre-GAP-10 rows.
     """
     await session.execute(
         text(
@@ -398,10 +403,12 @@ async def record_pending_order(
             INSERT INTO orchestrator.pending_orders
                 (id, vault_address, order_key, session_id,
                  execute_after_block, status, decision_snapshot,
+                 submit_tx_hash,
                  created_at, updated_at)
             VALUES
                 (:id, :vault_address, :order_key, CAST(:session_id AS uuid),
                  :execute_after_block, :status, CAST(:decision_snapshot AS jsonb),
+                 :submit_tx_hash,
                  :created_at, :updated_at)
             ON CONFLICT (vault_address, order_key) DO NOTHING
             """
@@ -416,6 +423,7 @@ async def record_pending_order(
             "decision_snapshot": json.dumps(decision_snapshot)
             if decision_snapshot is not None
             else None,
+            "submit_tx_hash": submit_tx_hash,
             "created_at": datetime.now(UTC),
             "updated_at": datetime.now(UTC),
         },
@@ -602,7 +610,8 @@ async def get_unresolved_pending_orders(
         text(
             """
             SELECT id, vault_address, order_key, session_id,
-                   execute_after_block, status, decision_snapshot
+                   execute_after_block, status, decision_snapshot,
+                   submit_tx_hash
             FROM orchestrator.pending_orders
             WHERE vault_address = :vault_address
               AND status IN ('intent', 'pending')
