@@ -22,7 +22,8 @@ Environment variables read (from .env files — secrets never hardcoded):
   OPERATOR_JOURNAL_KEY_PRIV    Hex private key for operator-journal EOA (SEC-01)
   OPERATOR_JOURNAL_KEY_ADDR    Hex address of operator-journal EOA (for transact from)
   PINATA_JWT                   Pinata V3 JWT for IPFS pinning (JOURNAL-02)
-  FILEBASE_API_KEY             Filebase S3 API key for backup pinning (D-08)
+  FILEBASE_ACCESS_KEY          Filebase S3 access key for backup pinning (D-08, SigV4)
+  FILEBASE_SECRET_KEY          Filebase S3 secret key for backup pinning (D-08, SigV4)
   FILEBASE_BUCKET              Filebase IPFS bucket name (default: traider-journals)
   PERPS_VENUE                  "mock" | "gmx" (default: "mock", D-01/D-03)
   SESSION_DURATION             Session duration in seconds (default: 1800 = 30min)
@@ -274,7 +275,8 @@ async def run_mini_session(
     operator_journal_private_key_hex: str | None = None,
     operator_journal_key_address: str | None = None,
     pinata_jwt: str | None = None,
-    filebase_api_key: str | None = None,
+    filebase_access_key: str | None = None,
+    filebase_secret_key: str | None = None,
     filebase_bucket: str = "traider-journals",
     perps_venue: str = "mock",
     session_duration_seconds: int = 1800,
@@ -306,7 +308,8 @@ async def run_mini_session(
         operator_journal_private_key_hex: Hex private key string for operator-journal EOA.
         operator_journal_key_address:     Checksummed address of operator-journal EOA.
         pinata_jwt:                       Pinata V3 JWT for IPFS pinning.
-        filebase_api_key:                 Filebase S3 API key for backup pinning.
+        filebase_access_key:              Filebase S3 access key (FILEBASE_ACCESS_KEY env var).
+        filebase_secret_key:              Filebase S3 secret key (FILEBASE_SECRET_KEY env var).
         filebase_bucket:                  Filebase IPFS bucket name.
         perps_venue:                      "mock" or "gmx" (D-01/D-03).
         session_duration_seconds:         Session run length (default 1800 = 30min).
@@ -516,13 +519,16 @@ async def run_mini_session(
 
     # Resolve pinata / filebase credentials
     _pinata_jwt = pinata_jwt or os.environ.get("PINATA_JWT", "") or None
-    _filebase_key = filebase_api_key or os.environ.get("FILEBASE_API_KEY", "") or None
+    _filebase_access_key = filebase_access_key or os.environ.get("FILEBASE_ACCESS_KEY", "") or None
+    _filebase_secret_key = filebase_secret_key or os.environ.get("FILEBASE_SECRET_KEY", "") or None
     _filebase_bucket = filebase_bucket or os.environ.get("FILEBASE_BUCKET", "traider-journals")
 
     logger.info(
-        "run_mini_session: journal_params — pinata_jwt=%s filebase_key=%s journal_key_addr=%s",
+        "run_mini_session: journal_params — pinata_jwt=%s filebase_access_key=%s "
+        "filebase_secret_key=%s journal_key_addr=%s",
         "SET" if _pinata_jwt else "NOT SET",
-        "SET" if _filebase_key else "NOT SET",
+        "SET" if _filebase_access_key else "NOT SET",
+        "SET" if _filebase_secret_key else "NOT SET",
         journal_key_addr or "NOT SET",
     )
 
@@ -553,12 +559,13 @@ async def run_mini_session(
             vault_contract=vault_contract,
             operator_trade_account=operator_trade_account,
             # Journal publisher params (PERPS-02 / D-08/D-09/D-10) — forwarded to keeper.
-            # When all three required params are non-None, the keeper publishes
+            # When all required params are non-None, the keeper publishes
             # journal entries on OrderExecuted (wired once at session start).
             journal_registry=journal_registry,
             operator_journal_private_key=operator_journal_private_key_bytes,
             pinata_jwt=_pinata_jwt,
-            storacha_api_key=_filebase_key,
+            filebase_access_key=_filebase_access_key,
+            filebase_secret_key=_filebase_secret_key,
             operator_journal_key_address=journal_key_addr or None,
             telegram_bot_token=telegram_bot_token,
             telegram_chat_id=telegram_chat_id,

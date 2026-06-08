@@ -47,7 +47,7 @@ async def test_filebase_failure_does_not_block_publish() -> None:
     async def mock_pinata_ok(payload, jwt, **kw):
         return fake_cid
 
-    async def mock_filebase_fail(payload, api_key, **kw):
+    async def mock_filebase_fail(payload, access_key, secret_key, **kw):
         raise RuntimeError("Filebase: connection refused (simulated outage)")
 
     with (
@@ -73,7 +73,8 @@ async def test_filebase_failure_does_not_block_publish() -> None:
             payload={"trade": "ETH", "cycle": 1},
             operator_journal_private_key=priv_key,
             pinata_jwt="test-jwt",
-            storacha_api_key="test-key",
+            filebase_access_key="test-access-key",
+            filebase_secret_key="test-secret-key",
         )
         # Drain pending asyncio tasks (the Filebase backfill create_task)
         await asyncio.gather(*asyncio.all_tasks() - {asyncio.current_task()})
@@ -137,7 +138,8 @@ async def test_filebase_failure_web3_storage_cid_remains_null() -> None:
             payload={"trade": "ETH"},
             operator_journal_private_key=priv_key,
             pinata_jwt="jwt",
-            storacha_api_key="key",
+            filebase_access_key="test-access-key",
+            filebase_secret_key="test-secret-key",
         )
         # Drain pending asyncio tasks so backfill task completes
         await asyncio.gather(*asyncio.all_tasks() - {asyncio.current_task()})

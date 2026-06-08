@@ -205,7 +205,8 @@ def _hex_to_bytes32(hex_str: str) -> bytes:
 
 async def _backfill_filebase(
     payload: dict,
-    storacha_api_key: str,
+    filebase_access_key: str,
+    filebase_secret_key: str,
     db_session: Any,
     vault_address: str,
     order_key: str,
@@ -219,16 +220,17 @@ async def _backfill_filebase(
     and the primary journal record (Pinata-confirmed, onchain) intact.
 
     Args:
-        payload:           Journal entry dict to pin.
-        storacha_api_key:  Filebase API key (from env).
-        db_session:        AsyncSession for updating web3_storage_cid on success.
-        vault_address:     DB row key (part of UNIQUE).
-        order_key:         DB row key (part of UNIQUE).
-        telegram_bot_token: Optional Telegram bot token for WARNING alert.
-        telegram_chat_id:  Optional Telegram chat ID for WARNING alert.
+        payload:              Journal entry dict to pin.
+        filebase_access_key:  Filebase S3 access key (FILEBASE_ACCESS_KEY from env).
+        filebase_secret_key:  Filebase S3 secret key (FILEBASE_SECRET_KEY from env).
+        db_session:           AsyncSession for updating web3_storage_cid on success.
+        vault_address:        DB row key (part of UNIQUE).
+        order_key:            DB row key (part of UNIQUE).
+        telegram_bot_token:   Optional Telegram bot token for WARNING alert.
+        telegram_chat_id:     Optional Telegram chat ID for WARNING alert.
     """
     try:
-        backup_cid = await pin_to_storacha_backup(payload, storacha_api_key)
+        backup_cid = await pin_to_storacha_backup(payload, filebase_access_key, filebase_secret_key)
         await update_journal_state(
             db_session,
             vault_address=vault_address,
@@ -272,7 +274,9 @@ async def publish_journal_entry(
     payload: dict,
     operator_journal_private_key: bytes,
     pinata_jwt: str,
-    storacha_api_key: str | None,
+    storacha_api_key: str | None = None,
+    filebase_access_key: str | None = None,
+    filebase_secret_key: str | None = None,
     operator_journal_key_address: str | None = None,
     telegram_bot_token: str | None = None,
     telegram_chat_id: str | None = None,
@@ -290,6 +294,12 @@ async def publish_journal_entry(
     D-09: called for TRADE entries only (onchain recordJournal is trade-only).
     PERPS-02: called ONLY from keeper_monitor after OrderExecuted — never from driver.
 
+    Filebase credentials: pass ``filebase_access_key`` + ``filebase_secret_key`` (SigV4).
+    The legacy ``storacha_api_key`` parameter is accepted for backwards compatibility but
+    is ignored when the new keys are provided.  If only ``storacha_api_key`` is set (old
+    callers), the backup is skipped with a WARNING so deployments fail loudly rather than
+    silently pinning with broken Bearer auth.
+
     Args:
         web3:                           AsyncWeb3 instance.
         journal_registry:               Bound JournalRegistry contract instance.
@@ -300,7 +310,9 @@ async def publish_journal_entry(
         payload:                        Full journal entry dict to pin.
         operator_journal_private_key:   Raw 32-byte private key (from env; never logged).
         pinata_jwt:                     Pinata V3 JWT (from env; never logged).
-        storacha_api_key:               Filebase API key, or None to skip backup.
+        storacha_api_key:               Deprecated — ignored. Use filebase_access_key + secret_key.
+        filebase_access_key:            Filebase S3 access key (FILEBASE_ACCESS_KEY env var).
+        filebase_secret_key:            Filebase S3 secret key (FILEBASE_SECRET_KEY env var).
         operator_journal_key_address:   Hex address to use in transact({from: ...}).
                                         If None, derived from operator_journal_private_key.
         telegram_bot_token:             Optional Telegram bot token for Filebase WARNING.
@@ -384,11 +396,12 @@ async def publish_journal_entry(
     )
 
     # ── Step 6: Async Filebase backfill — non-blocking (D-08 / T-03-21) ─────
-    if storacha_api_key:
+    if filebase_access_key and filebase_secret_key:
         asyncio.create_task(
             _backfill_filebase(
                 payload,
-                storacha_api_key,
+                filebase_access_key,
+                filebase_secret_key,
                 db_session,
                 vault_address,
                 order_key,
@@ -396,5 +409,12 @@ async def publish_journal_entry(
                 telegram_chat_id=telegram_chat_id,
             )
         )
+    elif storacha_api_key:
+        # Legacy path: storacha_api_key alone cannot authenticate to Filebase SigV4.
+        # Warn loudly rather than silently failing with a 403 at pin time.
+        logger.warning(
+            "publisher: storacha_api_key set but FILEBASE_ACCESS_KEY/SECRET_KEY are missing — "
+            "Filebase backup SKIPPED. Set FILEBASE_ACCESS_KEY + FILEBASE_SECRET_KEY in .env."
+        )
     else:
-        logger.debug("publisher: no storacha_api_key provided — skipping Filebase backfill")
+        logger.debug("publisher: Filebase creds not provided — skipping Filebase backfill")

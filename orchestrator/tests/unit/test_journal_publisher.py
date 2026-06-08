@@ -151,7 +151,8 @@ async def test_publish_journal_entry_state_machine() -> None:
             payload=payload,
             operator_journal_private_key=priv_key,
             pinata_jwt="test-jwt",
-            storacha_api_key="test-api-key",
+            filebase_access_key="test-access-key",
+            filebase_secret_key="test-secret-key",
         )
 
     # State machine: pinned_primary must come before recorded
@@ -192,7 +193,7 @@ async def test_publish_journal_entry_dual_pin_same_cid() -> None:
         pinata_cids.append(fake_cid)
         return fake_cid
 
-    async def mock_backup(payload, api_key, **kw):
+    async def mock_backup(payload, access_key, secret_key, **kw):
         backup_cids.append(fake_cid)
         return fake_cid
 
@@ -218,7 +219,8 @@ async def test_publish_journal_entry_dual_pin_same_cid() -> None:
             payload={"x": 1},
             operator_journal_private_key=priv_key,
             pinata_jwt="jwt",
-            storacha_api_key="key",
+            filebase_access_key="test-access-key",
+            filebase_secret_key="test-secret-key",
         )
         # Drain pending tasks so the async Filebase backfill runs
         await asyncio.gather(*asyncio.all_tasks() - {asyncio.current_task()})

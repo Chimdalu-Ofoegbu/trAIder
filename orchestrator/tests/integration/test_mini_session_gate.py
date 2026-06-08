@@ -14,7 +14,7 @@ Automated assertions for the TEST-03 HARD gate (D-04 / 03-08 plan):
    assert each is fetchable from BOTH the Pinata gateway AND the Filebase gateway
    via fetch_from_gateway, and that the fetched payload round-trips (same JSON).
    Measures + logs per-CID fetch latency vs the 10s verifier target (D-11).
-   Skips cleanly when PINATA_JWT / FILEBASE_API_KEY / TEST_RUN_CIDS are absent.
+   Skips cleanly when PINATA_JWT / FILEBASE_ACCESS_KEY / TEST_RUN_CIDS are absent.
 
 3. NAV-TICK (vault.nav() ticks with mock Chainlink feed):
    Push the mock ETH/USD aggregator to a new price on the local anvil; assert
@@ -63,7 +63,10 @@ _MANIFEST_PATH = _REPO_ROOT / "deployments" / "sepolia.json"
 
 _ARB_RPC = os.environ.get("ARB_RPC", "")
 _PINATA_JWT = os.environ.get("PINATA_JWT", "")  # gitleaks:allow
-_FILEBASE_API_KEY = os.environ.get("FILEBASE_API_KEY", "")  # gitleaks:allow
+# Filebase SigV4 credentials — replaces the old FILEBASE_API_KEY Bearer-auth approach.
+# Both keys are required for backup pinning; if absent, the Filebase gateway test defers.
+_FILEBASE_ACCESS_KEY = os.environ.get("FILEBASE_ACCESS_KEY", "")  # gitleaks:allow
+_FILEBASE_SECRET_KEY = os.environ.get("FILEBASE_SECRET_KEY", "")  # gitleaks:allow
 _FILEBASE_BUCKET = os.environ.get("FILEBASE_BUCKET", "traider-journals")
 # TEST_RUN_CIDS: comma-separated CID list from the live run (set by operator after Task 3)
 _TEST_RUN_CIDS_RAW = os.environ.get("TEST_RUN_CIDS", "")
@@ -71,9 +74,13 @@ _TEST_RUN_CIDS_RAW = os.environ.get("TEST_RUN_CIDS", "")
 # D-11: target fetch latency for the verifier
 _GATEWAY_LATENCY_TARGET_SECONDS = 10.0
 
-# Public gateways (distinct — D-04 requires BOTH are fetchable)
+# Public gateways (distinct independent sources — D-04 requires BOTH are fetchable).
+# _PINATA_GATEWAY  : Pinata's own public IPFS gateway (pinned by us).
+# _FILEBASE_GATEWAY: Filebase's public IPFS HTTP gateway — independent of Pinata.
+#                    A CID pinned to Filebase is retrievable from any public gateway;
+#                    using Filebase's own gateway keeps the two sources visibly distinct.
 _PINATA_GATEWAY = "https://gateway.pinata.cloud/ipfs"
-_FILEBASE_GATEWAY = "https://ipfs.filebase.io/ipfs"  # Filebase public gateway
+_FILEBASE_GATEWAY = "https://ipfs.filebase.io/ipfs"  # Filebase public IPFS gateway (independent)
 
 # ---------------------------------------------------------------------------
 # TEST 1: Fork suite precondition (subprocess to forge)
@@ -196,6 +203,8 @@ _CID_FETCH_SKIP_REASON = (
     "EXPLICIT-DEFER: PINATA_JWT and/or TEST_RUN_CIDS not set. "
     "Set PINATA_JWT=<jwt> and TEST_RUN_CIDS=<cid1>,<cid2>,... from the live mini-session run "
     "to assert both-gateways fetchability (D-04 HARD gate). "
+    "Filebase gateway test also requires FILEBASE_ACCESS_KEY + FILEBASE_SECRET_KEY "
+    "(not FILEBASE_API_KEY — that Bearer-auth approach was broken; SigV4 is now required). "
     "During the operator Task-3 run, these MUST be set and this test MUST pass."
 )
 

@@ -4,8 +4,11 @@ orchestrator.tests.integration.test_dual_pin_same_cid — Dual-pin CID parity (J
 Live integration test: pin a small test payload to Pinata AND Filebase backup.
 Assert both return identical CIDs (content-addressed → same content = same CID).
 
-Requires PINATA_JWT and FILEBASE_API_KEY + FILEBASE_BUCKET in env.
+Requires PINATA_JWT and FILEBASE_ACCESS_KEY + FILEBASE_SECRET_KEY + FILEBASE_BUCKET in env.
 Skips cleanly if env vars are not set (EXPLICIT-DEFER per host_infra_facts).
+
+Note: the old FILEBASE_API_KEY Bearer-auth is BROKEN (Filebase S3 requires SigV4).
+Use FILEBASE_ACCESS_KEY + FILEBASE_SECRET_KEY instead.
 
 This test proves the dual-pin CID-equality assumption before the publisher relies on it.
 """
@@ -24,14 +27,16 @@ from orchestrator.journal.ipfs import fetch_from_gateway, pin_to_pinata, pin_to_
 # ---------------------------------------------------------------------------
 
 PINATA_JWT = os.environ.get("PINATA_JWT", "")  # gitleaks:allow — reading env var, not a real secret
-FILEBASE_API_KEY = os.environ.get("FILEBASE_API_KEY", "")
+FILEBASE_ACCESS_KEY = os.environ.get("FILEBASE_ACCESS_KEY", "")  # gitleaks:allow
+FILEBASE_SECRET_KEY = os.environ.get("FILEBASE_SECRET_KEY", "")  # gitleaks:allow
 FILEBASE_BUCKET = os.environ.get("FILEBASE_BUCKET", "traider-journals")
 
-_LIVE_CREDS_AVAILABLE = bool(PINATA_JWT and FILEBASE_API_KEY)
+_LIVE_CREDS_AVAILABLE = bool(PINATA_JWT and FILEBASE_ACCESS_KEY and FILEBASE_SECRET_KEY)
 
 _SKIP_REASON = (
-    "EXPLICIT-DEFER: PINATA_JWT and/or FILEBASE_API_KEY not set in env. "
-    "Set both to run the live dual-pin integration test (TEST-03 requirement). "
+    "EXPLICIT-DEFER: PINATA_JWT and/or FILEBASE_ACCESS_KEY/FILEBASE_SECRET_KEY not set in env. "
+    "Set all three to run the live dual-pin integration test (TEST-03 requirement). "
+    "Use FILEBASE_ACCESS_KEY + FILEBASE_SECRET_KEY (SigV4) — NOT FILEBASE_API_KEY (Bearer/broken). "
     "Unit-level same-bytes invariant is proven in test_alert_sink.py Test 4."
 )
 
@@ -59,7 +64,9 @@ async def test_dual_pin_same_cid() -> None:
     assert pinata_cid.startswith("bafy"), f"Expected CIDv1, got {pinata_cid}"
 
     # Pin to Filebase backup (same sorted bytes → same CID)
-    filebase_cid = await pin_to_storacha_backup(payload, FILEBASE_API_KEY, bucket=FILEBASE_BUCKET)
+    filebase_cid = await pin_to_storacha_backup(
+        payload, FILEBASE_ACCESS_KEY, FILEBASE_SECRET_KEY, bucket=FILEBASE_BUCKET
+    )
     assert filebase_cid, "Filebase returned empty CID"
 
     # The two CIDs must match (same bytes → same content address)

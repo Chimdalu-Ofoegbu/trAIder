@@ -63,7 +63,8 @@ async def execute_ready_orders(
     journal_registry: Any | None = None,
     operator_journal_private_key: bytes | None = None,
     pinata_jwt: str | None = None,
-    storacha_api_key: str | None = None,
+    filebase_access_key: str | None = None,
+    filebase_secret_key: str | None = None,
     operator_journal_key_address: str | None = None,
     telegram_bot_token: str | None = None,
     telegram_chat_id: str | None = None,
@@ -84,7 +85,8 @@ async def execute_ready_orders(
                           pinata_jwt, publish_journal_entry fires after OrderExecuted.
         operator_journal_private_key: Raw 32-byte private key for EIP-191 signing.
         pinata_jwt: Pinata V3 JWT for IPFS pinning.
-        storacha_api_key: Optional Filebase backup key.
+        filebase_access_key: Filebase S3 access key (SigV4) for backup pinning (D-08).
+        filebase_secret_key: Filebase S3 secret key (SigV4) for backup pinning (D-08).
         operator_journal_key_address: Hex address for the journal key (transact from).
         telegram_bot_token: Optional Telegram bot token for alert sink.
         telegram_chat_id: Optional Telegram chat ID for alert sink.
@@ -189,7 +191,8 @@ async def execute_ready_orders(
                             payload=journal_payload,
                             operator_journal_private_key=operator_journal_private_key,
                             pinata_jwt=pinata_jwt,
-                            storacha_api_key=storacha_api_key,
+                            filebase_access_key=filebase_access_key,
+                            filebase_secret_key=filebase_secret_key,
                             operator_journal_key_address=operator_journal_key_address,
                             telegram_bot_token=telegram_bot_token,
                             telegram_chat_id=telegram_chat_id,
@@ -259,7 +262,8 @@ async def run_keeper_monitor(
     journal_registry: Any | None = None,
     operator_journal_private_key: bytes | None = None,
     pinata_jwt: str | None = None,
-    storacha_api_key: str | None = None,
+    filebase_access_key: str | None = None,
+    filebase_secret_key: str | None = None,
     operator_journal_key_address: str | None = None,
     telegram_bot_token: str | None = None,
     telegram_chat_id: str | None = None,
@@ -283,7 +287,8 @@ async def run_keeper_monitor(
         journal_registry: JournalRegistry contract for onchain attestation (PERPS-02).
         operator_journal_private_key: Raw key bytes for EIP-191 signing.
         pinata_jwt: Pinata JWT for IPFS pinning.
-        storacha_api_key: Optional Filebase backup key.
+        filebase_access_key: Filebase S3 access key (SigV4) for backup pinning (D-08).
+        filebase_secret_key: Filebase S3 secret key (SigV4) for backup pinning (D-08).
         operator_journal_key_address: Hex address for journal key transact from.
         telegram_bot_token: Optional Telegram token for WARNING alerts.
         telegram_chat_id: Optional Telegram chat ID.
@@ -315,7 +320,8 @@ async def run_keeper_monitor(
                 journal_registry=journal_registry,
                 operator_journal_private_key=operator_journal_private_key,
                 pinata_jwt=pinata_jwt,
-                storacha_api_key=storacha_api_key,
+                filebase_access_key=filebase_access_key,
+                filebase_secret_key=filebase_secret_key,
                 operator_journal_key_address=operator_journal_key_address,
                 telegram_bot_token=telegram_bot_token,
                 telegram_chat_id=telegram_chat_id,
