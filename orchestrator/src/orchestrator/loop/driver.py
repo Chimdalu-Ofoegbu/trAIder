@@ -1092,6 +1092,14 @@ async def run_session(
             session_id=config.session_id,
             stop_event=stop_event,
             poll_seconds=2.0,
+            # VAULT-06: wire vault_contract + orchestrator address so the keeper calls
+            # clearTradingLock(orderKey) after each OrderExecuted.  Without this, the
+            # vault's _tradingLocked flag stays true and every subsequent openLong/
+            # openShort/closePosition reverts "Vault: order in flight" — bricking the
+            # session after its first trade.  Both default None for backward-compat with
+            # Phase-2 anvil tests that do not use a vault_contract.
+            vault_contract=vault_contract,
+            orchestrator_address=operator_trade_address,
             # Journal publisher params (PERPS-02 / D-08/D-09/D-10).
             # All default None — backward-compat with Phase-2 anvil tests.
             # When all three required params are non-None, the keeper publishes

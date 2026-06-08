@@ -57,6 +57,13 @@ async def execute_ready_orders(
     redis: Any | None = None,
     session_id: str,
     seq_counter: int,
+    # VAULT-06: vault contract + orchestrator address for clearTradingLock after OrderExecuted.
+    # Optional to preserve backward-compat with existing callers (anvil tests, Phase-2 harness).
+    # When vault_contract and orchestrator_address are both provided, clearTradingLock is called
+    # immediately after OrderExecuted so the next cycle can submit a trade without reverting
+    # "Vault: order in flight".
+    vault_contract: Any | None = None,
+    orchestrator_address: str | None = None,
     # Journal publisher params (PERPS-02 / D-08/D-09): optional to preserve
     # backward-compat with existing callers (anvil tests, Phase-2 harness).
     # When all three are provided, publish_journal_entry fires after OrderExecuted.
@@ -80,6 +87,14 @@ async def execute_ready_orders(
         redis: Optional redis.asyncio client for TradeEvent publishing.
         session_id: Active trading session UUID string.
         seq_counter: Envelope sequence number for the TradeEvent.
+        vault_contract: MTokenVault contract instance (VAULT-06). When provided together
+                        with orchestrator_address, clearTradingLock(orderKey) is called
+                        after OrderExecuted so subsequent trades do not revert
+                        "Vault: order in flight". Signed by the orchestrator EOA via the
+                        signing middleware already loaded on web3 at session start (D-16).
+        orchestrator_address: Checksummed address of the operator-trade EOA that is the
+                              vault's onlyOrchestrator. Must match the signing middleware
+                              loaded on web3 so clearTradingLock transact auto-signs.
         journal_registry: JournalRegistry contract instance for onchain attestation.
                           When provided together with operator_journal_private_key and
                           pinata_jwt, publish_journal_entry fires after OrderExecuted.
@@ -174,6 +189,61 @@ async def execute_ready_orders(
                     exec_tx_hex[:10],
                 )
 
+                # ── VAULT-06: clearTradingLock so next cycle can trade ────────────
+                # The vault sets _tradingLocked=true when openLong/openShort/closePosition
+                # is called. Without this call, every subsequent trade reverts with
+                # "Vault: order in flight" — bricking the session after its first trade.
+                # Must be signed by the orchestrator EOA (onlyOrchestrator modifier).
+                # Failure is logged LOUDLY at ERROR + alert; a stuck lock bricks trading.
+                if vault_contract is not None and orchestrator_address is not None:
+                    try:
+                        clear_tx = await vault_contract.functions.clearTradingLock(
+                            order_key_bytes
+                        ).transact({"from": orchestrator_address})
+                        clear_receipt = await web3.eth.wait_for_transaction_receipt(
+                            clear_tx, timeout=30
+                        )
+                        if clear_receipt.get("status") == 0:
+                            raise RuntimeError(
+                                f"clearTradingLock tx reverted (order_key={order_key_hex[:10]})"
+                            )
+                        logger.info(
+                            "keeper: clearTradingLock OK order_key=%s clear_tx=%s",
+                            order_key_hex[:10],
+                            (clear_tx.hex() if hasattr(clear_tx, "hex") else str(clear_tx))[:10],
+                        )
+                    except Exception as lock_exc:  # noqa: BLE001
+                        # CRITICAL: a stuck lock means every subsequent trade reverts.
+                        # Log at ERROR, fire alert sink, do NOT silently swallow.
+                        logger.error(
+                            "keeper: CRITICAL — clearTradingLock FAILED for order_key=%s "
+                            "(vault LOCKED — trading is bricked until manually cleared): %s",
+                            order_key_hex[:10],
+                            lock_exc,
+                        )
+                        await send_alert(
+                            f"CRITICAL: clearTradingLock FAILED for order_key={order_key_hex[:10]}. "
+                            f"Vault {vault_address[:10]} is LOCKED — trading is bricked. "
+                            f"Error: {lock_exc}",
+                            AlertSeverity.CRITICAL,
+                            context={
+                                "vault_address": vault_address,
+                                "order_key": order_key_hex,
+                                "orchestrator_address": orchestrator_address,
+                                "error": str(lock_exc),
+                            },
+                            telegram_bot_token=telegram_bot_token,
+                            telegram_chat_id=telegram_chat_id,
+                        )
+                else:
+                    # vault_contract / orchestrator_address not wired — legacy test path.
+                    # Log at DEBUG so CI tests don't produce noisy warnings.
+                    logger.debug(
+                        "keeper: vault_contract or orchestrator_address not provided — "
+                        "clearTradingLock skipped (legacy/test path). "
+                        "Wire vault_contract + orchestrator_address in production (VAULT-06)."
+                    )
+
                 # ── PERPS-02 / JOURNAL-01: publish journal ONLY on OrderExecuted ──
                 # Wired here and NEVER in driver.py (front-running mitigation 9.1 /
                 # D-09 pin scope: trade entries only, gated on the confirmed event).
@@ -258,6 +328,10 @@ async def run_keeper_monitor(
     session_id: str,
     stop_event: asyncio.Event,
     poll_seconds: float = 2.0,
+    # VAULT-06: vault contract + orchestrator address for clearTradingLock after OrderExecuted.
+    # Optional for backward-compat with existing callers; in production MUST be provided.
+    vault_contract: Any | None = None,
+    orchestrator_address: str | None = None,
     # Journal publisher params (PERPS-02): optional, forwarded to execute_ready_orders.
     journal_registry: Any | None = None,
     operator_journal_private_key: bytes | None = None,
@@ -284,13 +358,19 @@ async def run_keeper_monitor(
         stop_event: asyncio.Event — set by the session driver at session end (D-12).
         poll_seconds: Keeper poll interval in seconds (default 2.0 — much faster
                       than the 60s trading cadence so orders aren't left waiting).
+        vault_contract: MTokenVault contract instance (VAULT-06). When provided with
+                        orchestrator_address, clearTradingLock is called after each
+                        OrderExecuted to unlock _tradingLocked and allow subsequent trades.
+        orchestrator_address: Checksummed address of the operator-trade EOA that is the
+                              vault's onlyOrchestrator. The signing middleware on web3
+                              must cover this address (loaded at session start, D-16).
         journal_registry: JournalRegistry contract for onchain attestation (PERPS-02).
         operator_journal_private_key: Raw key bytes for EIP-191 signing.
         pinata_jwt: Pinata JWT for IPFS pinning.
         filebase_access_key: Filebase S3 access key (SigV4) for backup pinning (D-08).
         filebase_secret_key: Filebase S3 secret key (SigV4) for backup pinning (D-08).
         operator_journal_key_address: Hex address for journal key transact from.
-        telegram_bot_token: Optional Telegram token for WARNING alerts.
+        telegram_bot_token: Optional Telegram token for WARNING/CRITICAL alerts.
         telegram_chat_id: Optional Telegram chat ID.
     """
     logger.info(
@@ -317,6 +397,8 @@ async def run_keeper_monitor(
                 redis=redis,
                 session_id=session_id,
                 seq_counter=_seq,
+                vault_contract=vault_contract,
+                orchestrator_address=orchestrator_address,
                 journal_registry=journal_registry,
                 operator_journal_private_key=operator_journal_private_key,
                 pinata_jwt=pinata_jwt,
