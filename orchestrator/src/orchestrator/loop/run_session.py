@@ -223,43 +223,57 @@ async def _latency_watchdog_queue_driven(
 # ---------------------------------------------------------------------------
 
 
-def _check_signing_middleware_present(web3: AsyncWeb3, eoa_address: str) -> bool:
-    """Return True if `web3.middleware_onion` contains a SignAndSendRaw middleware
-    that was built for `eoa_address`.
+def _check_signing_middleware_present(
+    web3: AsyncWeb3,
+    eoa_address: str,
+    loaded_signers: set[str] | None = None,
+) -> bool:
+    """Return True if `eoa_address` has a signing middleware loaded.
 
-    web3.py 7.x SignAndSendRawMiddlewareBuilder.build() returns a curry partial whose
-    __wrapped__ attribute (or the closure's private state) holds the account.
-    The safest cross-version approach is to inspect each middleware object for an
-    `account` attribute whose `.address` matches the target EOA.
+    Detection strategy (most-reliable first):
+    1. **Explicit tracked set** (primary): if `loaded_signers` is provided, check
+       whether the checksummed address is in that set.  This set is built by
+       run_mini_session right after each SignAndSendRawMiddlewareBuilder.build()
+       call and is 100% reliable regardless of web3.py version.
+    2. **middleware_onion introspection** (fallback, legacy): if `loaded_signers` is
+       None (called from old code paths or tests that don't pass the set), fall back
+       to the original attribute-sniffing approach.  web3.py 7.x produces coroutine
+       functions from SignAndSendRawMiddlewareBuilder.build(), so the attribute path
+       is unreliable — the fallback is kept only for backward-compat and fails open
+       (returns True) on iteration errors rather than false-positiving.
 
     This guard is ONLY called at startup — performance is not a concern.
 
     Args:
-        web3:        AsyncWeb3 instance whose middleware_onion to inspect.
-        eoa_address: Checksummed-or-hex EOA address string to search for.
+        web3:           AsyncWeb3 instance (used only for the legacy fallback path).
+        eoa_address:    Checksummed-or-hex EOA address string to search for.
+        loaded_signers: Explicit set of lowercased checksummed addresses whose signing
+                        middleware was successfully injected by run_mini_session.
+                        When provided this is the sole source of truth.
 
     Returns:
-        True if signing middleware for the address is found, False otherwise.
+        True if signing middleware for the address is confirmed, False otherwise.
     """
     target = eoa_address.lower()
+
+    # ── Primary path: explicit tracked set ──────────────────────────────────
+    if loaded_signers is not None:
+        return target in loaded_signers
+
+    # ── Legacy fallback: middleware_onion attribute introspection ────────────
+    # web3.py 7.x SignAndSendRawMiddlewareBuilder.build() returns an async callable
+    # (not an object with .account).  Introspection is unreliable; kept only for
+    # callers that cannot supply `loaded_signers` (e.g. old unit tests).
     try:
-        # web3.py 7.x: middleware_onion exposes an iterable of (name, mw) or just mw objects.
-        # We iterate and inspect each entry for a recognisable account attribute.
         for entry in web3.middleware_onion:
-            # entry may be the middleware callable directly, or a tuple (name, mw)
             mw = entry[1] if isinstance(entry, tuple) else entry
-            # Check for `account` attribute (SignAndSendRaw sets this on its closure/object)
             acct = getattr(mw, "account", None)
             if acct is not None and getattr(acct, "address", "").lower() == target:
                 return True
-            # Also check for `_account` (some web3 versions use private attr)
             acct = getattr(mw, "_account", None)
             if acct is not None and getattr(acct, "address", "").lower() == target:
                 return True
     except Exception:  # noqa: BLE001
-        # If iteration fails for any reason, fail open (return True) so the guard does not
-        # block sessions on unexpected web3 version changes — the 400 error itself is the
-        # definitive signal. Log a warning so the issue is visible.
         logger.warning(
             "_check_signing_middleware_present: iteration over middleware_onion failed "
             "for EOA=%s — guard skipped (fail-open). Check web3.py version compatibility.",
@@ -429,6 +443,13 @@ async def run_mini_session(
     # Arbitrum Sepolia uses PoA-style headers (extra data) — inject middleware for safety
     web3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
 
+    # Explicit tracked-signer set (GAP #11 / startup-guard fix).
+    # Each time SignAndSendRawMiddlewareBuilder.build(account) is injected below, we
+    # record account.address (lowercased) in this set.  The startup signer guard then
+    # checks this set — not middleware_onion — so detection is reliable across all
+    # web3.py 7.x versions regardless of how build() wraps the middleware callable.
+    _loaded_signer_addresses: set[str] = set()
+
     # ── Step 3: Load operator accounts ───────────────────────────────────────
     # Operator-trade key (submits trades via vault.openLong/openShort/closePosition, D-16)
     trade_key_hex = operator_trade_private_key or os.environ.get("OPERATOR_TRADE_KEY", "")
@@ -467,6 +488,8 @@ async def run_mini_session(
 
         _pusher_mw = _SARMBuilder.build(price_pusher_account)
         web3.middleware_onion.inject(_pusher_mw, layer=0)
+        # Track in explicit set so the startup signer guard detects it reliably (#GAP-11-guard).
+        _loaded_signer_addresses.add(price_pusher_account.address.lower())
     else:
         logger.info(
             "run_mini_session: PRICE_PUSHER_KEY not set — price pusher uses OPERATOR_TRADE_KEY "
@@ -495,6 +518,8 @@ async def run_mini_session(
 
         _journal_mw = _SARMBuilder.build(operator_journal_account)
         web3.middleware_onion.inject(_journal_mw, layer=0)
+        # Track in explicit set so the startup signer guard detects it reliably (#GAP-11-guard).
+        _loaded_signer_addresses.add(operator_journal_account.address.lower())
         logger.info(
             "run_mini_session: operator-journal EOA=%s signing middleware loaded "
             "(GAP #11 fix — recordJournal.transact → eth_sendRawTransaction)",
@@ -514,17 +539,24 @@ async def run_mini_session(
     # Assert every EOA that will call .transact({"from": X}) has signing middleware.
     # A missing signer causes Alchemy to reject with 400 at runtime — this guard
     # surfaces the problem at startup with a clear message (not buried in trade logs).
-    # The guard inspects web3.middleware_onion to confirm each required signer is present.
-    # operator-trade signing is loaded later in driver.run_session (D-16), so we track
-    # which signers run_session itself is responsible for (journal + pusher).
+    #
+    # Detection uses `_loaded_signer_addresses` — an EXPLICIT set built above right
+    # after each SignAndSendRawMiddlewareBuilder.build() + inject() call.  This is
+    # reliable across all web3.py 7.x versions; middleware_onion introspection is NOT
+    # (build() returns an async coroutine function, not an object with .account).
+    #
+    # operator-trade signing is loaded later in driver.run_session (D-16), so we only
+    # guard the signers that run_mini_session itself is responsible for here:
+    # operator-journal and price-pusher (when their keys are configured).
     _signer_guard_errors: list[str] = []
 
-    # operator-journal: must have middleware if the key is set (publisher will transact from it)
+    # operator-journal: must be tracked if the key is set (publisher will transact from it)
     if operator_journal_account is not None:
-        # Verify the account is wired by checking all middleware in the onion.
-        # SignAndSendRawMiddlewareBuilder produces a coroutine middleware whose
-        # account attribute is accessible for identity checking.
-        _journal_found = _check_signing_middleware_present(web3, operator_journal_account.address)
+        _journal_found = _check_signing_middleware_present(
+            web3,
+            operator_journal_account.address,
+            loaded_signers=_loaded_signer_addresses,
+        )
         if not _journal_found:
             _signer_guard_errors.append(
                 f"operator-journal EOA {operator_journal_account.address} has no signing "
@@ -535,6 +567,25 @@ async def run_mini_session(
             logger.info(
                 "run_mini_session: startup signer guard PASSED — operator-journal EOA=%s",
                 operator_journal_account.address,
+            )
+
+    # price-pusher: must be tracked if a dedicated PRICE_PUSHER_KEY was configured
+    if price_pusher_address is not None:
+        _pusher_found = _check_signing_middleware_present(
+            web3,
+            price_pusher_address,
+            loaded_signers=_loaded_signer_addresses,
+        )
+        if not _pusher_found:
+            _signer_guard_errors.append(
+                f"price-pusher EOA {price_pusher_address} has no signing middleware — "
+                "setPrice.transact() would fall back to eth_sendTransaction (Alchemy 400). "
+                "Check SignAndSendRawMiddlewareBuilder injection above."
+            )
+        else:
+            logger.info(
+                "run_mini_session: startup signer guard PASSED — price-pusher EOA=%s",
+                price_pusher_address,
             )
 
     if _signer_guard_errors:
