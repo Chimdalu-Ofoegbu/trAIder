@@ -80,6 +80,7 @@ from orchestrator.loop.market_state import (
 )
 from orchestrator.loop.price_pusher import PriceWalk, run_price_pusher
 from orchestrator.loop.session import SessionConfig, format_session_duration, format_time_remaining
+from orchestrator.loop.settlement_keeper import run_settlement_keeper
 from orchestrator.mock_harness import _make_envelope, _publish
 from orchestrator.providers.anthropic_adapter import (
     call_claude,
@@ -1566,6 +1567,74 @@ async def run_session(
             pass  # best-effort close; don't mask shutdown errors
 
         await end_session(db, session_id=config.session_id)
+
+        # SETTLE_ON_END gate (GAP #9): run the settlement keeper ONLY when explicitly
+        # requested at session-end — never on a Phase-3 mid-session gate stop.
+        # Enable by setting SETTLE_ON_END=1 in the environment, or by passing
+        # settle_on_end=True to run_session (not yet added to the signature to avoid
+        # breaking existing callers — checked via os.environ here).
+        #
+        # Requires: settlement_contract, mock_perps, vault_contract, orchestrator
+        # address all wired (they are: vault_contract and operator_trade_address come
+        # from run_session params; mock_perps is the adapter).
+        _settle = os.environ.get("SETTLE_ON_END", "").strip().lower() in ("1", "true", "yes")
+        if _settle:
+            _sett_addr = os.environ.get("SETTLEMENT_CONTRACT_ADDRESS", "").strip()
+            if _sett_addr and vault_contract is not None and operator_trade_address is not None:
+                try:
+                    from orchestrator.loop.run_session import _CONTRACTS_OUT, _load_abi
+
+                    _sett_artifact = (
+                        _CONTRACTS_OUT / "SettlementContract.sol" / "SettlementContract.json"
+                    )
+                    _sett_abi: list = []
+                    try:
+                        _sett_abi = _load_abi(_sett_artifact)
+                    except FileNotFoundError:
+                        logger.warning(
+                            "run_session: SettlementContract artifact not found "
+                            "(SETTLE_ON_END=1 set but forge build not run?)"
+                        )
+                    _settlement_contract = web3.eth.contract(address=_sett_addr, abi=_sett_abi)
+                    logger.warning(
+                        "run_session: SETTLE_ON_END=1 — launching settlement keeper "
+                        "(vault=%s settlement=%s)",
+                        vault[:10],
+                        _sett_addr[:10],
+                    )
+                    settle_result = await run_settlement_keeper(
+                        web3,
+                        mock_perps,
+                        _settlement_contract,
+                        vault_contract,
+                        vault_address=vault,
+                        orchestrator_address=operator_trade_address,
+                        deployer_address=deployer_address,
+                        telegram_bot_token=telegram_bot_token,
+                        telegram_chat_id=telegram_chat_id,
+                    )
+                    logger.warning(
+                        "run_session: settlement keeper complete — status=%s positions_closed=%d",
+                        settle_result.get("status"),
+                        settle_result.get("positions_closed", 0),
+                    )
+                except Exception as sett_exc:  # noqa: BLE001
+                    logger.error(
+                        "run_session: settlement keeper raised (non-fatal, session still ended): %s",
+                        sett_exc,
+                    )
+            else:
+                if not _sett_addr:
+                    logger.warning(
+                        "run_session: SETTLE_ON_END=1 but SETTLEMENT_CONTRACT_ADDRESS not set — "
+                        "settlement keeper skipped. Set SETTLEMENT_CONTRACT_ADDRESS to the "
+                        "SettlementContract address for this vault."
+                    )
+                else:
+                    logger.warning(
+                        "run_session: SETTLE_ON_END=1 but vault_contract or "
+                        "operator_trade_address not wired — settlement keeper skipped."
+                    )
 
     return {
         "cycles": cycle,
