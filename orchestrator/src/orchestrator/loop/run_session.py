@@ -36,7 +36,7 @@ Environment variables read (from .env files — secrets never hardcoded):
   TELEGRAM_BOT_TOKEN           Telegram bot token for alert sink (D-15, optional)
   TELEGRAM_CHAT_ID             Telegram chat ID for alert sink (D-15, optional)
   LATENCY_WATCHDOG_THRESHOLD   createOrder→OrderExecuted latency threshold in seconds
-                               (default: 30 for drill / 300 for spec, D-03)
+                               (default: 120 — sized for ~40-60s Sepolia execution; ARCH-X D-03)
 
 Security (SEC-01 / T-03-31): private keys read from gitignored .env files, passed
 as parameters, NEVER logged verbatim. run_session.py reads them ONCE from env and
@@ -293,7 +293,7 @@ async def run_mini_session(
     redis_url: str | None = None,
     telegram_bot_token: str | None = None,
     telegram_chat_id: str | None = None,
-    latency_watchdog_threshold: float = 30.0,
+    latency_watchdog_threshold: float = 120.0,
     model: str = "claude-opus-4-7",
 ) -> dict:
     """Run the Sepolia mini-session end-to-end (TEST-03 hard gate / D-04).
@@ -705,7 +705,12 @@ async def _async_main() -> None:
     drift = float(os.environ.get("DRIFT", "0.0001"))
     volatility = float(os.environ.get("VOLATILITY", "0.005"))
     venue = os.environ.get("PERPS_VENUE", "mock")
-    threshold = float(os.environ.get("LATENCY_WATCHDOG_THRESHOLD", "30.0"))
+    # ARCH-X D-03: Sepolia execution takes ~40-60s (block.number advances at L1 cadence).
+    # 30s was calibrated for instant anvil execution and false-trips on every normal Sepolia
+    # cycle. Raised to 120s = ~2x worst-case Sepolia execution latency. Genuine stalls
+    # (keeper down, sequencer offline) exceed 3× normal and still trip at 120s.
+    # The threshold remains env-tunable for any chain or test overrides.
+    threshold = float(os.environ.get("LATENCY_WATCHDOG_THRESHOLD", "120.0"))
 
     logger.info(
         "run_session.main: SESSION_DURATION=%ds PERPS_VENUE=%s DRIFT=%s VOLATILITY=%s LATENCY_THRESHOLD=%.0fs",

@@ -92,6 +92,7 @@ from orchestrator.state.db import (
     end_session,
     get_latest_model_status,
     get_unresolved_pending_orders,
+    has_unresolved_pending_order,
     mark_pending_order_reconciled,
     record_journal_pending,
     record_model_status,
@@ -563,6 +564,51 @@ async def run_live_cycle(
 
     # ── Step 8: RECORD-INTENT BEFORE SUBMIT (ORCH-08 / SC-2) ─────────────────
     #
+    # ARCH-X submission gate: before writing the intent row, verify that no prior
+    # order for this vault is still in-flight (status='intent' or 'pending').
+    # On Sepolia, keeper execution takes ~40-60s; without this gate the driver
+    # submits a second order over the first, hits "Vault: order in flight" revert,
+    # and crashes the session.
+    #
+    # Single-owner / no TOCTOU rationale:
+    #   - The decision loop is the SOLE submitter per vault.
+    #   - The keeper only CLEARS (mark_pending_order_executed / reconciled) — never submits.
+    #   - The event loop is cooperative: there is NO async yield between this EXISTS
+    #     check and record_pending_order(status='intent') two lines below, which
+    #     acquires the "lock" by creating the intent row.  No concurrent Task can
+    #     interleave a submission for the same vault in this window.
+    if await has_unresolved_pending_order(db, vault_address=vault):
+        logger.info(
+            "Cycle %d vault=%s: order still in-flight — skipping submission this cycle "
+            "(ARCH-X gate: prior order pending/intent, will retry next cycle)",
+            cycle,
+            vault[:10],
+        )
+        # Journal the skipped cycle as a hold so the audit log is complete.
+        await record_journal_pending(
+            db,
+            vault_address=vault,
+            order_key=f"skipped-inflight-{session_id}-{cycle}",
+            raw_request={"prompt": prompt},
+            raw_response=raw,
+            canonical_decision=decision.model_dump(),
+        )
+        _emit_diagnostic(
+            capture_path=_diag_path,
+            cycle=cycle,
+            prompt=prompt,
+            raw_response=raw,
+            parsed_decision=decision.model_dump(),
+            rationale=getattr(decision, "rationale", None),
+            outcome="skipped_inflight",
+            malformed_reason="order still in-flight — submission skipped (ARCH-X gate)",
+        )
+        return {
+            "status": "skipped_inflight",
+            "action": decision.action,
+            "reason": "order pending — skipping submit this cycle",
+        }
+
     # 8a. Compute intent key (deterministic, no network) and execution block.
     current_block = await web3.eth.get_block_number()
     execution_delay = await mock_perps.functions.executionDelay().call()
@@ -650,16 +696,44 @@ async def run_live_cycle(
             return {"status": "rejected", "reason": reason}
         pos_key_hex: str = existing["position_key"]
         pos_key_bytes = bytes.fromhex(pos_key_hex.removeprefix("0x"))
-        # D-16: submit via vault_contract as operator-trade EOA (Sepolia-capable path)
-        if _use_vault_submit:
-            tx = await vault_contract.functions.closePosition(
-                pos_key_bytes, size_usd_1e30
-            ).transact({"from": operator_trade_address})
-        else:
-            # Legacy anvil from-impersonation (not for Sepolia)
-            tx = await mock_perps.functions.closePosition(pos_key_bytes, size_usd_1e30).transact(
-                {"from": vault}
+        # ARCH-X belt-and-suspenders: wrap .transact() in try/except so that if the
+        # in-flight gate above was somehow bypassed (e.g. extreme timing edge case)
+        # and the vault reverts "Vault: order in flight", the session NEVER crashes.
+        # The except block cleans up the intent row and continues to the next cycle.
+        try:
+            # D-16: submit via vault_contract as operator-trade EOA (Sepolia-capable path)
+            if _use_vault_submit:
+                tx = await vault_contract.functions.closePosition(
+                    pos_key_bytes, size_usd_1e30
+                ).transact({"from": operator_trade_address})
+            else:
+                # Legacy anvil from-impersonation (not for Sepolia)
+                tx = await mock_perps.functions.closePosition(
+                    pos_key_bytes, size_usd_1e30
+                ).transact({"from": vault})
+        except Exception as exc:  # noqa: BLE001
+            reason = f"transact failed (belt-and-suspenders catch): {exc}"
+            _is_inflight = (
+                "order in flight" in str(exc).lower() or "tradinglock" in str(exc).lower()
             )
+            log_fn = logger.warning if _is_inflight else logger.error
+            log_fn(
+                "Cycle %d: %s — intent cleared, loop continues (ARCH-X graceful-catch)",
+                cycle,
+                reason,
+            )
+            await mark_pending_order_reconciled(db, vault_address=vault, order_key=intent_key)
+            _emit_diagnostic(
+                capture_path=_diag_path,
+                cycle=cycle,
+                prompt=prompt,
+                raw_response=raw,
+                parsed_decision=decision.model_dump(),
+                rationale=getattr(decision, "rationale", None),
+                outcome="error",
+                malformed_reason=reason,
+            )
+            return {"status": "error", "reason": reason, "intent_key": intent_key}
     elif decision.action == "adjust":
         # Adjust is not cleanly supported by MockPerps (no partial-size modification).
         # Reject safely rather than silently opening a new position. (D-09 reject pattern)
@@ -688,26 +762,51 @@ async def run_live_cycle(
         return {"status": "rejected", "reason": reason}
     else:
         # action == "open": proceed with openLong/openShort.
-        # D-16: submit via vault_contract as operator-trade EOA (Sepolia-capable path)
-        if _use_vault_submit:
-            open_fn = (
-                vault_contract.functions.openLong
-                if decision.side == "long"
-                else vault_contract.functions.openShort
+        # ARCH-X belt-and-suspenders: same transact-level catch as the close path above.
+        try:
+            # D-16: submit via vault_contract as operator-trade EOA (Sepolia-capable path)
+            if _use_vault_submit:
+                open_fn = (
+                    vault_contract.functions.openLong
+                    if decision.side == "long"
+                    else vault_contract.functions.openShort
+                )
+                tx = await open_fn(
+                    decision.market, size_usd_1e30, leverage_1e4, slippage_bps
+                ).transact({"from": operator_trade_address})
+            else:
+                # Legacy anvil from-impersonation (not for Sepolia)
+                open_fn = (
+                    mock_perps.functions.openLong
+                    if decision.side == "long"
+                    else mock_perps.functions.openShort
+                )
+                tx = await open_fn(
+                    decision.market, size_usd_1e30, leverage_1e4, slippage_bps
+                ).transact({"from": vault})
+        except Exception as exc:  # noqa: BLE001
+            reason = f"transact failed (belt-and-suspenders catch): {exc}"
+            _is_inflight = (
+                "order in flight" in str(exc).lower() or "tradinglock" in str(exc).lower()
             )
-            tx = await open_fn(decision.market, size_usd_1e30, leverage_1e4, slippage_bps).transact(
-                {"from": operator_trade_address}
+            log_fn = logger.warning if _is_inflight else logger.error
+            log_fn(
+                "Cycle %d: %s — intent cleared, loop continues (ARCH-X graceful-catch)",
+                cycle,
+                reason,
             )
-        else:
-            # Legacy anvil from-impersonation (not for Sepolia)
-            open_fn = (
-                mock_perps.functions.openLong
-                if decision.side == "long"
-                else mock_perps.functions.openShort
+            await mark_pending_order_reconciled(db, vault_address=vault, order_key=intent_key)
+            _emit_diagnostic(
+                capture_path=_diag_path,
+                cycle=cycle,
+                prompt=prompt,
+                raw_response=raw,
+                parsed_decision=decision.model_dump(),
+                rationale=getattr(decision, "rationale", None),
+                outcome="error",
+                malformed_reason=reason,
             )
-            tx = await open_fn(decision.market, size_usd_1e30, leverage_1e4, slippage_bps).transact(
-                {"from": vault}
-            )
+            return {"status": "error", "reason": reason, "intent_key": intent_key}
 
     # GAP-1a fix: use wait_for_transaction_receipt (not get_transaction_receipt) to avoid
     # TransactionNotFound race on anvil, and wrap the entire receipt + event-recovery block

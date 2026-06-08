@@ -686,4 +686,85 @@ awaiting native perps venue." Chainlink feeds provide real NAV math.
 
 ---
 
+### [2026-06-08] ARCH-X async-timing hardening — per-vault in-flight order gate
+
+**Root cause (single root assumption, three defects):**
+All three recent defects trace to a single root assumption: ANVIL-ONLY INSTANT-EXECUTION.
+
+- **Defect 1** — `prompt 72h hardcode`: The LLM was told the session was 72 hours long
+  (hardcoded string) regardless of actual session_duration_seconds. On anvil (instant block
+  advancement) the prompt mismatch is invisible. On Sepolia (real time), the model always
+  held because "so much time remaining" — trade-gap root cause. Fixed: session duration is
+  now parameterized in the prompt.
+
+- **Defect 2** — `clearTradingLock timing`: The keeper called clearTradingLock but it was
+  wired AFTER the loop, so the vault's \_tradingLocked flag stayed true between the first trade
+  and the next cycle. On anvil, blocks are instant so the next cycle happened before the flag
+  mattered. On Sepolia, the 40-60s delay meant the second trade arrived before the lock was
+  cleared — bricking the session. Fixed: keeper calls clearTradingLock immediately after
+  OrderExecuted (VAULT-06).
+
+- **Defect 3** — `in-flight submission collision` (this fix): On anvil, each cycle completes
+  before the next one starts. On Sepolia, keeper execution takes ~40-60s. The driver
+  submitted a new order over the in-flight one, hit "Vault: order in flight" revert, and
+  crashed the session. Fixed by ARCH-X (this fix).
+
+**Architecture-X posture (closed by this fix):**
+
+The ARCH-X gate closes the per-vault order-submission coupling with a small guard:
+
+1. **Submission gate (primary)**: Before writing the intent row, `run_live_cycle` calls
+   `has_unresolved_pending_order(db, vault_address=vault)`. If any `intent` or `pending` row
+   exists for this vault, the cycle is skipped with an INFO log: "order pending — skipping
+   submit this cycle". The decision is made (LLM is called), but no order is submitted.
+
+2. **Compare-and-set / single-owner**: The decision loop is the SOLE submitter per vault.
+   The keeper only CLEARS (mark_pending_order_executed / mark_pending_order_reconciled).
+   The cooperative event loop means no async yield occurs between the gate check and
+   `record_pending_order(status='intent')` — the intent row IS the lock acquisition.
+   No queue/queue-consumer refactor was needed.
+
+3. **Belt-and-suspenders graceful catch**: Even if the gate is bypassed (extreme edge case),
+   `.transact()` exceptions (including "Vault: order in flight" ContractLogicError) are caught,
+   the intent row is reconciled, and the session continues. This was previously unhandled and
+   crashed the session.
+
+4. **Per-vault independence**: The gate is keyed by `vault_address`. While Vault A's order
+   settles (~40-60s), Vaults B and C keep deciding/trading every cycle. No global lock.
+
+5. **Latency watchdog** (D-03): Raised default threshold from 30s to 120s. The old 30s
+   threshold was calibrated for instant anvil execution and false-tripped on every normal
+   Sepolia cycle (~40-60s). 120s ≈ 2× worst-case Sepolia execution; genuine stalls
+   (keeper down, sequencer offline) exceed 3× normal and still trip at 120s. Still
+   env-tunable via LATENCY_WATCHDOG_THRESHOLD.
+
+**Bounded cost**: A vault skips ~1 cycle per trade (the cycle during which the prior order
+is executing). At 60s cadence and ~40-60s Sepolia execution, each vault trades roughly
+every other cycle at worst. Aggregate demo activity is preserved by per-vault independence:
+while one vault waits, the others continue.
+
+**Y (full decouple via queue) = post-hackathon**: A full producer/consumer queue
+decoupling the decision loop from the submission loop would eliminate the skip entirely.
+Out of scope for the hackathon — the ARCH-X gate is sufficient for the demo window.
+
+**Regression suite**: `orchestrator/tests/unit/test_arch_x_async_timing.py` covers all
+six items: (a) gate skips, (b) graceful revert catch, (c) keeper resolution clears state,
+(d) per-vault independence, (e) stale-lock/race (compare-and-set), (f) watchdog thresholds.
+
+**Async path audit under ~40-60s confirmation (clean findings):**
+
+- `reconcile_pending_orders` (ORCH-08): correct — checks on-chain pendingOrders(key_bytes)
+  vault field; if non-zero, the order IS on-chain and the keeper will execute it; no
+  resubmit. No instant-confirmation assumption.
+- `journal completion`: the previous `pinned_primary`-only state was caused by the session
+  crash (before Filebase backfill ran). With the gate preventing crashes, journal
+  completion now runs fully. The publish_journal_entry call is already in a try/except
+  in the keeper so failures don't crash the monitor.
+- `wait_for_transaction_receipt(timeout=30)` on createOrder: the 30s timeout is for the
+  TRANSACTION RECEIPT (tx landing in a block — seconds on Sepolia), NOT for keeper execution
+  (40-60s). The two events are distinct. The driver's timeout is fine.
+- No other instant-confirmation assumptions found in the decision/keeper/journal path.
+
+---
+
 _End of Known Issues log. Append new entries above this line._

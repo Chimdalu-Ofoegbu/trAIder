@@ -136,6 +136,12 @@ async def test_close_action_calls_close_position_not_open() -> None:
         patch("orchestrator.loop.driver.validate_business_rules", return_value=None),
         patch("backend.ws.channels.channel_for", return_value="test-channel"),
         patch("orchestrator.loop.driver._publish", new_callable=AsyncMock),
+        # ARCH-X: no in-flight order — gate passes (False = no prior pending)
+        patch(
+            "orchestrator.loop.driver.has_unresolved_pending_order",
+            new_callable=AsyncMock,
+            return_value=False,
+        ),
     ):
         mock_call_claude.return_value = MagicMock()
         mock_extract.return_value = {"action": "close", "market": "ETH"}
@@ -237,6 +243,12 @@ async def test_close_with_no_open_position_is_rejected() -> None:
         patch("orchestrator.loop.driver.validate_business_rules", return_value=None),
         patch("backend.ws.channels.channel_for", return_value="test-channel"),
         patch("orchestrator.loop.driver._publish", new_callable=AsyncMock),
+        # ARCH-X: no in-flight order — gate passes (False = no prior pending)
+        patch(
+            "orchestrator.loop.driver.has_unresolved_pending_order",
+            new_callable=AsyncMock,
+            return_value=False,
+        ),
     ):
         mock_call_claude.return_value = MagicMock()
         mock_extract.return_value = {"action": "close", "market": "ETH"}

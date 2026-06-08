@@ -40,6 +40,9 @@ coverage/
 *.webp
 *.gif
 
+# ── Diagnostic / runtime output (DIAGNOSTIC_CAPTURE env — TEST-03 investigation) ─
+diag*.jsonl
+
 # ── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]

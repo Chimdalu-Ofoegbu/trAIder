@@ -615,6 +615,54 @@ async def get_unresolved_pending_orders(
 
 
 # ---------------------------------------------------------------------------
+# has_unresolved_pending_order — per-vault in-flight gate (ARCH-X submission guard)
+# ---------------------------------------------------------------------------
+
+
+async def has_unresolved_pending_order(
+    session: AsyncSession,
+    *,
+    vault_address: str,
+) -> bool:
+    """Return True if any status='intent' or status='pending' row exists for this vault.
+
+    ARCH-X submission gate: called by run_live_cycle BEFORE writing the intent row so
+    the driver can skip a submission cycle when a prior order is still in-flight.
+
+    This is a cheap EXISTS query (index scan on vault_address + status).  The result is
+    used to gate the cycle — if True, the cycle is skipped with an INFO log rather than
+    over-submitting and hitting the "Vault: order in flight" revert.
+
+    Single-owner / no TOCTOU: the decision loop is the SOLE submitter per vault (the
+    keeper only CLEARs via mark_pending_order_executed / mark_pending_order_reconciled).
+    The driver's event loop is cooperative — there is exactly one asyncio Task running
+    the cycle loop per vault, and no async yield occurs between this check and the
+    record_pending_order(status='intent') call that CREATES the lock row.  That makes
+    the read→check→create sequence effectively atomic within a single-vault session.
+
+    Args:
+        session: AsyncSession bound to orchestrator_user role.
+        vault_address: Vault address to check.
+
+    Returns:
+        True if at least one unresolved row exists; False if the vault is clear.
+    """
+    result = await session.execute(
+        text(
+            """
+            SELECT 1
+            FROM orchestrator.pending_orders
+            WHERE vault_address = :vault_address
+              AND status IN ('intent', 'pending')
+            LIMIT 1
+            """
+        ),
+        {"vault_address": vault_address},
+    )
+    return result.fetchone() is not None
+
+
+# ---------------------------------------------------------------------------
 # create_session / end_session — session lifecycle (D-12, ORCH plan 05 startup)
 # ---------------------------------------------------------------------------
 
