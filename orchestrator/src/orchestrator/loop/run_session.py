@@ -29,6 +29,8 @@ Environment variables read (from .env files — secrets never hardcoded):
   SESSION_DURATION             Session duration in seconds (default: 1800 = 30min)
   SESSION_CADENCE              Trading cadence in seconds (default: 60)
   PRICE_SEED                   PriceWalk seed (default: 42, D-01)
+  DRIFT                        PriceWalk per-cycle log-normal drift fraction (default: 0.0001, D-01)
+  VOLATILITY                   PriceWalk per-cycle std-dev fraction (default: 0.005, D-01)
   ORCHESTRATOR_DATABASE_URL    Async Postgres URL (postgresql+asyncpg://...)
   REDIS_URL                    Redis URL for WS fanout (optional)
   TELEGRAM_BOT_TOKEN           Telegram bot token for alert sink (D-15, optional)
@@ -285,6 +287,8 @@ async def run_mini_session(
     session_duration_seconds: int = 1800,
     cadence_seconds: float = 60.0,
     price_seed: int = 42,
+    drift: float = 0.0001,
+    volatility: float = 0.005,
     database_url: str | None = None,
     redis_url: str | None = None,
     telegram_bot_token: str | None = None,
@@ -318,6 +322,8 @@ async def run_mini_session(
         session_duration_seconds:         Session run length (default 1800 = 30min).
         cadence_seconds:                  Trading cadence (default 60s).
         price_seed:                       PriceWalk seed (D-01).
+        drift:                            Per-cycle log-normal drift fraction (D-01, default 0.0001).
+        volatility:                       Per-cycle std-dev fraction (D-01, default 0.005).
         database_url:                     Async Postgres URL.
         redis_url:                        Redis URL for WS fanout (optional).
         telegram_bot_token:               Telegram bot token (D-15, optional).
@@ -547,13 +553,17 @@ async def run_mini_session(
         session_duration_seconds=session_duration_seconds,
         cadence_seconds=cadence_seconds,
         price_seed=price_seed,
+        drift=drift,
+        volatility=volatility,
         execution_delay_cycles=1,  # D-13 default
     )
     logger.warning(
-        "SESSION CONFIG: duration=%ss cadence=%ss seed=%s model=%s venue=%s vault=%s",
+        "SESSION CONFIG: duration=%ss cadence=%ss seed=%s drift=%s volatility=%s model=%s venue=%s vault=%s",
         session_duration_seconds,
         cadence_seconds,
         price_seed,
+        drift,
+        volatility,
         model,
         venue,
         vault_claude_addr[:10],
@@ -692,13 +702,17 @@ async def _async_main() -> None:
     session_duration = int(os.environ.get("SESSION_DURATION", "1800"))
     cadence = float(os.environ.get("SESSION_CADENCE", "60.0"))
     seed = int(os.environ.get("PRICE_SEED", "42"))
+    drift = float(os.environ.get("DRIFT", "0.0001"))
+    volatility = float(os.environ.get("VOLATILITY", "0.005"))
     venue = os.environ.get("PERPS_VENUE", "mock")
     threshold = float(os.environ.get("LATENCY_WATCHDOG_THRESHOLD", "30.0"))
 
     logger.info(
-        "run_session.main: SESSION_DURATION=%ds PERPS_VENUE=%s LATENCY_THRESHOLD=%.0fs",
+        "run_session.main: SESSION_DURATION=%ds PERPS_VENUE=%s DRIFT=%s VOLATILITY=%s LATENCY_THRESHOLD=%.0fs",
         session_duration,
         venue,
+        drift,
+        volatility,
         threshold,
     )
 
@@ -706,6 +720,8 @@ async def _async_main() -> None:
         session_duration_seconds=session_duration,
         cadence_seconds=cadence,
         price_seed=seed,
+        drift=drift,
+        volatility=volatility,
         perps_venue=venue,
         latency_watchdog_threshold=threshold,
         # All secret params read from env inside run_mini_session
