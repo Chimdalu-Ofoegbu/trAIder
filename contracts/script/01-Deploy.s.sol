@@ -280,7 +280,19 @@ contract DeployPhase1 is Script {
         );
         console2.log("SessionFactory deployed:", address(factory));
 
-        // ── Step 4: Transfer oracle + journal ownership to the factory ────────
+        // ── Step 4a: Authorize the publisher EOA on JournalRegistry (GAP #5) ──────
+        //    The Python JournalPublisher sends recordJournal from the OPERATOR_JOURNAL_KEY
+        //    EOA. The registry auth requires authorizedVaults || authorizedPublishers || owner.
+        //    The EOA is neither a vault nor the owner after transferOwnership, so every
+        //    on-chain journal would revert "unauthorized" without this call.
+        //
+        //    ORDERING: MUST happen while the deployer still owns the registry —
+        //    BEFORE transferOwnership transfers ownership to the factory.
+        journal.setAuthorizedPublisher(operatorJournalKey, true);
+        console2.log("JournalRegistry.setAuthorizedPublisher: authorized publisher EOA (GAP #5)");
+        console2.log("  Publisher EOA:", operatorJournalKey);
+
+        // ── Step 4b: Transfer oracle + journal ownership to the factory ───────
         //    registerVault is owner-gated on both registries (Plans 02/03).
         //    The factory must own them before calling createSession (Key Decision 01-06).
         oracle.transferOwnership(address(factory));

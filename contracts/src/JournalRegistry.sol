@@ -10,8 +10,15 @@ import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/Messa
 ///         Rejects duplicate `tradeHash` writes — providing chain-layer idempotency for
 ///         the orchestrator's `(vault, order_key)` journal publication path (JOURNAL-04).
 ///
-///         Only registered session vaults or the owner (operator) may call `recordJournal`.
-///         Vault registration is performed by SessionFactory via `registerVault` (Plan 06).
+///         Caller-auth: `recordJournal` is open to three caller classes:
+///           1. Registered session vaults (`authorizedVaults[msg.sender]`) — set by
+///              SessionFactory via `registerVault` (Plan 06).
+///           2. Authorized off-chain publishers (`authorizedPublishers[msg.sender]`) — set
+///              by the owner via `setAuthorizedPublisher`. This path is for the Python
+///              JournalPublisher EOA (OPERATOR_JOURNAL_KEY) which submits journal entries
+///              on behalf of the operator. The operator signature (ecrecover gate, D-10)
+///              still gates authenticity — this only adds a caller-auth path.
+///           3. The owner (operator) directly — kept as a safe fallback.
 ///
 ///         No audit-payload bytes are stored on-chain — only the IPFS CID, the
 ///         EIP-191 operator-journal signature, and the block timestamp (JREG-01).
@@ -63,6 +70,14 @@ contract JournalRegistry is Ownable {
     ///         Set exclusively by the owner via registerVault.
     mapping(address => bool) public authorizedVaults;
 
+    /// @notice Off-chain publisher addresses authorized to call recordJournal.
+    ///         The Python JournalPublisher EOA (OPERATOR_JOURNAL_KEY) is authorized here so it
+    ///         can submit entries on behalf of the operator without being a registered vault.
+    ///         The ecrecover gate (D-10) still enforces authenticity — this mapping only controls
+    ///         who may call the function, not whose signature is accepted.
+    ///         Set exclusively by the owner via setAuthorizedPublisher.
+    mapping(address => bool) public authorizedPublishers;
+
     /// @notice Operator-journal key. recordJournal verifies the EIP-191 sig against this (D-10).
     /// @dev Immutable — set at deploy time. Rotation requires redeploy (no governance attack surface).
     address public immutable OPERATOR_JOURNAL_KEY;
@@ -74,8 +89,13 @@ contract JournalRegistry is Ownable {
     /// @notice Emitted when a journal entry is recorded.
     /// @param tradeHash  keccak256 identifier of the on-chain trade (from OrderExecuted).
     /// @param ipfsCid    IPFS CID of the journal payload (bytes32-packed CIDv1).
-    /// @param caller     Address that submitted the entry (registered vault or owner).
+    /// @param caller     Address that submitted the entry (registered vault, authorized publisher, or owner).
     event JournalRecorded(bytes32 indexed tradeHash, bytes32 indexed ipfsCid, address indexed caller);
+
+    /// @notice Emitted when an authorized publisher is added or removed.
+    /// @param publisher  The publisher address being granted or revoked.
+    /// @param allowed    true = authorized, false = revoked.
+    event AuthorizedPublisherSet(address indexed publisher, bool allowed);
 
     // =========================================================================
     // Constructor
@@ -101,6 +121,24 @@ contract JournalRegistry is Ownable {
         authorizedVaults[vault] = true;
     }
 
+    /// @notice Grants or revokes the off-chain publisher authorization for an address.
+    /// @dev Intended for the Python JournalPublisher EOA (OPERATOR_JOURNAL_KEY) so it can
+    ///      call `recordJournal` without being a registered session vault. The ecrecover gate
+    ///      (D-10) still enforces authenticity — this function only controls caller-level access.
+    ///
+    ///      ORDERING: In the deploy script, this MUST be called BEFORE `transferOwnership`
+    ///      to the SessionFactory, while the deployer still owns the registry. Once ownership
+    ///      is transferred, the factory becomes the owner and can no longer be called by the
+    ///      deployer's EOA.
+    ///
+    /// @param publisher  Address to authorize or deauthorize. Must be non-zero.
+    /// @param allowed    true = authorize, false = revoke.
+    function setAuthorizedPublisher(address publisher, bool allowed) external onlyOwner {
+        require(publisher != address(0), "JournalRegistry: zero publisher");
+        authorizedPublishers[publisher] = allowed;
+        emit AuthorizedPublisherSet(publisher, allowed);
+    }
+
     /// @notice Records one `{ipfsCid, operatorSig, timestamp}` entry for `tradeHash`.
     /// @dev Reverts if `tradeHash` is already registered (chain-layer idempotency, JREG-01).
     ///      Only registered vaults or the owner may call this function.
@@ -124,7 +162,10 @@ contract JournalRegistry is Ownable {
     /// @param ipfsCid    bytes32-packed IPFS CIDv1 of the journal payload. Must be non-zero.
     /// @param operatorSig EIP-191 personal_sign by the operator-journal key. Verified on-chain.
     function recordJournal(bytes32 tradeHash, bytes32 ipfsCid, bytes calldata operatorSig) external {
-        require(authorizedVaults[msg.sender] || msg.sender == owner(), "JournalRegistry: unauthorized");
+        require(
+            authorizedVaults[msg.sender] || authorizedPublishers[msg.sender] || msg.sender == owner(),
+            "JournalRegistry: unauthorized"
+        );
         require(tradeHash != bytes32(0), "JournalRegistry: zero tradeHash");
         require(ipfsCid != bytes32(0), "JournalRegistry: zero ipfsCid");
         require(!registered[tradeHash], "JournalRegistry: duplicate tradeHash");

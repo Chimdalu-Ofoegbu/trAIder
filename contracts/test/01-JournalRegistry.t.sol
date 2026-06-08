@@ -174,4 +174,87 @@ contract JournalRegistryTest is Test {
     function test_JournalRegistry_OperatorJournalKeySet() public view {
         assertEq(registry.OPERATOR_JOURNAL_KEY(), operatorJournalKey, "OPERATOR_JOURNAL_KEY mismatch");
     }
+
+    // =========================================================================
+    // Tests 7-10: authorizedPublishers — GAP #5 fix
+    // =========================================================================
+
+    /// @notice Proves that an authorized publisher EOA can call recordJournal with a
+    ///         valid operator signature (caller-auth + ecrecover gate both satisfied).
+    /// @dev GAP #5: Python JournalPublisher sends from the OPERATOR_JOURNAL_KEY EOA.
+    ///      Before this fix the EOA was neither a vault nor owner → every on-chain journal
+    ///      reverted "unauthorized". setAuthorizedPublisher grants the caller-auth path.
+    function test_JournalRegistry_AuthorizedPublisher_Accepts() public {
+        // Register the publisher EOA (simulating deploy-script setAuthorizedPublisher call).
+        address publisherEOA = makeAddr("publisher");
+        registry.setAuthorizedPublisher(publisherEOA, true);
+
+        bytes memory sig = _buildSig(tradeHash, cid);
+
+        // Publisher (not a vault) calls recordJournal — must succeed.
+        vm.prank(publisherEOA);
+        registry.recordJournal(tradeHash, cid, sig);
+
+        assertTrue(registry.registered(tradeHash), "registered should be true after publisher record");
+        (bytes32 storedCid,,) = registry.journals(tradeHash);
+        assertEq(storedCid, cid, "stored ipfsCid should match");
+    }
+
+    /// @notice Proves that an address that is NOT in authorizedPublishers still reverts
+    ///         "unauthorized" — the mapping does not open a blanket hole.
+    function test_JournalRegistry_UnauthorizedEOA_StillReverts() public {
+        // Stranger has no vault registration and no publisher authorization.
+        bytes memory sig = _buildSig(tradeHash, cid);
+
+        vm.prank(stranger);
+        vm.expectRevert("JournalRegistry: unauthorized");
+        registry.recordJournal(tradeHash, cid, sig);
+    }
+
+    /// @notice Proves that a valid publisher + WRONG operator signature still reverts
+    ///         "invalid operator sig" — the ecrecover gate is enforced even after caller-auth.
+    /// @dev This is the critical two-layer check: caller-auth (mapping) + authenticity (ecrecover).
+    ///      Being in authorizedPublishers bypasses the caller check but NOT the sig check.
+    function test_JournalRegistry_AuthorizedPublisher_WrongSig_Reverts() public {
+        address publisherEOA = makeAddr("publisher");
+        registry.setAuthorizedPublisher(publisherEOA, true);
+
+        // Build a sig with a WRONG private key so ecrecover returns a different address.
+        uint256 wrongKey = 0xBAD5EED;
+        bytes32 packed = keccak256(abi.encodePacked(tradeHash, cid));
+        bytes32 ethHash = MessageHashUtils.toEthSignedMessageHash(packed);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(wrongKey, ethHash);
+        bytes memory badSig = abi.encodePacked(r, s, v);
+
+        // Caller IS authorized, but sig is wrong — must revert at the ecrecover gate.
+        vm.prank(publisherEOA);
+        vm.expectRevert("JournalRegistry: invalid operator sig");
+        registry.recordJournal(tradeHash, cid, badSig);
+    }
+
+    /// @notice Proves that setAuthorizedPublisher is owner-only (OZ Ownable gate).
+    function test_JournalRegistry_SetAuthorizedPublisher_OnlyOwner() public {
+        address anyAddr = makeAddr("anyAddr");
+        vm.prank(stranger);
+        vm.expectRevert(); // OZ OwnableUnauthorizedAccount custom error
+        registry.setAuthorizedPublisher(anyAddr, true);
+    }
+
+    /// @notice Proves that setAuthorizedPublisher emits AuthorizedPublisherSet event.
+    function test_JournalRegistry_SetAuthorizedPublisher_EmitsEvent() public {
+        address publisherEOA = makeAddr("publisher");
+
+        vm.expectEmit(true, false, false, true);
+        emit JournalRegistry.AuthorizedPublisherSet(publisherEOA, true);
+
+        registry.setAuthorizedPublisher(publisherEOA, true);
+        assertTrue(registry.authorizedPublishers(publisherEOA), "publisher should be authorized");
+
+        // Revocation path: emit false + mapping cleared.
+        vm.expectEmit(true, false, false, true);
+        emit JournalRegistry.AuthorizedPublisherSet(publisherEOA, false);
+
+        registry.setAuthorizedPublisher(publisherEOA, false);
+        assertFalse(registry.authorizedPublishers(publisherEOA), "publisher should be revoked");
+    }
 }
