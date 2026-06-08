@@ -92,3 +92,8 @@ tmp/
 # ── Docker ───────────────────────────────────────────────────────────────────
 # docker volumes and local state — never tracked
 .docker/
+
+# Phase-03 mini-session scratch run logs (final PASS run preserved in .planning/phases/03-*/)
+/gate.jsonl
+/confirm.jsonl
+/final.jsonl
