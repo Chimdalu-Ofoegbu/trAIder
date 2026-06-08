@@ -61,6 +61,49 @@ class SessionConfig:
     paused_poll_interval_seconds: float = 180.0  # D-16 back-off probe interval
 
 
+def format_session_duration(total_seconds: int) -> str:
+    """Return a human-readable string for the TOTAL session duration (D-11).
+
+    Renders the same ``total_seconds`` value used by ``format_time_remaining`` so
+    that the ``{{session_duration}}`` placeholder in system.md is always consistent
+    with the ``{{time_remaining}}`` countdown — both are derived from
+    ``SessionConfig.session_duration_seconds`` (never a hardcoded constant).
+
+    Examples
+    --------
+    >>> format_session_duration(259200)  # 72 hours
+    '72 hours'
+    >>> format_session_duration(10800)   # 3 hours
+    '3 hours'
+    >>> format_session_duration(1800)    # 30 minutes
+    '30 minutes'
+    >>> format_session_duration(155)     # 2 minutes 35 seconds
+    '2 minutes 35 seconds'
+
+    Parameters
+    ----------
+    total_seconds:
+        ``SessionConfig.session_duration_seconds``.
+
+    Returns
+    -------
+    str
+        Human-readable duration, e.g. ``"3 hours"``, ``"30 minutes"``,
+        ``"2 minutes 35 seconds"``.  Uses the largest non-zero unit as the
+        primary unit; sub-units are appended only when they carry non-zero value
+        and the primary unit is minutes or seconds.
+    """
+    h, rem = divmod(int(total_seconds), 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h} hour{'s' if h != 1 else ''}"
+    if m > 0 and s == 0:
+        return f"{m} minute{'s' if m != 1 else ''}"
+    if m > 0:
+        return f"{m} minute{'s' if m != 1 else ''} {s} second{'s' if s != 1 else ''}"
+    return f"{s} second{'s' if s != 1 else ''}"
+
+
 def format_time_remaining(elapsed_seconds: float, total_seconds: int) -> str:
     """Return a truthful human-readable countdown string (D-11).
 

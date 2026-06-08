@@ -94,6 +94,7 @@ def test_render_prompt_no_unfilled_placeholders() -> None:
         available_usdc=10000.0,
         recent_decisions="No decisions yet.",
         market_table=DUMMY_MARKET_TABLE,
+        session_duration="15 minutes",
     )
     assert "{{" not in rendered, "Unfilled Jinja2 opening braces remain in output"
     assert "}}" not in rendered, "Unfilled Jinja2 closing braces remain in output"
@@ -108,6 +109,7 @@ def test_render_prompt_contains_market_table_content() -> None:
         available_usdc=5000.0,
         recent_decisions="hold cycle 1",
         market_table=DUMMY_MARKET_TABLE,
+        session_duration="1 hour",
     )
     assert "$3,000.00" in rendered, "market_table content missing from rendered prompt"
 
@@ -121,6 +123,7 @@ def test_render_prompt_contains_formatted_usdc() -> None:
         available_usdc=10000.0,
         recent_decisions="",
         market_table=DUMMY_MARKET_TABLE,
+        session_duration="15 minutes",
     )
     # The render formats available_usdc as f"{available_usdc:,.2f}"
     assert "10,000.00" in rendered, (
@@ -139,6 +142,7 @@ def test_render_prompt_on_real_system_md_does_not_raise() -> None:
         available_usdc=10000.0,
         recent_decisions="No decisions yet.",
         market_table=DUMMY_MARKET_TABLE,
+        session_duration="15 minutes",
     )
     assert isinstance(rendered, str)
     assert len(rendered) > 100, "Rendered prompt suspiciously short"

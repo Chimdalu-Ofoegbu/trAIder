@@ -146,12 +146,14 @@ def render_prompt(
     available_usdc: float,
     recent_decisions: str,
     market_table: str,
+    session_duration: str,
 ) -> str:
-    """Fill the six frozen system.md Jinja2 placeholders and return the full prompt.
+    """Fill the seven frozen system.md Jinja2 placeholders and return the full prompt.
 
     Placeholder mapping (all must be present or Jinja2 raises ``UndefinedError``):
     - ``{{nav_table}}`` — vault NAV table string
     - ``{{time_remaining}}`` — truthful countdown from ``format_time_remaining()`` (D-11)
+    - ``{{session_duration}}`` — total session length from ``format_session_duration()`` (D-11)
     - ``{{positions_table}}`` — open positions string
     - ``{{available_usdc}}`` — formatted USDC balance (e.g. ``"10,000.00"``)
     - ``{{recent_decisions}}`` — last-5-cycles decision summary
@@ -175,6 +177,10 @@ def render_prompt(
         Summary of last 5 decisions (plain text or mini table).
     market_table:
         Terse market data table (from ``format_market_table()``).
+    session_duration:
+        Human-readable total session duration (from ``session.format_session_duration()``).
+        MUST be derived from the same ``SessionConfig.session_duration_seconds`` as
+        ``time_remaining`` so the prompt is internally consistent (D-11).
 
     Returns
     -------
@@ -188,6 +194,7 @@ def render_prompt(
         available_usdc=f"{available_usdc:,.2f}",
         recent_decisions=recent_decisions,
         market_table=market_table,
+        session_duration=session_duration,
     )
 
 

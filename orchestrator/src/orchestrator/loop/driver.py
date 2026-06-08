@@ -79,7 +79,7 @@ from orchestrator.loop.market_state import (
     read_mark_prices,
 )
 from orchestrator.loop.price_pusher import PriceWalk, run_price_pusher
-from orchestrator.loop.session import SessionConfig, format_time_remaining
+from orchestrator.loop.session import SessionConfig, format_session_duration, format_time_remaining
 from orchestrator.mock_harness import _make_envelope, _publish
 from orchestrator.providers.anthropic_adapter import (
     call_claude,
@@ -300,6 +300,7 @@ async def run_live_cycle(
         prices = await read_mark_prices(aggregators)
         market_table = build_market_table(walk, prices)
     time_remaining = format_time_remaining(elapsed_seconds, config.session_duration_seconds)
+    session_duration = format_session_duration(config.session_duration_seconds)
 
     from orchestrator.loop.market_state import render_prompt
 
@@ -310,6 +311,7 @@ async def run_live_cycle(
         available_usdc=available_usdc,
         recent_decisions=recent_decisions,
         market_table=market_table,
+        session_duration=session_duration,
     )
 
     # TEST-03 diagnostic capture — resolved once per cycle; None when env unset/empty.
