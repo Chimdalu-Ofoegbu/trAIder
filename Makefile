@@ -17,7 +17,7 @@
 #   pnpm (make gen-types: frontend)
 # =============================================================================
 
-.PHONY: up seed verify-stack reset down db-reset gen-types coverage deploy-sepolia deploy-sepolia-clean run-mini-session test-03-gate help
+.PHONY: up seed verify-stack reset down db-reset gen-types coverage deploy-sepolia deploy-sepolia-clean run-mini-session test-03-gate verify-sepolia help
 
 # ── Environment ───────────────────────────────────────────────────────────────
 # Source .env.example for defaults (real values come from .env.* gitignored files)
@@ -275,6 +275,47 @@ test-03-gate:
 	@echo "      4. createOrder->execute->journal E2E (live run only — Task 3)"
 	@echo "      5. >=30min clean continuous run (live run only — Task 3)"
 
+# ── verify-sepolia ────────────────────────────────────────────────────────────
+# Step 4 scanner: scripted post-deploy Sepolia integration verification harness.
+# Exercises every cell of 03-INTEGRATION-MATRIX.md against the real deployed
+# Sepolia contracts (AUTH / STATE / TIMING). READ-ONLY — no transactions submitted.
+#
+# Canary cell: AUTH-3 (journal.authorizedPublishers(operator-journal EOA))
+#   - FAILS on pre-redeploy deployment (GAP #5 not yet fixed) — expected
+#   - MUST PASS after the redeploy that fixes GAP #5
+#
+# Usage:
+#   make verify-sepolia                  # uses SEPOLIA_RPC from .env
+#   SEPOLIA_RPC=https://... make verify-sepolia
+#
+# No-make equivalent (Windows git-bash):
+#   source .env 2>/dev/null
+#   uv run --project orchestrator python -m orchestrator.verify_integration
+#
+# Pytest wrapper (granular per-cell diagnostics):
+#   source .env 2>/dev/null
+#   uv run --project orchestrator pytest \
+#       orchestrator/tests/integration/test_post_deploy_verification.py -v --tb=short
+#
+# Required env:
+#   SEPOLIA_RPC      Alchemy / public Arbitrum Sepolia HTTPS endpoint
+#                    (default: https://sepolia-rollup.arbitrum.io/rpc if unset)
+#
+# Optional env (addresses only, NOT private keys):
+#   DEPLOYER_ADDRESS             Deployer EOA address (fallback: from matrix)
+#   OPERATOR_TRADE_ADDRESS       Operator-trade EOA address (fallback: from matrix)
+#   OPERATOR_JOURNAL_KEY_ADDR    Operator-journal EOA address (fallback: from matrix)
+verify-sepolia:
+	@echo "==> Post-deploy Sepolia integration verification (Step 4 scanner)..."
+	@echo "    Manifest: deployments/sepolia.json"
+	@echo "    RPC: $${SEPOLIA_RPC:-https://sepolia-rollup.arbitrum.io/rpc (public fallback)}"
+	@echo "    Canary: AUTH-3 (journal.authorizedPublishers) — FAIL=pre-redeploy, PASS=post-GAP#5-fix"
+	@echo ""
+	SEPOLIA_RPC=$${SEPOLIA_RPC:-https://sepolia-rollup.arbitrum.io/rpc} \
+		uv run --project orchestrator python -m orchestrator.verify_integration
+	@echo ""
+	@echo "==> verify-sepolia complete. Exit 0 = all-pass. Exit 1 = gap(s) found."
+
 # ── help ──────────────────────────────────────────────────────────────────────
 help:
 	@echo "trAIder Makefile targets:"
@@ -300,5 +341,10 @@ help:
 	@echo "                              Stage 1: forge fork suite (GMX@405000000 + Sequencer@353000000)"
 	@echo "                              Stage 2: Python assertions (nav-tick + both-gateways CID)"
 	@echo "                              Requires: ARB_RPC (Stage 1), PINATA_JWT (Stage 2 live)"
+	@echo ""
+	@echo "  make verify-sepolia         Post-deploy Sepolia integration verification (Step 4 scanner)"
+	@echo "                              READ-ONLY: all cells from 03-INTEGRATION-MATRIX.md"
+	@echo "                              Canary: AUTH-3 journal.authorizedPublishers (GAP #5 fix signal)"
+	@echo "                              No-make: uv run --project orchestrator python -m orchestrator.verify_integration"
 	@echo ""
 	@echo "Prerequisites: Docker Desktop, Foundry (cast/forge), uv, pnpm"
