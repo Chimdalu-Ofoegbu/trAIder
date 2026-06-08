@@ -60,8 +60,11 @@ FORBIDDEN in this module (D-13 / T-02-21):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import time
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -96,6 +99,60 @@ from orchestrator.state.db import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# _emit_diagnostic — gated observe-only JSONL capture (TEST-03 trade-gap investigation)
+#
+# Activated ONLY when env var DIAGNOSTIC_CAPTURE is set to a non-empty file path.
+# When unset/empty: this function is a pure no-op with zero overhead.
+# The try/except ensures a capture failure can NEVER affect the trading cycle.
+# ---------------------------------------------------------------------------
+
+
+def _emit_diagnostic(  # noqa: PLR0913 (many params by design — diagnostic)
+    *,
+    capture_path: str | None,
+    cycle: int,
+    prompt: str | None,
+    raw_response: Any,
+    parsed_decision: dict | None,
+    rationale: str | None,
+    outcome: str,
+    malformed_reason: str | None,
+) -> None:
+    """Append one JSONL line to DIAGNOSTIC_CAPTURE file (observe-only, TEST-03).
+
+    One line per cycle, covering every branch (hold / open / malformed / rejected).
+    No-op when capture_path is None or empty.  Never raises — capture errors are
+    logged as warnings so the trading cycle is never affected.
+    """
+    if not capture_path:
+        return
+    try:
+        record = {
+            "cycle": cycle,
+            "ts": datetime.now(UTC).isoformat(),
+            "prompt": prompt,
+            "raw_response": (
+                raw_response
+                if isinstance(raw_response, dict | list | type(None))
+                else str(raw_response)
+            ),
+            "parsed_decision": parsed_decision,
+            "rationale": rationale,
+            "outcome": outcome,
+            "malformed_reason": malformed_reason,
+        }
+        with open(capture_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, default=str) + "\n")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "DIAGNOSTIC_CAPTURE write failed (cycle=%d, path=%s): %s — cycle unaffected",
+            cycle,
+            capture_path,
+            exc,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +312,9 @@ async def run_live_cycle(
         market_table=market_table,
     )
 
+    # TEST-03 diagnostic capture — resolved once per cycle; None when env unset/empty.
+    _diag_path: str | None = os.environ.get("DIAGNOSTIC_CAPTURE") or None
+
     # ── Step 4: Call Claude (api_failure path on exception) ───────────────────
     try:
         response = await call_claude(prompt, model=model)
@@ -292,6 +352,17 @@ async def run_live_cycle(
         }
         envelope = _make_envelope("ModelStatus", status_payload, seq=seq)
         await _publish(redis, vault_channel, envelope)
+        # TEST-03 diagnostic capture (DIAGNOSTIC_CAPTURE env — observe-only, no side effects)
+        _emit_diagnostic(
+            capture_path=_diag_path,
+            cycle=cycle,
+            prompt=prompt,
+            raw_response=None,
+            parsed_decision=None,
+            rationale=None,
+            outcome="api_failure",
+            malformed_reason=f"api_failure: {exc}",
+        )
         return {"status": "api_failure", "reason": str(exc), "kind": kind}
 
     # ── Step 5: Extract + validate ────────────────────────────────────────────
@@ -337,6 +408,17 @@ async def run_live_cycle(
         }
         envelope = _make_envelope("ModelStatus", status_payload, seq=seq)
         await _publish(redis, vault_channel, envelope)
+        # TEST-03 diagnostic capture (DIAGNOSTIC_CAPTURE env — observe-only, no side effects)
+        _emit_diagnostic(
+            capture_path=_diag_path,
+            cycle=cycle,
+            prompt=prompt,
+            raw_response=None,
+            parsed_decision=None,
+            rationale=None,
+            outcome="malformed",
+            malformed_reason=reason,
+        )
         return {"status": "malformed", "reason": reason}
 
     decision = validate_decision(raw)
@@ -381,6 +463,17 @@ async def run_live_cycle(
         }
         envelope = _make_envelope("ModelStatus", status_payload, seq=seq)
         await _publish(redis, vault_channel, envelope)
+        # TEST-03 diagnostic capture (DIAGNOSTIC_CAPTURE env — observe-only, no side effects)
+        _emit_diagnostic(
+            capture_path=_diag_path,
+            cycle=cycle,
+            prompt=prompt,
+            raw_response=raw,
+            parsed_decision=None,
+            rationale=None,
+            outcome="malformed",
+            malformed_reason=reason,
+        )
         return {"status": "malformed", "reason": reason}
 
     # ── Step 6: Valid parse — reset both streaks (D-17) ──────────────────────
@@ -410,6 +503,17 @@ async def run_live_cycle(
             raw_request={"prompt": prompt},
             raw_response=raw,
             canonical_decision=decision.model_dump(),
+        )
+        # TEST-03 diagnostic capture (DIAGNOSTIC_CAPTURE env — observe-only, no side effects)
+        _emit_diagnostic(
+            capture_path=_diag_path,
+            cycle=cycle,
+            prompt=prompt,
+            raw_response=raw,
+            parsed_decision=decision.model_dump(),
+            rationale=getattr(decision, "rationale", None),
+            outcome="hold",
+            malformed_reason=None,
         )
         return {"status": "ok", "action": "hold"}
 
@@ -441,6 +545,17 @@ async def run_live_cycle(
             raw_request={"prompt": prompt},
             raw_response=raw,
             canonical_decision=decision.model_dump(),
+        )
+        # TEST-03 diagnostic capture (DIAGNOSTIC_CAPTURE env — observe-only, no side effects)
+        _emit_diagnostic(
+            capture_path=_diag_path,
+            cycle=cycle,
+            prompt=prompt,
+            raw_response=raw,
+            parsed_decision=decision.model_dump(),
+            rationale=getattr(decision, "rationale", None),
+            outcome="rejected",
+            malformed_reason=rejection_reason,
         )
         return {"status": "rejected", "reason": rejection_reason}
 
@@ -519,6 +634,17 @@ async def run_live_cycle(
             )
             # Flip the intent row to reconciled (no order created) so it won't linger
             await mark_pending_order_reconciled(db, vault_address=vault, order_key=intent_key)
+            # TEST-03 diagnostic capture (DIAGNOSTIC_CAPTURE env — observe-only, no side effects)
+            _emit_diagnostic(
+                capture_path=_diag_path,
+                cycle=cycle,
+                prompt=prompt,
+                raw_response=raw,
+                parsed_decision=decision.model_dump(),
+                rationale=getattr(decision, "rationale", None),
+                outcome="rejected",
+                malformed_reason=reason,
+            )
             return {"status": "rejected", "reason": reason}
         pos_key_hex: str = existing["position_key"]
         pos_key_bytes = bytes.fromhex(pos_key_hex.removeprefix("0x"))
@@ -546,6 +672,17 @@ async def run_live_cycle(
             canonical_decision=decision.model_dump(),
         )
         await mark_pending_order_reconciled(db, vault_address=vault, order_key=intent_key)
+        # TEST-03 diagnostic capture (DIAGNOSTIC_CAPTURE env — observe-only, no side effects)
+        _emit_diagnostic(
+            capture_path=_diag_path,
+            cycle=cycle,
+            prompt=prompt,
+            raw_response=raw,
+            parsed_decision=decision.model_dump(),
+            rationale=getattr(decision, "rationale", None),
+            outcome="rejected",
+            malformed_reason=reason,
+        )
         return {"status": "rejected", "reason": reason}
     else:
         # action == "open": proceed with openLong/openShort.
@@ -581,6 +718,17 @@ async def run_live_cycle(
         reason = f"receipt retrieval failed: {exc}"
         logger.error("Cycle %d: %s (tx=%s)", cycle, reason, tx.hex() if hasattr(tx, "hex") else tx)
         await mark_pending_order_reconciled(db, vault_address=vault, order_key=intent_key)
+        # TEST-03 diagnostic capture (DIAGNOSTIC_CAPTURE env — observe-only, no side effects)
+        _emit_diagnostic(
+            capture_path=_diag_path,
+            cycle=cycle,
+            prompt=prompt,
+            raw_response=raw,
+            parsed_decision=decision.model_dump(),
+            rationale=getattr(decision, "rationale", None),
+            outcome="error",
+            malformed_reason=reason,
+        )
         return {"status": "error", "reason": reason, "intent_key": intent_key}
 
     # On-chain revert: status==0 means the transaction was included but reverted.
@@ -594,6 +742,17 @@ async def run_live_cycle(
             decision.side,
         )
         await mark_pending_order_reconciled(db, vault_address=vault, order_key=intent_key)
+        # TEST-03 diagnostic capture (DIAGNOSTIC_CAPTURE env — observe-only, no side effects)
+        _emit_diagnostic(
+            capture_path=_diag_path,
+            cycle=cycle,
+            prompt=prompt,
+            raw_response=raw,
+            parsed_decision=decision.model_dump(),
+            rationale=getattr(decision, "rationale", None),
+            outcome="error",
+            malformed_reason=reason,
+        )
         return {"status": "error", "reason": reason, "intent_key": intent_key}
 
     # Recover the REAL order_key from the OrderCreated event (mock_harness CR-01 pattern):
@@ -601,6 +760,17 @@ async def run_live_cycle(
     if not created:
         logger.error("Cycle %d: OrderCreated event not found in receipt", cycle)
         await mark_pending_order_reconciled(db, vault_address=vault, order_key=intent_key)
+        # TEST-03 diagnostic capture (DIAGNOSTIC_CAPTURE env — observe-only, no side effects)
+        _emit_diagnostic(
+            capture_path=_diag_path,
+            cycle=cycle,
+            prompt=prompt,
+            raw_response=raw,
+            parsed_decision=decision.model_dump(),
+            rationale=getattr(decision, "rationale", None),
+            outcome="error",
+            malformed_reason="OrderCreated event not found in open tx receipt",
+        )
         return {
             "status": "error",
             "error": "OrderCreated event not found in open tx receipt",
@@ -638,6 +808,17 @@ async def run_live_cycle(
         intent_key[:20],
         order_key_hex[:10],
         execute_after_block,
+    )
+    # TEST-03 diagnostic capture (DIAGNOSTIC_CAPTURE env — observe-only, no side effects)
+    _emit_diagnostic(
+        capture_path=_diag_path,
+        cycle=cycle,
+        prompt=prompt,
+        raw_response=raw,
+        parsed_decision=decision.model_dump(),
+        rationale=getattr(decision, "rationale", None),
+        outcome="open",
+        malformed_reason=None,
     )
     return {
         "status": "submitted",
