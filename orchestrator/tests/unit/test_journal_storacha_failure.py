@@ -41,6 +41,8 @@ async def test_filebase_failure_does_not_block_publish() -> None:
     mock_registry = MagicMock()
     mock_registry.functions.recordJournal = MagicMock(return_value=mock_record_fn)
     mock_web3 = MagicMock()
+    # GAP #8: publisher awaits wait_for_transaction_receipt after recordJournal.transact()
+    mock_web3.eth.wait_for_transaction_receipt = AsyncMock(return_value={"status": 1})
     mock_db = MagicMock()
 
     # Pinata OK — Filebase RAISES
@@ -128,8 +130,11 @@ async def test_filebase_failure_web3_storage_cid_remains_null() -> None:
         patch("orchestrator.journal.publisher.update_journal_state", mock_update),
         patch("orchestrator.journal.publisher.send_alert", new_callable=AsyncMock),
     ):
+        # GAP #8: publisher awaits wait_for_transaction_receipt after recordJournal.transact()
+        _mock_web3_cid = MagicMock()
+        _mock_web3_cid.eth.wait_for_transaction_receipt = AsyncMock(return_value={"status": 1})
         await publish_journal_entry(
-            MagicMock(),
+            _mock_web3_cid,
             mock_registry,
             MagicMock(),
             vault_address="0xVault",

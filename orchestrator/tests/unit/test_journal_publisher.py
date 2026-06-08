@@ -122,6 +122,8 @@ async def test_publish_journal_entry_state_machine() -> None:
     mock_registry.functions = mock_registry_functions
 
     mock_web3 = MagicMock()
+    # GAP #8: publisher awaits wait_for_transaction_receipt after recordJournal.transact()
+    mock_web3.eth.wait_for_transaction_receipt = AsyncMock(return_value={"status": 1})
     mock_db = MagicMock()
 
     payload = {"trade": "ETH", "cycle": 42, "action": "open"}
@@ -202,6 +204,8 @@ async def test_publish_journal_entry_dual_pin_same_cid() -> None:
     mock_registry = MagicMock()
     mock_registry.functions.recordJournal = MagicMock(return_value=mock_record_fn)
     mock_web3 = MagicMock()
+    # GAP #8: publisher awaits wait_for_transaction_receipt after recordJournal.transact()
+    mock_web3.eth.wait_for_transaction_receipt = AsyncMock(return_value={"status": 1})
     mock_db = MagicMock()
 
     with (
