@@ -22,7 +22,7 @@ dependencies = [
     "asyncpg>=0.29",             # async Postgres driver; implied by db.py DSN
     "redis[asyncio]>=5.0",       # pub/sub; use redis.asyncio, not sync client
     "jinja2>=3.1",               # prompt template rendering (system.md Jinja2 {{placeholders}})
-    "boto3>=1.35",               # Filebase S3 SigV4 backup pinner (D-08; sync, run via asyncio.to_thread)
+    # boto3 removed — Filebase backup now uses IPFS RPC add (httpx async, no boto3 needed)
 ]
 
 [project.optional-dependencies]

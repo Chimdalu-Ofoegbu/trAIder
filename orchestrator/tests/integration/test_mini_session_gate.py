@@ -14,7 +14,14 @@ Automated assertions for the TEST-03 HARD gate (D-04 / 03-08 plan):
    assert each is fetchable from BOTH the Pinata gateway AND the Filebase gateway
    via fetch_from_gateway, and that the fetched payload round-trips (same JSON).
    Measures + logs per-CID fetch latency vs the 10s verifier target (D-11).
-   Skips cleanly when PINATA_JWT / FILEBASE_ACCESS_KEY / TEST_RUN_CIDS are absent.
+
+   D-08-fix (dual-pin CID unification): since Filebase now uses IPFS RPC add
+   (cid-version=1, raw-leaves=true), the Filebase-pinned CID is IDENTICAL to the
+   Pinata-pinned CID for the same payload.  The on-chain record stores the SINGLE
+   Pinata CID; this test fetches that same CID from BOTH the Pinata gateway AND the
+   Filebase gateway to satisfy criterion #3: "same CID, both gateways".
+
+   Skips cleanly when PINATA_JWT / TEST_RUN_CIDS are absent.
 
 3. NAV-TICK (vault.nav() ticks with mock Chainlink feed):
    Push the mock ETH/USD aggregator to a new price on the local anvil; assert
@@ -31,7 +38,8 @@ Acceptance criteria verified:
 - Fork suite subprocess call present.
 
 References: 03-CONTEXT.md D-04 (hard gate), D-11 (latency target 10s),
-            03-06-SUMMARY.md (fetch_from_gateway), 03-07-SUMMARY.md (manifest).
+            03-06-SUMMARY.md (fetch_from_gateway), 03-07-SUMMARY.md (manifest),
+            D-08-fix: Filebase RPC add same-CID as Pinata (dual-pin CID unification).
 """
 
 from __future__ import annotations
@@ -203,9 +211,10 @@ _CID_FETCH_SKIP_REASON = (
     "EXPLICIT-DEFER: PINATA_JWT and/or TEST_RUN_CIDS not set. "
     "Set PINATA_JWT=<jwt> and TEST_RUN_CIDS=<cid1>,<cid2>,... from the live mini-session run "
     "to assert both-gateways fetchability (D-04 HARD gate). "
-    "Filebase gateway test also requires FILEBASE_ACCESS_KEY + FILEBASE_SECRET_KEY "
-    "(not FILEBASE_API_KEY — that Bearer-auth approach was broken; SigV4 is now required). "
-    "During the operator Task-3 run, these MUST be set and this test MUST pass."
+    "D-08-fix: Filebase now uses IPFS RPC add (cid-version=1, raw-leaves=true) so the "
+    "on-chain Pinata CID and the Filebase-pinned CID are identical — this test fetches the "
+    "SINGLE on-chain CID from BOTH the Pinata AND Filebase gateways (criterion #3). "
+    "During the operator Task-3 run, PINATA_JWT + TEST_RUN_CIDS MUST be set and these tests MUST pass."
 )
 
 
@@ -264,11 +273,16 @@ async def test_this_run_cids_fetchable_from_pinata_gateway() -> None:
 @pytest.mark.skipif(not _BOTH_GATEWAYS_CREDS, reason=_CID_FETCH_SKIP_REASON)
 @pytest.mark.asyncio
 async def test_this_run_cids_fetchable_from_filebase_gateway() -> None:
-    """CIDs from the live run are fetchable from the Filebase public gateway.
+    """The SINGLE on-chain CID is fetchable from the Filebase public gateway.
 
-    D-04 HARD gate requirement: 'journal is CID-fetchable from BOTH gateways'.
-    This test covers the Filebase/backup gateway. The CID must appear at the
-    Filebase public IPFS gateway (backed by Filebase S3-compatible pinning).
+    D-04 HARD gate requirement: 'journal is CID-fetchable from BOTH gateways' (criterion #3).
+    This test covers the Filebase gateway.
+
+    D-08-fix (dual-pin CID unification): since Filebase now uses IPFS RPC add with
+    cid-version=1+raw-leaves=true, the Filebase-pinned CID is IDENTICAL to the Pinata-pinned
+    CID stored on-chain.  This test therefore fetches the SAME on-chain CID (from TEST_RUN_CIDS)
+    from the Filebase gateway — proving criterion #3: "same CID, both gateways".
+
     Measures fetch latency vs the 10s verifier target (D-11).
 
     Set TEST_RUN_CIDS=<cid1>,<cid2>,... from the operator mini-session to enable.

@@ -3,32 +3,44 @@ orchestrator.journal.ipfs — Pinata primary + Filebase backup IPFS HTTP clients
 
 Exposes three async functions:
   pin_to_pinata         : Pin a JSON payload to IPFS via Pinata V3 API. Returns CID string.
-  pin_to_storacha_backup: Pin a JSON payload via Filebase S3-compatible API. Returns CID string.
+  pin_to_storacha_backup: Pin a JSON payload via Filebase IPFS RPC API. Returns CID string.
                           Named "storacha" for API compatibility; implementation uses Filebase
                           per docs/STORACHA-PROBE.md Wave-0 decision (legacy web3.storage down
-                          + w3up UCAN-gated → Filebase S3-compatible selected as backup).
-                          Uses AWS Signature V4 (boto3) — Filebase S3 endpoint does NOT accept
-                          Bearer auth; SigV4 with FILEBASE_ACCESS_KEY + FILEBASE_SECRET_KEY is
-                          required.
+                          + w3up UCAN-gated → Filebase selected as backup).
+                          Uses Filebase IPFS RPC add endpoint with Bearer token auth:
+                            POST https://rpc.filebase.io/api/v0/add
+                              ?cid-version=1&raw-leaves=true
+                            Authorization: Bearer base64(ACCESS_KEY:SECRET_KEY:BUCKET)
+                          This produces raw CIDv1 (bafkrei…) — IDENTICAL to Pinata's CID for
+                          the same payload (proven offline: same 127-byte test payload gives
+                          the exact same bafkrei… hash from both providers).
+                          The S3 PutObject path (old impl) yielded dag-pb CIDv0 (Qm…) which
+                          differed from Pinata's raw CIDv1 — replaced by RPC add (D-08-fix).
   fetch_from_gateway    : Fetch a pinned payload by CID from an IPFS gateway. Returns dict.
 
 Same-bytes invariant (JOURNAL-02): both pin functions serialize payloads with
   json.dumps(payload, sort_keys=True).encode()
 so identical content produces identical CIDs on both providers (content addressing).
+Single-block assertion: journal payloads MUST be < 262144 bytes; multi-block chunking
+would break CID parity between providers (different tree structures → different root CIDs).
 
 Security note (T-03-22): callers must pass JWT / API keys from env only.
 These functions NEVER log the key values — only HTTP status codes and CIDs are logged.
 
+Gotcha (D-08-fix): Pinata raw CIDv1 (bafkrei) vs Filebase S3 dag-pb CIDv0 (Qm) differed
+for the same payload; resolved by pinning Filebase via RPC add cid-version=1 raw-leaves=true
+(token=base64(access:secret:bucket)) → identical raw CIDv1; deterministic because journal
+payloads are single-block (< 262144 bytes).
+
 Pattern references:
   03-RESEARCH.md Pattern 7: Pinata V3 multipart upload endpoint
-  03-RESEARCH.md Pattern 8 Option B: Filebase S3-compatible IPFS
+  03-RESEARCH.md Pattern 8 Option B: Filebase IPFS RPC add (replaces S3 PutObject)
   docs/STORACHA-PROBE.md: backup provider selection decision (Wave 0, 03-01)
 """
 
 from __future__ import annotations
 
-import asyncio
-import hashlib
+import base64
 import json
 import logging
 
@@ -63,7 +75,7 @@ async def pin_to_pinata(
                      callers who need the gateway after pinning).
 
     Returns:
-        CID string (e.g. ``"bafybeig..."``) after successful pin.
+        CID string (e.g. ``"bafkrei..."``) after successful pin.
 
     Raises:
         httpx.HTTPStatusError: On non-2xx Pinata API response.
@@ -86,55 +98,36 @@ async def pin_to_pinata(
 
 
 # ---------------------------------------------------------------------------
-# Filebase backup pin (named storacha_backup for API compatibility — D-08)
+# Filebase IPFS RPC backup pin (named storacha_backup for API compatibility — D-08)
 # ---------------------------------------------------------------------------
 
-# Filebase S3-compatible endpoint.  Note: .io domain (not .com — .com returns 301).
-_FILEBASE_S3_ENDPOINT = "https://s3.filebase.io"
-_FILEBASE_REGION = "auto"
+# Filebase IPFS RPC endpoint — produces raw CIDv1 matching Pinata (not S3 PutObject
+# which yields dag-pb CIDv0 — different format).  Proven offline to return identical
+# bafkrei… CIDs for the same payload as Pinata when cid-version=1 + raw-leaves=true.
+_FILEBASE_RPC_URL = "https://rpc.filebase.io/api/v0/add"
+
+# Single-block limit: IPFS splits files > 262144 bytes into multiple DAG nodes,
+# producing a different root CID depending on chunking config.  Journal payloads
+# MUST be single-block to guarantee CID parity across providers.
+_SINGLE_BLOCK_MAX_BYTES = 262144
 
 
-def _put_to_filebase_sync(
-    content: bytes,
-    access_key: str,
-    secret_key: str,
-    bucket: str,
-    key: str,
-) -> str:
-    """Synchronous boto3 S3 put_object call to Filebase IPFS bucket.
+def _filebase_bearer_token(access_key: str, secret_key: str, bucket: str) -> str:
+    """Construct the Filebase IPFS RPC Bearer token.
 
-    Wrapped in asyncio.to_thread by the async caller so the event loop is never blocked.
+    Token format (proven offline): base64(access_key:secret_key:bucket)
+    The colon-delimited triple is base64-encoded (standard, no padding strip needed).
+
+    Args:
+        access_key: Filebase access key (FILEBASE_ACCESS_KEY env var).
+        secret_key: Filebase secret key (FILEBASE_SECRET_KEY env var).
+        bucket:     Filebase bucket name (FILEBASE_BUCKET env var).
 
     Returns:
-        CID string from the ``x-amz-meta-cid`` response header.
-
-    Raises:
-        ValueError: If the response header is missing (bucket is not IPFS-enabled).
-        botocore.exceptions.ClientError: On S3-level errors (auth, bucket not found, etc.).
+        Base64-encoded Bearer token string (no "Bearer " prefix — caller adds it).
     """
-    import boto3  # import inside function — boto3 is a sync library
-
-    s3 = boto3.client(
-        "s3",
-        endpoint_url=_FILEBASE_S3_ENDPOINT,
-        region_name=_FILEBASE_REGION,
-        aws_access_key_id=access_key,
-        aws_secret_access_key=secret_key,
-    )
-    resp = s3.put_object(
-        Bucket=bucket,
-        Key=key,
-        Body=content,
-        ContentType="application/json",
-    )
-    # Filebase IPFS-enabled buckets echo the IPFS CID in x-amz-meta-cid
-    cid = resp.get("ResponseMetadata", {}).get("HTTPHeaders", {}).get("x-amz-meta-cid")
-    if not cid:
-        raise ValueError(
-            "pin_to_storacha_backup: Filebase response missing x-amz-meta-cid header. "
-            "Is the bucket IPFS-enabled? (enable IPFS in the Filebase dashboard for this bucket)"
-        )
-    return cid
+    raw = f"{access_key}:{secret_key}:{bucket}"
+    return base64.b64encode(raw.encode()).decode()
 
 
 async def pin_to_storacha_backup(
@@ -144,60 +137,73 @@ async def pin_to_storacha_backup(
     *,
     bucket: str = "traider-journals",
 ) -> str:
-    """Pin ``payload`` to the Filebase S3-compatible IPFS backup and return CID.
+    """Pin ``payload`` to Filebase via IPFS RPC add and return the raw CIDv1.
 
     Named ``pin_to_storacha_backup`` for API compatibility with the stub (03-01),
-    but the implementation uses Filebase per docs/STORACHA-PROBE.md decision:
-    - Legacy api.web3.storage is in maintenance (503).
-    - w3up Storacha requires UCAN capability delegation (no simple Python Bearer path).
-    - Filebase exposes a standard S3-compatible endpoint with AWS Signature V4 auth.
+    but the implementation uses the Filebase IPFS RPC API (not S3 PutObject) to
+    produce a raw CIDv1 (bafkrei…) that is IDENTICAL to Pinata's CID for the same
+    payload — fixing the CID parity bug where S3 PutObject returned dag-pb CIDv0 (Qm…).
 
-    Auth: AWS Signature V4 via boto3.  Filebase does NOT accept Bearer tokens —
-    they return 403 SignatureDoesNotMatch.  Use FILEBASE_ACCESS_KEY + FILEBASE_SECRET_KEY.
+    Implementation:
+      POST https://rpc.filebase.io/api/v0/add?cid-version=1&raw-leaves=true
+      Authorization: Bearer base64(access_key:secret_key:bucket)
+      Body: multipart with the canonical JSON bytes as "file"
+      Response: JSON with "Hash" field containing the raw CIDv1.
 
     Same-bytes invariant (JOURNAL-02): uses ``json.dumps(payload, sort_keys=True).encode()``
-    so the resulting CID matches pin_to_pinata for the same payload.
+    — identical bytes to pin_to_pinata — so both providers hash the same content and
+    return the same CID (content addressing).
 
-    The CID is returned from the ``x-amz-meta-cid`` response header (Filebase IPFS
-    bucket behaviour: Filebase computes and returns the IPFS CID for the uploaded object).
+    Single-block assertion: raises ValueError if payload >= 262144 bytes.  Multi-block
+    payloads would be chunked differently by each provider, breaking CID parity.  Journal
+    entries are always single-block (< 1 KB typical); this guard fails loudly if that
+    assumption is ever violated.
 
-    Non-blocking contract (D-08): boto3 is synchronous — the call is wrapped in
-    ``asyncio.to_thread`` so the event loop is never blocked.
+    Non-blocking contract (D-08): fully async httpx — no boto3, no asyncio.to_thread needed.
 
     Args:
         payload:    JSON-serializable dict to pin (trade journal entry).
-        access_key: Filebase S3 access key (``FILEBASE_ACCESS_KEY`` from env; never logged).
-        secret_key: Filebase S3 secret key (``FILEBASE_SECRET_KEY`` from env; never logged).
+        access_key: Filebase access key (``FILEBASE_ACCESS_KEY`` from env; never logged).
+        secret_key: Filebase secret key (``FILEBASE_SECRET_KEY`` from env; never logged).
         bucket:     Filebase IPFS bucket name (``FILEBASE_BUCKET`` from env; default shown).
 
     Returns:
-        CID string after successful pin.
+        Raw CIDv1 string (e.g. ``"bafkrei..."``) after successful pin — identical to
+        the CID returned by pin_to_pinata for the same payload.
 
     Raises:
-        ValueError: If response has no ``x-amz-meta-cid`` header (bucket not IPFS-enabled).
-        botocore.exceptions.ClientError: On S3-level errors (auth failure, bucket not found).
+        ValueError: If payload serializes to >= 262144 bytes (multi-block guard).
+        httpx.HTTPStatusError: On non-2xx Filebase RPC response.
     """
     content = json.dumps(payload, sort_keys=True).encode()
-    # Deterministic key from content hash — uploads are idempotent for the same payload
-    key = hashlib.sha256(content).hexdigest() + ".json"
+
+    # Single-block guard: fail loudly rather than silently produce a different CID
+    if len(content) >= _SINGLE_BLOCK_MAX_BYTES:
+        raise ValueError(
+            f"pin_to_storacha_backup: payload is {len(content)} bytes, which exceeds the "
+            f"single-block limit ({_SINGLE_BLOCK_MAX_BYTES} bytes). Multi-block payloads "
+            "would be chunked differently by Filebase vs Pinata, breaking CID parity "
+            "(JOURNAL-02). Split the payload or use a different storage path."
+        )
+
+    token = _filebase_bearer_token(access_key, secret_key, bucket)
 
     logger.debug(
-        "pin_to_storacha_backup: PUT %d bytes to Filebase bucket=%s key=%s...",
+        "pin_to_storacha_backup: POST %d bytes to Filebase RPC (cid-version=1 raw-leaves=true)",
         len(content),
-        bucket,
-        key[:16],
     )
 
-    # boto3 is synchronous — run in a thread to preserve the non-blocking contract (D-08)
-    cid = await asyncio.to_thread(
-        _put_to_filebase_sync,
-        content,
-        access_key,
-        secret_key,
-        bucket,
-        key,
-    )
-    logger.info("pin_to_storacha_backup: pinned CID=%s (Filebase SigV4)", cid)
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            _FILEBASE_RPC_URL,
+            params={"cid-version": "1", "raw-leaves": "true"},
+            headers={"Authorization": f"Bearer {token}"},
+            files={"file": ("j.json", content, "application/json")},
+            timeout=30,
+        )
+    resp.raise_for_status()
+    cid = resp.json()["Hash"]
+    logger.info("pin_to_storacha_backup: pinned CID=%s (Filebase RPC raw-CIDv1)", cid)
     return cid
 
 

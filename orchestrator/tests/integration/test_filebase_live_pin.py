@@ -1,26 +1,33 @@
 """
-orchestrator.tests.integration.test_filebase_live_pin — Live Filebase S3 SigV4 smoke test.
+orchestrator.tests.integration.test_filebase_live_pin — Live Filebase IPFS RPC smoke test.
 
 Proves the full Filebase backup round-trip BEFORE the 30-min operator gate run:
-  1. PUT a tiny JSON payload to Filebase via SigV4 (boto3 → asyncio.to_thread).
-  2. Assert the response contains a CID in the x-amz-meta-cid header.
+  1. POST a tiny JSON payload to Filebase via IPFS RPC add
+     (cid-version=1, raw-leaves=true, Bearer token = base64(ACCESS:SECRET:BUCKET)).
+  2. Assert the response "Hash" field contains a raw CIDv1 (bafkrei…).
   3. Fetch the CID from an independent IPFS gateway (ipfs.filebase.io) and assert
      the bytes round-trip exactly (JOURNAL-02 same-bytes invariant).
+
+This replaces the old S3 PutObject / SigV4 approach which yielded dag-pb CIDv0 (Qm…)
+that differed from Pinata's raw CIDv1 (bafkrei…) for the same payload.  The RPC add
+endpoint with cid-version=1+raw-leaves=true produces identical raw CIDv1 CIDs — proven
+offline for 127-byte single-block journal payloads.
 
 Skip conditions (EXPLICIT-DEFER):
   - FILEBASE_ACCESS_KEY not set.
   - FILEBASE_SECRET_KEY not set.
   Both must be present for the test to run live. The operator sets them after this fix
   and runs `uv run --project orchestrator pytest tests/integration/test_filebase_live_pin.py -v`
-  to confirm the SigV4 fix is working end-to-end before the gate session.
+  to confirm the RPC fix is working end-to-end before the gate session.
 
 Security note (T-03-22): keys are read from env only. They are never logged verbatim;
 only SET/NOT SET status is logged.
 
 References:
-  - orchestrator/src/orchestrator/journal/ipfs.py — pin_to_storacha_backup (SigV4 impl)
+  - orchestrator/src/orchestrator/journal/ipfs.py — pin_to_storacha_backup (IPFS RPC impl)
   - docs/STORACHA-PROBE.md — Filebase backup selection decision
-  - 03-08 gap fix: Filebase Bearer auth was broken; this test proves the SigV4 fix
+  - 03-08 gap fix (dual-pin CID unification): Filebase S3 dag-pb CIDv0 != Pinata raw CIDv1;
+    resolved by switching Filebase to IPFS RPC add with cid-version=1+raw-leaves=true
 """
 
 from __future__ import annotations
@@ -48,9 +55,10 @@ _FILEBASE_IPFS_GATEWAY = "https://ipfs.filebase.io/ipfs"
 _SKIP_REASON = (
     "EXPLICIT-DEFER: FILEBASE_ACCESS_KEY and/or FILEBASE_SECRET_KEY not set. "
     "Set both env vars (from the Filebase dashboard → Access Keys) and re-run this test "
-    "to prove the SigV4 fix end-to-end before the operator gate session. "
-    "Note: use FILEBASE_ACCESS_KEY + FILEBASE_SECRET_KEY — NOT the old FILEBASE_API_KEY "
-    "(Bearer auth returns 403 SignatureDoesNotMatch on Filebase S3)."
+    "to prove the Filebase IPFS RPC add fix end-to-end before the operator gate session. "
+    "Token = base64(FILEBASE_ACCESS_KEY:FILEBASE_SECRET_KEY:FILEBASE_BUCKET). "
+    "The old S3 PutObject / SigV4 path returned dag-pb CIDv0 (Qm…) which differed from "
+    "Pinata's raw CIDv1 (bafkrei…); this test proves the RPC add path returns the same CIDv1."
 )
 
 _HAVE_CREDS = bool(_FILEBASE_ACCESS_KEY) and bool(_FILEBASE_SECRET_KEY)
@@ -65,10 +73,10 @@ _HAVE_CREDS = bool(_FILEBASE_ACCESS_KEY) and bool(_FILEBASE_SECRET_KEY)
 @pytest.mark.asyncio
 @pytest.mark.skipif(not _HAVE_CREDS, reason=_SKIP_REASON)
 async def test_filebase_live_pin_round_trip() -> None:
-    """Live Filebase S3 SigV4 smoke test: PUT payload, get CID, fetch from IPFS gateway.
+    """Live Filebase IPFS RPC smoke test: POST payload, get raw CIDv1, fetch from gateway.
 
     Asserts:
-    1. pin_to_storacha_backup returns a non-empty CID string.
+    1. pin_to_storacha_backup returns a non-empty raw CIDv1 string (bafkrei… prefix).
     2. CID is fetched from the Filebase IPFS gateway within 30s.
     3. Fetched bytes match the original canonical serialization (JOURNAL-02 round-trip).
 
@@ -104,6 +112,12 @@ async def test_filebase_live_pin_round_trip() -> None:
 
     assert cid, "pin_to_storacha_backup returned an empty CID string"
     assert len(cid) > 10, f"CID looks too short to be valid: {cid!r}"
+    # RPC add with cid-version=1 + raw-leaves=true produces raw CIDv1 (bafkrei… prefix)
+    # confirming CID parity with Pinata (D-08-fix: old S3 PutObject returned Qm… CIDv0)
+    assert cid.startswith("bafkrei"), (
+        f"Expected raw CIDv1 (bafkrei…) from Filebase RPC add, got {cid!r}. "
+        "cid-version=1 + raw-leaves=true must produce raw CIDv1 matching Pinata."
+    )
     logger.info("test_filebase_live_pin: PIN OK — CID=%s (%.2fs)", cid, pin_elapsed)
 
     # ── Step 2: FETCH from independent IPFS gateway ──────────────────────────

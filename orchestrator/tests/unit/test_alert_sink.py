@@ -184,9 +184,13 @@ async def test_pin_to_pinata_posts_multipart_returns_cid() -> None:
 async def test_same_sorted_json_bytes_both_providers() -> None:
     """Both pin functions use json.dumps(sort_keys=True) — identical content bytes.
 
-    Pinata: mocked via httpx.AsyncClient (multipart POST).
-    Filebase: mocked via _put_to_filebase_sync (boto3 sync helper wrapped in to_thread).
+    Pinata: mocked via httpx.AsyncClient (multipart POST to Pinata V3 endpoint).
+    Filebase: mocked via httpx.AsyncClient (multipart POST to Filebase IPFS RPC endpoint).
     Both must receive the same canonical sorted-JSON bytes (JOURNAL-02 same-bytes invariant).
+
+    The Filebase impl now uses the IPFS RPC add endpoint (cid-version=1, raw-leaves=true)
+    which returns raw CIDv1 identical to Pinata's — replacing the old S3 PutObject path
+    that returned dag-pb CIDv0 (different format, D-08-fix).
     """
     payload = {"z_field": "zzz", "a_field": "aaa", "cycle": 42}
     # Expected canonical bytes
@@ -195,45 +199,44 @@ async def test_same_sorted_json_bytes_both_providers() -> None:
     captured_pinata: list[bytes] = []
     captured_filebase: list[bytes] = []
 
-    fake_cid = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
+    # Same raw CIDv1 from both providers (proven offline for the same content bytes)
+    fake_cid = "bafkreihsc5kbzkkoshidvd4ntx3focrmeegoke5w34ja33sh6kmfgkbfs4"
 
-    # --- Mock for Pinata (httpx multipart POST) ---
-    async def mock_pinata_post(url, *, headers, files, data, timeout):
-        # Extract content bytes from multipart files tuple: ("journal.json", content, mime)
-        captured_pinata.append(files["file"][1])
+    # --- Shared async httpx mock — routes by URL ---
+    # Both Pinata and Filebase calls go through httpx.AsyncClient; we use a single
+    # mock that inspects the URL to route to the correct capture list.
+
+    async def mock_post(url, **kwargs):
         mock_resp = MagicMock()
         mock_resp.raise_for_status = MagicMock()
-        mock_resp.json = MagicMock(return_value={"data": {"cid": fake_cid}})
+        if "pinata.cloud" in url:
+            # Pinata V3: extract bytes from multipart files tuple ("journal.json", content, mime)
+            files = kwargs.get("files", {})
+            captured_pinata.append(files["file"][1])
+            mock_resp.json = MagicMock(return_value={"data": {"cid": fake_cid}})
+        elif "filebase.io" in url:
+            # Filebase RPC: extract bytes from multipart files tuple ("j.json", content, mime)
+            files = kwargs.get("files", {})
+            captured_filebase.append(files["file"][1])
+            mock_resp.json = MagicMock(return_value={"Hash": fake_cid})
+        else:
+            raise AssertionError(f"Unexpected URL in mock: {url}")
         return mock_resp
 
-    mock_pinata_client = AsyncMock()
-    mock_pinata_client.__aenter__ = AsyncMock(return_value=mock_pinata_client)
-    mock_pinata_client.__aexit__ = AsyncMock(return_value=False)
-    mock_pinata_client.post = AsyncMock(side_effect=mock_pinata_post)
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.post = AsyncMock(side_effect=mock_post)
 
-    # --- Mock for Filebase (boto3 sync helper _put_to_filebase_sync) ---
-    # The new implementation calls asyncio.to_thread(_put_to_filebase_sync, content, ...)
-    # We patch the sync helper directly so we can capture `content` without involving boto3.
-    def mock_put_to_filebase_sync(
-        content: bytes, access_key: str, secret_key: str, bucket: str, key: str
-    ) -> str:
-        captured_filebase.append(content)
-        return fake_cid
-
-    with (
-        patch("orchestrator.journal.ipfs.httpx.AsyncClient", return_value=mock_pinata_client),
-        patch(
-            "orchestrator.journal.ipfs._put_to_filebase_sync", side_effect=mock_put_to_filebase_sync
-        ),
-    ):
+    with patch("orchestrator.journal.ipfs.httpx.AsyncClient", return_value=mock_client):
         await pin_to_pinata(payload, "jwt-x")
-        # New signature: pin_to_storacha_backup(payload, access_key, secret_key, *, bucket)
+        # Signature: pin_to_storacha_backup(payload, access_key, secret_key, *, bucket)
         await pin_to_storacha_backup(
             payload, "filebase-access", "filebase-secret", bucket="my-bucket"
         )
 
     assert len(captured_pinata) == 1, "Pinata mock must have been called once"
-    assert len(captured_filebase) == 1, "Filebase mock must have been called once"
+    assert len(captured_filebase) == 1, "Filebase RPC mock must have been called once"
     assert captured_pinata[0] == expected_bytes, "Pinata content must be sorted-JSON bytes"
     assert captured_filebase[0] == expected_bytes, "Filebase content must be sorted-JSON bytes"
     assert captured_pinata[0] == captured_filebase[0], "Both providers must receive identical bytes"
