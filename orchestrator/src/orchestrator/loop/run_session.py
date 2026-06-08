@@ -232,7 +232,10 @@ def load_manifest(manifest_path: Path | str | None = None) -> dict:
 
     Returns:
         Dict with keys: sessionFactory, oracle, journal, vaultClaude, vaultGpt,
-        vaultGem, adapter, mockUsdc, ethFeed, btcFeed, solFeed, sequencerFeed.
+        vaultGem, adapter, mockPerps, mockUsdc, ethFeed, btcFeed, solFeed, sequencerFeed.
+
+        Note: adapter = address(0) (GMXAdapter deferred, D-13). When PERPS_VENUE=mock
+        the session resolves the adapter address from mockPerps, NOT adapter.
 
     Raises:
         FileNotFoundError: If the manifest file does not exist.
@@ -333,14 +336,27 @@ async def run_mini_session(
     eth_feed_addr = manifest["ethFeed"]
     btc_feed_addr = manifest["btcFeed"]
     sol_feed_addr = manifest["solFeed"]
-    mock_perps_addr = manifest.get("adapter")  # zero-address if not deployed
+    # D-14 gap fix: resolve the adapter address by VENUE rather than always using manifest["adapter"].
+    # manifest["adapter"] = address(0) (GMXAdapter deferred to Phase 6 per D-13).
+    # manifest["mockPerps"] = real MockPerps address (set in sepolia.json + written by 01-Deploy.s.sol).
+    # When venue=mock, we MUST use mockPerps so the reader + keeper_monitor hit the live contract.
+    _raw_mock_perps = manifest.get("mockPerps", "")
+    _raw_gmx_adapter = manifest.get("adapter", "")
+    _ZERO_ADDR = "0x" + "0" * 40
+
+    mock_perps_addr: str | None = None  # resolved below after web3 is connected (for fallback)
+    gmx_adapter_addr: str | None = (
+        _raw_gmx_adapter if _raw_gmx_adapter and _raw_gmx_adapter != _ZERO_ADDR else None
+    )
+
     # mock_usdc_addr available for seeding steps (not used in the session loop itself)
     _ = manifest.get("mockUsdc")
     logger.info(
-        "run_mini_session: manifest loaded — vaultClaude=%s journal=%s adapter=%s",
+        "run_mini_session: manifest loaded — vaultClaude=%s journal=%s mockPerps=%s adapter=%s",
         vault_claude_addr,
         journal_addr,
-        mock_perps_addr,
+        _raw_mock_perps or "(not set)",
+        _raw_gmx_adapter or "(not set)",
     )
 
     # ── Step 2: AsyncWeb3 connection ──────────────────────────────────────────
@@ -404,10 +420,54 @@ async def run_mini_session(
             "Run `forge build` in contracts/ if needed."
         )
 
+    # Resolve the concrete adapter address by venue (D-14 gap fix).
+    # For venue=mock: prefer manifest["mockPerps"]; fall back to vault.adapter() on-chain
+    # if the manifest field is absent or zero. This ensures both the driver reads
+    # (getOpenPositionKeys) and keeper_monitor (OrderExecuted watch) use the live address.
+    # For venue=gmx: use manifest["adapter"] (GMXAdapter, Phase 6+).
+    if venue == "mock":
+        if _raw_mock_perps and _raw_mock_perps != _ZERO_ADDR:
+            mock_perps_addr = _raw_mock_perps
+            logger.info(
+                "run_mini_session: venue=mock — resolved MockPerps from manifest.mockPerps: %s",
+                mock_perps_addr,
+            )
+        else:
+            # Belt-and-suspenders: query vault.adapter() on-chain when manifest field is missing.
+            logger.warning(
+                "run_mini_session: manifest.mockPerps missing/zero — "
+                "falling back to vault.adapter() on-chain for venue=mock"
+            )
+            _vault_abi_for_fallback: list = []
+            try:
+                _vault_abi_for_fallback = _load_abi(_MTOKEN_VAULT_ARTIFACT)
+            except FileNotFoundError:
+                pass
+            _fallback_vault = web3.eth.contract(
+                address=vault_claude_addr, abi=_vault_abi_for_fallback
+            )
+            try:
+                mock_perps_addr = await _fallback_vault.functions.adapter().call()
+                logger.info(
+                    "run_mini_session: vault.adapter() on-chain fallback resolved to: %s",
+                    mock_perps_addr,
+                )
+            except Exception as _exc:  # noqa: BLE001
+                logger.error(
+                    "run_mini_session: vault.adapter() fallback failed: %s — "
+                    "cannot build mock adapter without a valid address",
+                    _exc,
+                )
+                raise ValueError(
+                    "venue=mock: manifest.mockPerps is missing/zero and vault.adapter() "
+                    "fallback failed. Add mockPerps to deployments/sepolia.json."
+                ) from _exc
+
     adapter = build_perps_adapter(
         web3,
         venue=venue,
-        mock_perps_address=mock_perps_addr if mock_perps_addr else None,
+        mock_perps_address=mock_perps_addr if venue == "mock" else None,
+        gmx_adapter_address=gmx_adapter_addr if venue == "gmx" else None,
         mock_perps_abi=mock_perps_abi,
     )
 

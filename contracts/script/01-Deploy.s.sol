@@ -316,6 +316,7 @@ contract DeployPhase1 is Script {
             vaults[1], // mGPT-S1
             vaults[2], // mGEM-S1
             address(0), // adapter (GMXAdapter deferred to Phase 6 per D-13)
+            mockPerpsAddr, // mockPerps: real MockPerps address (session uses this for venue=mock)
             mockUsdcAddr,
             mockEthFeedAddr,
             mockBtcFeedAddr,
@@ -381,6 +382,11 @@ contract DeployPhase1 is Script {
     /// @dev Called after vm.stopBroadcast() - vm.writeFile is a cheatcode.
     ///      All fields are written as checksummed hex addresses.
     ///      The manifest is the single source of truth for the orchestrator + frontend.
+    ///
+    ///      mockPerps is recorded separately from adapter so the orchestrator can resolve
+    ///      the real MockPerps address when PERPS_VENUE=mock, even when adapter=address(0)
+    ///      (GMXAdapter deferred to Phase 6 per D-13).  The session reads manifest["mockPerps"]
+    ///      for venue=mock and manifest["adapter"] for venue=gmx (fix for address(0) bug).
     function _writeManifest(
         string memory manifestPath,
         address sessionFactory,
@@ -390,6 +396,7 @@ contract DeployPhase1 is Script {
         address vaultGpt,
         address vaultGem,
         address adapter,
+        address mockPerps,
         address mockUsdc,
         address ethFeed,
         address btcFeed,
@@ -397,7 +404,8 @@ contract DeployPhase1 is Script {
         address sequencerFeed
     ) internal {
         // Build JSON string. vm.toString converts addresses to checksummed hex strings.
-        string memory manifest = string(
+        // abi.encodePacked has a 32KB limit; split into two halves to avoid stack issues.
+        string memory part1 = string(
             abi.encodePacked(
                 "{\n",
                 '  "sessionFactory": "',
@@ -417,9 +425,16 @@ contract DeployPhase1 is Script {
                 '",\n',
                 '  "vaultGem": "',
                 vm.toString(vaultGem),
-                '",\n',
+                '",\n'
+            )
+        );
+        string memory part2 = string(
+            abi.encodePacked(
                 '  "adapter": "',
                 vm.toString(adapter),
+                '",\n',
+                '  "mockPerps": "',
+                vm.toString(mockPerps),
                 '",\n',
                 '  "mockUsdc": "',
                 vm.toString(mockUsdc),
@@ -439,6 +454,7 @@ contract DeployPhase1 is Script {
                 "}\n"
             )
         );
+        string memory manifest = string(abi.encodePacked(part1, part2));
         vm.writeFile(manifestPath, manifest);
         console2.log("Manifest written:", manifestPath);
     }
