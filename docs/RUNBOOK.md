@@ -21,7 +21,8 @@
 7. [Demo-Day Minute-by-Minute Timetable](#7-demo-day-minute-by-minute-timetable)
 8. [Provider Rate Limits — ACTIVE (no application required) (ORCH-09)](#8-provider-rate-limits--active-no-application-required-orch-09)
 9. [Judging Window (DEPLOY-04)](#9-judging-window-deploy-04)
-10. [Known Issues and Gotchas](#10-known-issues-and-gotchas)
+10. [House-Arb Bot (Phase 4)](#10-house-arb-bot-phase-4--d-08d-09d-10)
+11. [Known Issues and Gotchas](#11-known-issues-and-gotchas)
 
 ---
 
@@ -557,7 +558,163 @@ Phase 6 session-timing plan inputs:
 
 ---
 
-## 10. Known Issues and Gotchas
+## 10. House-Arb Bot (Phase 4) — D-08/D-09/D-10
+
+> **Filled in by:** Plan 04-07
+> The house-arb bot (`arb_bot.py`) is the Phase-4 peg-keeper that owns the <60s criterion #2 during the gate session.
+
+### Overview
+
+The bot is a single Python process that polls all 3 mTOKEN/USDC pools every 12 seconds, computes the NAV-vs-AMM gap for each vault, and fires `arbCloseGap` on key #4 when the gap exceeds the hysteresis floor (default 1.5%). Sequential per-pool firing avoids key #4 nonce self-contention by construction (D-10).
+
+**Key #4 is arb-only** — it is NEVER shared with the orchestrator-trade EOA. Compromise of key #4 is not a capital-drain vector: `arbCloseGap` is permissionless and the caller receives the arb profit.
+
+### Running the Bot
+
+```bash
+# From the repo root (Windows: uv run via PowerShell or git-bash)
+uv run --project orchestrator python -m orchestrator.loop.arb_bot
+
+# With all env vars set:
+export ARB_KEY4=<private-key-hex>
+export ARB_POLL_INTERVAL=12
+export FIRE_THRESHOLD_BPS=150
+export KEY4_USDC_MIN_WARNING=500000000   # 500 USDC in raw units
+export SEPOLIA_RPC=<your-rpc-url>
+export TELEGRAM_BOT_TOKEN=<token>
+export TELEGRAM_CHAT_ID=<chat-id>
+```
+
+### Environment Variables
+
+| Variable                | Default     | Description                                                                  |
+| ----------------------- | ----------- | ---------------------------------------------------------------------------- |
+| `ARB_KEY4`              | (required)  | Private key for arb bot key #4 (arb-only EOA, distinct from operator-trade)  |
+| `ARB_POLL_INTERVAL`     | `12`        | Poll cadence in seconds (D-09: 10–15s range)                                 |
+| `FIRE_THRESHOLD_BPS`    | `150`       | Hysteresis floor in bps (1.5%). Must exceed 1% contract floor                |
+| `KEY4_USDC_MIN_WARNING` | `500000000` | Alert threshold in raw USDC units (default $500). Sent as WARNING on startup |
+| `TELEGRAM_BOT_TOKEN`    | (optional)  | Telegram bot API token for WARNING/CRITICAL alerts (D-15)                    |
+| `TELEGRAM_CHAT_ID`      | (optional)  | Telegram chat ID to receive arb-bot alerts                                   |
+
+The vault/pool pair manifest (3 vault addresses + 3 pool addresses) is read from `deployments/sepolia.json` at runtime. The bot requires this file to exist and contain valid addresses (populated by `04-06` pool seeding).
+
+### Key #4 Working-Capital Funding (D-08)
+
+Key #4 needs two types of working capital:
+
+1. **ETH gas:** Required for every `arbCloseGap` call. Fund at least **0.05 ETH Sepolia** at startup. Each arbCloseGap uses ~300k gas (Algebra swap + ERC-4626 round-trip). At 1 Gwei, this covers ~1,666 arb calls. Top up when the balance falls below 0.01 ETH.
+
+2. **Mock USDC working capital (arbMint leg):** `arbMint` requires the bot to deposit USDC into the vault. On Sepolia, mint mock USDC directly:
+
+```bash
+# Mint mock USDC to key #4 (Sepolia only — MockERC20 is freely mintable)
+cast send <MockUSDC> "mint(address,uint256)" <KEY4_ADDRESS> 10000000000 \
+  --rpc-url $SEPOLIA_RPC --private-key $DEPLOYER_PRIVATE_KEY
+# 10000000000 = 10,000 USDC in raw 6-decimal units
+```
+
+**Depletion alert (Pitfall 4):** At startup, `preflight_key4_balance` reads the key #4 USDC balance. If below `KEY4_USDC_MIN_WARNING` (default $500), a `WARNING` alert fires via the alert sink (Telegram if configured) before the first poll tick. Silent USDC depletion would disable gap-closing without any error — hence the proactive check.
+
+**The depletion alert message will contain:**
+
+```
+[WARNING] Key #4 USDC balance <X> USDC is below the 500 USDC threshold — arbCloseGap may fail on the arbMint leg. Refund key4=0x...
+```
+
+### Monitoring and Overnight Alerting (D-09)
+
+The bot sends alerts via the alert sink (D-15):
+
+| Condition                    | Severity | Alert Message                                     |
+| ---------------------------- | -------- | ------------------------------------------------- |
+| USDC balance below threshold | WARNING  | "Key #4 USDC balance below threshold"             |
+| Pool error (non-CB-pause)    | (log)    | ERROR in Python log only — continues to next pool |
+| Bot process down > 2 min     | CRITICAL | Covered by Phase-6 process monitor (uptime check) |
+
+Ongoing operator monitoring:
+
+- Check Python log for `arb_poll_loop: arbCloseGap closed Nbps gap in X.Xs` entries — these confirm the <60s criterion is met.
+- Check log for `ERROR arb_poll_loop` entries — these indicate per-pool failures (non-fatal, but warrant investigation).
+- The `gap_log_callback` path (wired in the gate harness) records `{gap_bps, close_time_s, tx}` to the gate log for the <60s budget audit.
+
+### CB-Pause Expected Behavior (D-07 / Pitfall 6)
+
+When the circuit breaker is active (vault `_mintPaused = true`), the AMM price can drift ABOVE NAV because `arbMint` (the vault deposit leg of `arbCloseGap`) is blocked. In this state:
+
+- The bot will attempt to call `arbCloseGap` for the AMM>NAV direction.
+- The on-chain call will revert with **"Vault: mint paused"**.
+- **This is EXPECTED and NOT alert-worthy** — it is the correct CB behavior per D-07.
+- The bot classifies this revert as `expected_cb_pause` and logs at **INFO**, not ERROR.
+- No WARNING/CRITICAL alert is fired.
+- The bot continues to the next pool.
+
+The `arbBurn` direction (AMM below NAV) is NOT blocked by the CB — vault redeem has no CB guard. So `arbCloseGap` continues to close downward gaps even during a CB episode.
+
+**Operator signal:** If you see INFO logs with `expected_cb_pause` during a session, check whether the circuit breaker was intentionally triggered. If it was NOT intentionally triggered, investigate the NAV oracle (Chainlink staleness check may have latched the CB).
+
+### Manual arbCloseGap Fallback (D-08 — First-Class Path)
+
+The bot is the automated path. The manual `cast` fallback is documented here as a first-class operator tool for:
+
+- Pre-gate demo testing
+- Any window when the bot is not running
+- Direct gap-close during the gate narration
+
+**Exact command (argument order matters — vault THEN pool):**
+
+```bash
+cast send <ARBITRAGE_PRIMITIVE_ADDRESS> \
+  "arbCloseGap(address,address)" \
+  <VAULT_ADDRESS> \
+  <POOL_ADDRESS> \
+  --rpc-url $SEPOLIA_RPC \
+  --private-key $ARB_KEY4
+```
+
+Where:
+
+- `<ARBITRAGE_PRIMITIVE_ADDRESS>`: from `deployments/sepolia.json` field `arbitragePrimitive`
+- `<VAULT_ADDRESS>`: from `deployments/sepolia.json` e.g. `vaultClaude` / `vaultGpt` / `vaultGemini`
+- `<POOL_ADDRESS>`: from `deployments/sepolia.json` e.g. `poolClaude` / `poolGpt` / `poolGemini`
+- `$ARB_KEY4`: private key for arb-only key #4 (`.env.gas` or a dedicated `.env.arb-key4`)
+
+**Note:** This manual path is explicitly **not** a Phase-5 button (FRONT-04 ships in Phase 5). It is a raw operator cast command. Do NOT add authentication, UX hardening, or smart-contract access controls to this path — it is permissionless by design (D-08 guardrail).
+
+**Example using the Python ArbitragePrimitive helper (alternative fallback):**
+
+```python
+# orchestrator/scripts/manual_arb_close.py (not a production entrypoint — drill only)
+import asyncio
+from web3 import AsyncWeb3
+
+async def main():
+    w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(SEPOLIA_RPC))
+    arb = w3.eth.contract(address=ARB_PRIMITIVE_ADDR, abi=ARB_PRIMITIVE_ABI)
+    tx_hash = await arb.functions.arbCloseGap(VAULT_ADDR, POOL_ADDR).transact(
+        {"from": KEY4_ADDRESS, "gas": 300000}
+    )
+    receipt = await w3.eth.wait_for_transaction_receipt(tx_hash, timeout=90)
+    print(f"closed gap: tx={tx_hash.hex()}, status={receipt.status}")
+
+asyncio.run(main())
+```
+
+### Phase-6 Extension Point (MAINNET_HOOK_PLACEHOLDER)
+
+The bot has a deliberate extension point for Phase-6 mainnet economics:
+
+```python
+# In arb_bot.py — set this before deploying to mainnet:
+MAINNET_HOOK_PLACEHOLDER = lambda gap_bps: (
+    gap_bps > FIRE_THRESHOLD_BPS + 20  # only fire if gap > 1.7% (above gas-cost floor)
+)
+```
+
+On Sepolia (testnet), `MAINNET_HOOK_PLACEHOLDER = None` (default) and the bot fires on every qualifying gap — gas is subsidized and economic analysis is not required. On mainnet, this hook can gate on gas price, profit estimate, or any other economic check. **Do not implement this in Phase 4** — leave as `None`.
+
+---
+
+## 11. Known Issues and Gotchas
 
 > **Append-only log.** Add new issues in reverse chronological order (newest first).
 > Never delete or edit existing entries — update by adding a new entry.
