@@ -7,9 +7,9 @@ orchestrator-trade EOA.
 
 Design invariants (D-08/D-09/D-10):
   - ARB_POLL_INTERVAL: 12s default (D-09: 10-15s range, env-overridable)
-  - FIRE_THRESHOLD_BPS: 150 (1.5%) default hysteresis above the 1% contract floor
-    (D-09; env-overridable; set above the max Algebra Integral v1 dynamic fee 1.2%
-    plus slippage buffer per D-05/Probe 1)
+  - FIRE_THRESHOLD_BPS: 250 (2.5%) default hysteresis above the 1% contract floor
+    (D-09; env-overridable; probe-justified floor above max Algebra Integral v1
+    dynamic fee 1.49% per D-05/Probe 1 — reconciled in 04-08 Task 1)
   - CONTRACT_FLOOR_BPS: 100 (1% — the on-chain ArbitragePrimitive.GAP_THRESHOLD_BPS,
     documented here for reference; do NOT lower FIRE_THRESHOLD_BPS below this)
   - MAINNET_HOOK_PLACEHOLDER: None — D-09 Phase-6 extension point for gas/profit
@@ -47,9 +47,10 @@ logger = logging.getLogger(__name__)
 ARB_POLL_INTERVAL: int = int(os.environ.get("ARB_POLL_INTERVAL", "12"))
 """Poll cadence in seconds. D-09: 10-15s. Default 12s."""
 
-FIRE_THRESHOLD_BPS: int = int(os.environ.get("FIRE_THRESHOLD_BPS", "150"))
-"""Hysteresis floor in basis points. D-09: ~1.5%. Must exceed CONTRACT_FLOOR_BPS.
-Set above max Algebra Integral v1 dynamic fee (1.2%) + slippage buffer per D-05."""
+FIRE_THRESHOLD_BPS: int = int(os.environ.get("FIRE_THRESHOLD_BPS", "250"))
+"""Hysteresis floor in basis points. D-09: 2.5%. Must exceed CONTRACT_FLOOR_BPS.
+Probe 1 (04-PROBE-RESULTS.md): Algebra Integral v1 max dynamic fee = 1.49%
+(alpha1+alpha2=14900 bps); 250 bps (2.5%) is the probe-justified floor above that fee."""
 
 CONTRACT_FLOOR_BPS: int = 100
 """On-chain ArbitragePrimitive.GAP_THRESHOLD_BPS = 1%. Documented here for reference.

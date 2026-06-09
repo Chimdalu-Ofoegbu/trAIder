@@ -13,6 +13,7 @@ Five behavior tests:
 from __future__ import annotations
 
 import asyncio
+import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -102,13 +103,15 @@ def _make_web3(tx_status: int = 1) -> MagicMock:
 async def test_arb_bot_fires_on_gap_above_hysteresis() -> None:
     """ArbBot fires arbCloseGap when gap > FIRE_THRESHOLD_BPS; skips when below.
 
-    Behavior:
-      - gap = 1.6% (> 1.5% FIRE_THRESHOLD_BPS=150) → arbCloseGap called once
-      - gap = 1.2% (< 1.5%) → arbCloseGap NOT called
+    Behavior (after Probe 1 reconciliation — 04-08 Task 1):
+      - gap = 2.6% (> 2.5% FIRE_THRESHOLD_BPS=250) → arbCloseGap called once
+      - gap = 1.6% (< 2.5%) → arbCloseGap NOT called
+    FIRE_THRESHOLD_BPS=250 is the probe-justified floor above Algebra Integral v1's
+    max dynamic fee of 1.49% (Probe 1: alpha1+alpha2=14900 bps).
     """
-    # --- ABOVE HYSTERESIS: 1.6% gap ---
+    # --- ABOVE HYSTERESIS: 2.6% gap ---
     nav_e18 = 10**18  # NAV = $1.00
-    price_ratio_above = 1.016  # 1.6% above NAV → gap_bps = 160 >= 150
+    price_ratio_above = 1.026  # 2.6% above NAV → gap_bps = 260 >= 250
     sqrt_above = _nav_e18_to_sqrt_price_x96(price_ratio_above)
 
     vault = _make_vault(nav_e18)
@@ -139,8 +142,8 @@ async def test_arb_bot_fires_on_gap_above_hysteresis() -> None:
     nonce_mgr.assign_and_sign.assert_called_once()
     assert tick_count == 1
 
-    # --- BELOW HYSTERESIS: 1.2% gap ---
-    price_ratio_below = 1.012  # 1.2% above NAV → gap_bps = 120 < 150
+    # --- BELOW HYSTERESIS: 1.6% gap ---
+    price_ratio_below = 1.016  # 1.6% above NAV → gap_bps = 160 < 250
     sqrt_below = _nav_e18_to_sqrt_price_x96(price_ratio_below)
 
     vault2 = _make_vault(nav_e18)
@@ -182,7 +185,7 @@ async def test_arb_bot_per_pool_fault_isolation() -> None:
       - Pools 2 and 3: fire correctly (assign_and_sign called successfully)
     """
     nav_e18 = 10**18
-    sqrt_above = _nav_e18_to_sqrt_price_x96(1.016)  # 1.6% gap
+    sqrt_above = _nav_e18_to_sqrt_price_x96(1.026)  # 2.6% gap (above 2.5% threshold)
 
     def make_pair(i: int) -> tuple[MagicMock, MagicMock]:
         v = _make_vault(nav_e18)
@@ -248,7 +251,7 @@ async def test_cb_pause_is_expected_not_error() -> None:
       - send_alert must NOT be called with WARNING or CRITICAL
     """
     nav_e18 = 10**18
-    sqrt_above = _nav_e18_to_sqrt_price_x96(1.016)
+    sqrt_above = _nav_e18_to_sqrt_price_x96(1.026)
 
     vault = _make_vault(nav_e18)
     pool = _make_pool(sqrt_above)
@@ -360,7 +363,7 @@ async def test_close_time_logged() -> None:
       - tx: str (hex string)
     """
     nav_e18 = 10**18
-    sqrt_above = _nav_e18_to_sqrt_price_x96(1.016)
+    sqrt_above = _nav_e18_to_sqrt_price_x96(1.026)
 
     vault = _make_vault(nav_e18)
     pool = _make_pool(sqrt_above)
@@ -409,9 +412,17 @@ async def test_close_time_logged() -> None:
 
 
 def test_fire_threshold_above_contract_floor() -> None:
-    """FIRE_THRESHOLD_BPS (1.5%) must be > CONTRACT_FLOOR_BPS (1%) by design."""
+    """FIRE_THRESHOLD_BPS (2.5%) must be > CONTRACT_FLOOR_BPS (1%) by design.
+
+    Probe 1 (04-PROBE-RESULTS.md): max Algebra Integral v1 dynamic fee = 1.49%
+    (alpha1+alpha2 = 14900 bps, baseFee = 0). The probe-justified floor is 2.5%
+    (250 bps) to clear the fee band plus a slippage buffer — reconciled 04-08 Task 1.
+    """
     assert FIRE_THRESHOLD_BPS > CONTRACT_FLOOR_BPS, (
         f"FIRE_THRESHOLD_BPS={FIRE_THRESHOLD_BPS} must be > CONTRACT_FLOOR_BPS={CONTRACT_FLOOR_BPS}"
+    )
+    assert FIRE_THRESHOLD_BPS == 250 or int(os.environ.get("FIRE_THRESHOLD_BPS", "0")) > 0, (
+        f"Default FIRE_THRESHOLD_BPS should be 250 (probe-justified); got {FIRE_THRESHOLD_BPS}"
     )
 
 

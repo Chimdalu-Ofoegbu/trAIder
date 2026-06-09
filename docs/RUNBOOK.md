@@ -565,7 +565,9 @@ Phase 6 session-timing plan inputs:
 
 ### Overview
 
-The bot is a single Python process that polls all 3 mTOKEN/USDC pools every 12 seconds, computes the NAV-vs-AMM gap for each vault, and fires `arbCloseGap` on key #4 when the gap exceeds the hysteresis floor (default 1.5%). Sequential per-pool firing avoids key #4 nonce self-contention by construction (D-10).
+The bot is a single Python process that polls all 3 mTOKEN/USDC pools every 12 seconds, computes the NAV-vs-AMM gap for each vault, and fires `arbCloseGap` on key #4 when the gap exceeds the hysteresis floor (default **2.5%** / 250 bps). Sequential per-pool firing avoids key #4 nonce self-contention by construction (D-10).
+
+> **Probe 1 note (04-08 Task 1):** The default `FIRE_THRESHOLD_BPS` was raised from 150 (1.5%) to **250 (2.5%)** — the probe-justified floor above Algebra Integral v1's maximum dynamic fee of 1.49% (alpha1+alpha2 = 14900 bps, baseFee = 0). This ensures the bot never fires inside the fee band. See `04-PROBE-RESULTS.md` Probe 1 and `04-VENUE-DECISION.md` for the full derivation.
 
 **Key #4 is arb-only** — it is NEVER shared with the orchestrator-trade EOA. Compromise of key #4 is not a capital-drain vector: `arbCloseGap` is permissionless and the caller receives the arb profit.
 
@@ -578,7 +580,7 @@ uv run --project orchestrator python -m orchestrator.loop.arb_bot
 # With all env vars set:
 export ARB_KEY4=<private-key-hex>
 export ARB_POLL_INTERVAL=12
-export FIRE_THRESHOLD_BPS=150
+export FIRE_THRESHOLD_BPS=250
 export KEY4_USDC_MIN_WARNING=500000000   # 500 USDC in raw units
 export SEPOLIA_RPC=<your-rpc-url>
 export TELEGRAM_BOT_TOKEN=<token>
@@ -587,14 +589,14 @@ export TELEGRAM_CHAT_ID=<chat-id>
 
 ### Environment Variables
 
-| Variable                | Default     | Description                                                                  |
-| ----------------------- | ----------- | ---------------------------------------------------------------------------- |
-| `ARB_KEY4`              | (required)  | Private key for arb bot key #4 (arb-only EOA, distinct from operator-trade)  |
-| `ARB_POLL_INTERVAL`     | `12`        | Poll cadence in seconds (D-09: 10–15s range)                                 |
-| `FIRE_THRESHOLD_BPS`    | `150`       | Hysteresis floor in bps (1.5%). Must exceed 1% contract floor                |
-| `KEY4_USDC_MIN_WARNING` | `500000000` | Alert threshold in raw USDC units (default $500). Sent as WARNING on startup |
-| `TELEGRAM_BOT_TOKEN`    | (optional)  | Telegram bot API token for WARNING/CRITICAL alerts (D-15)                    |
-| `TELEGRAM_CHAT_ID`      | (optional)  | Telegram chat ID to receive arb-bot alerts                                   |
+| Variable                | Default     | Description                                                                                   |
+| ----------------------- | ----------- | --------------------------------------------------------------------------------------------- |
+| `ARB_KEY4`              | (required)  | Private key for arb bot key #4 (arb-only EOA, distinct from operator-trade)                   |
+| `ARB_POLL_INTERVAL`     | `12`        | Poll cadence in seconds (D-09: 10–15s range)                                                  |
+| `FIRE_THRESHOLD_BPS`    | `250`       | Hysteresis floor in bps (2.5%). Probe-justified floor above max Algebra dynamic fee (Probe 1) |
+| `KEY4_USDC_MIN_WARNING` | `500000000` | Alert threshold in raw USDC units (default $500). Sent as WARNING on startup                  |
+| `TELEGRAM_BOT_TOKEN`    | (optional)  | Telegram bot API token for WARNING/CRITICAL alerts (D-15)                                     |
+| `TELEGRAM_CHAT_ID`      | (optional)  | Telegram chat ID to receive arb-bot alerts                                                    |
 
 The vault/pool pair manifest (3 vault addresses + 3 pool addresses) is read from `deployments/sepolia.json` at runtime. The bot requires this file to exist and contain valid addresses (populated by `04-06` pool seeding).
 
