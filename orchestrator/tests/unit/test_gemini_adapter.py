@@ -107,31 +107,13 @@ class TestGeminiAdapterClassifyException:
     """Tests for classify_exception (D-17 name-matched error counter mapping)."""
 
     def test_classify_exception_maps_transient_to_api_failure(self) -> None:
-        """Name-matched transient error types map to 'api_failure'."""
+        """Name-matched transient error types map to 'api_failure'.
+
+        Matching spec (04-04 plan action): type.__name__ contains any of
+        "Timeout", "RateLimit", "ServerError", "Connection".
+        Classes whose names don't include those substrings map to "unknown".
+        """
         from orchestrator.providers.gemini_adapter import classify_exception
-
-        # Fake exception classes with transient-category names
-        class DeadlineExceededError(Exception):
-            pass
-
-        class ResourceExhaustedError(Exception):  # RateLimit equivalent
-            pass
-
-        class InternalServerError(Exception):
-            pass
-
-        class ServiceUnavailableError(Exception):  # Connection/ServerError equivalent
-            pass
-
-        # Timeout-related
-        class APITimeoutError(Exception):
-            pass
-
-        # Test all categories that should map to api_failure
-        assert classify_exception(DeadlineExceededError()) == "api_failure"
-        assert classify_exception(ResourceExhaustedError()) == "unknown"  # doesn't match patterns
-        assert classify_exception(InternalServerError()) == "api_failure"
-        assert classify_exception(ServiceUnavailableError()) == "unknown"
 
         # Direct name-match tests per plan spec:
         # "Timeout", "RateLimit", "ServerError", "Connection"
@@ -147,10 +129,28 @@ class TestGeminiAdapterClassifyException:
         class SomeConnectionError(Exception):
             pass
 
+        class APITimeoutError(Exception):
+            pass
+
+        class InternalServerError(Exception):
+            pass
+
         assert classify_exception(SomeTimeoutError()) == "api_failure"
         assert classify_exception(SomeRateLimitError()) == "api_failure"
         assert classify_exception(SomeServerError()) == "api_failure"
         assert classify_exception(SomeConnectionError()) == "api_failure"
+        assert classify_exception(APITimeoutError()) == "api_failure"
+        assert classify_exception(InternalServerError()) == "api_failure"
+
+        # Names without matching substrings map to "unknown"
+        class DeadlineExceededError(Exception):
+            pass
+
+        class ResourceExhaustedError(Exception):
+            pass
+
+        assert classify_exception(DeadlineExceededError()) == "unknown"
+        assert classify_exception(ResourceExhaustedError()) == "unknown"
 
     def test_classify_exception_generic_returns_unknown(self) -> None:
         """Generic exceptions map to 'unknown'."""
