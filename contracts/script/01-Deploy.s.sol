@@ -276,7 +276,8 @@ contract DeployPhase1 is Script {
             orchestrator,
             operator,
             initialCapital,
-            useSepoliaStaleness
+            useSepoliaStaleness,
+            address(0) // operatorLpKey: set post-deploy when AMM pool is seeded (Phase 4)
         );
         console2.log("SessionFactory deployed:", address(factory));
 

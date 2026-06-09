@@ -84,6 +84,11 @@ contract SessionFactory is Ownable {
     /// @notice If true, uses the 6-hour Sepolia staleness window for all Chainlink feeds (D-12).
     bool public immutable useSepoliaStaleness;
 
+    /// @notice Operator/LP key address for the AMM position guard (D-18).
+    ///         Threaded into each SettlementContract as mmAddress_ so endSession requires
+    ///         the AMM LP to redeem vault shares before settling. Pass address(0) to disable.
+    address public immutable operatorLpKey;
+
     // =========================================================================
     // Events
     // =========================================================================
@@ -102,16 +107,17 @@ contract SessionFactory is Ownable {
     ///      createSession. The oracle and journal MUST transfer ownership to this factory
     ///      (via oracle.transferOwnership(address(this))) before createSession is called,
     ///      because registerVault is owner-gated on both registries (Plans 02/03).
-    /// @param _oracle             PerformanceOracle deployed by the operator.
-    /// @param _journal            JournalRegistry deployed by the operator.
-    /// @param _sequencerFeed      Chainlink Arbitrum sequencer uptime feed (address(0) = skip).
-    /// @param _ethFeed            Chainlink ETH/USD feed.
-    /// @param _btcFeed            Chainlink BTC/USD feed.
-    /// @param _solFeed            Chainlink SOL/USD feed.
-    /// @param _orchestrator       Orchestrator key for trading operations.
-    /// @param _operator           Operator key (funds session; cannot withdraw USDC).
-    /// @param _initialCapitalUsdc Seed capital per vault in 6-decimal USDC units (e.g. 10_000e6).
+    /// @param _oracle              PerformanceOracle deployed by the operator.
+    /// @param _journal             JournalRegistry deployed by the operator.
+    /// @param _sequencerFeed       Chainlink Arbitrum sequencer uptime feed (address(0) = skip).
+    /// @param _ethFeed             Chainlink ETH/USD feed.
+    /// @param _btcFeed             Chainlink BTC/USD feed.
+    /// @param _solFeed             Chainlink SOL/USD feed.
+    /// @param _orchestrator        Orchestrator key for trading operations.
+    /// @param _operator            Operator key (funds session; cannot withdraw USDC).
+    /// @param _initialCapitalUsdc  Seed capital per vault in 6-decimal USDC units (e.g. 10_000e6).
     /// @param _useSepoliaStaleness If true, uses 6-hour staleness window for all Chainlink feeds.
+    /// @param _operatorLpKey       Operator/LP key for AMM guard (D-18). address(0) disables.
     constructor(
         address _oracle,
         address _journal,
@@ -122,7 +128,8 @@ contract SessionFactory is Ownable {
         address _orchestrator,
         address _operator,
         uint256 _initialCapitalUsdc,
-        bool _useSepoliaStaleness
+        bool _useSepoliaStaleness,
+        address _operatorLpKey
     ) Ownable(msg.sender) {
         require(_oracle != address(0), "Factory: zero oracle");
         require(_journal != address(0), "Factory: zero journal");
@@ -143,6 +150,7 @@ contract SessionFactory is Ownable {
         operator = _operator;
         initialCapitalUsdc = _initialCapitalUsdc > 0 ? _initialCapitalUsdc : 10_000e6;
         useSepoliaStaleness = _useSepoliaStaleness;
+        operatorLpKey = _operatorLpKey;
     }
 
     // =========================================================================
@@ -209,8 +217,10 @@ contract SessionFactory is Ownable {
             vaults[i] = address(vault);
 
             // ── Step 2: deploy a fresh SettlementContract for this vault ─────────────────
+            // operatorLpKey is threaded as mmAddress_ so endSession blocks until the AMM LP
+            // (held as vault shares) is redeemed. address(0) disables the guard (D-18).
             SettlementContract settlement =
-                new SettlementContract(usdc, adapter, address(vault), address(this), deadline);
+                new SettlementContract(usdc, adapter, address(vault), address(this), deadline, operatorLpKey);
 
             // ── Step 3: wire the settlement so settlementBurn/settlementWithdraw are authorized ──
             vault.setSettlement(address(settlement));

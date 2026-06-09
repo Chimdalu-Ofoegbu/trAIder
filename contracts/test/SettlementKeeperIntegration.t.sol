@@ -111,9 +111,14 @@ contract SettlementKeeperIntegrationTest is Test {
             true // useSepoliaStaleness
         );
 
-        // Deploy settlement with deadline 72h from now
+        // Deploy settlement with deadline 72h from now (mmAddress_=address(0): guard disabled)
         settlement = new SettlementContract(
-            address(usdc), address(perps), address(vault), sessionFactory, block.timestamp + SESSION_DURATION
+            address(usdc),
+            address(perps),
+            address(vault),
+            sessionFactory,
+            block.timestamp + SESSION_DURATION,
+            address(0)
         );
 
         // Wire settlement into vault (factory-gated)

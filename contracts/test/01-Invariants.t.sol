@@ -378,7 +378,8 @@ contract InvariantVaultSolvency is StdInvariant, Test {
             address(perps),
             address(vault),
             sessionFactory,
-            block.timestamp + 72 hours // deadline: permissionless recovery hatch (SETT-02)
+            block.timestamp + 72 hours, // deadline: permissionless recovery hatch (SETT-02)
+            address(0) // mmAddress_: disabled (D-18 guard off in invariant tests)
         );
 
         // Wire settlement into the vault (factory-gated, one-time).

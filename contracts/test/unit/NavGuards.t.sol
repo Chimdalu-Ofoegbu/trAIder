@@ -124,9 +124,14 @@ contract NavGuardsTest is Test {
             true // useSepoliaStaleness: 6h threshold for all feeds
         );
 
-        // Deploy SettlementContract
+        // Deploy SettlementContract (mmAddress_=address(0): guard disabled in unit tests)
         settlement = new SettlementContract(
-            address(usdc), address(perps), address(vault), sessionFactory, block.timestamp + SESSION_DURATION
+            address(usdc),
+            address(perps),
+            address(vault),
+            sessionFactory,
+            block.timestamp + SESSION_DURATION,
+            address(0)
         );
 
         // Wire settlement (factory-gated, one-time)

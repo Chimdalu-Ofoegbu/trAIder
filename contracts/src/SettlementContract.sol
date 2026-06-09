@@ -86,6 +86,12 @@ contract SettlementContract is ReentrancyGuardTransient {
     /// @notice Unix timestamp after which any address may call endSession (SETT-02 recovery hatch).
     uint256 public immutable deadline;
 
+    /// @notice Operator/LP key address for the AMM position (D-18).
+    ///         If non-zero, endSession reverts if this address still holds vault shares —
+    ///         ensuring the MM/operator has redeemed all AMM LP positions before settlement.
+    ///         Pass address(0) to disable the guard (Phase 1 / tests without AMM).
+    address public immutable mmAddress;
+
     // =========================================================================
     // Events
     // =========================================================================
@@ -115,7 +121,15 @@ contract SettlementContract is ReentrancyGuardTransient {
     /// @param vault_          MTokenVault address — USDC custodian and share ledger.
     /// @param sessionFactory_ SessionFactory address — only caller before the deadline.
     /// @param deadline_       Unix timestamp after which endSession is permissionless.
-    constructor(address usdc_, address adapter_, address vault_, address sessionFactory_, uint256 deadline_) {
+    /// @param mmAddress_      Operator/LP key for AMM position guard (D-18). Pass address(0) to disable.
+    constructor(
+        address usdc_,
+        address adapter_,
+        address vault_,
+        address sessionFactory_,
+        uint256 deadline_,
+        address mmAddress_
+    ) {
         require(usdc_ != address(0), "Settlement: zero usdc");
         require(adapter_ != address(0), "Settlement: zero adapter");
         require(vault_ != address(0), "Settlement: zero vault");
@@ -127,6 +141,7 @@ contract SettlementContract is ReentrancyGuardTransient {
         vault = vault_;
         sessionFactory = sessionFactory_;
         deadline = deadline_;
+        mmAddress = mmAddress_;
     }
 
     // =========================================================================
@@ -194,6 +209,15 @@ contract SettlementContract is ReentrancyGuardTransient {
         // async closes BEFORE calling endSession, so positionValueUSDC(vault) == 0 here.
         // In production (GMX): the keeper executes the orders; endSession is called after.
         require(IPerpsAdapter(adapter).positionValueUSDC(vault) == 0, "Settlement: positions not drained");
+
+        // D-18 mmAddress guard: if the operator/MM LP key is set, they must have redeemed
+        // all vault shares before endSession can proceed. This ensures the AMM LP position
+        // (held as vault shares) is fully unwound before the redemption rate is frozen.
+        // address(0) disables the guard (Phase 1 / tests without AMM, ARB-01).
+        require(
+            mmAddress == address(0) || MTokenVault(vault).balanceOf(mmAddress) == 0,
+            "Settlement: operator/MM must redeem shares before endSession"
+        );
 
         // Snapshot the vault share supply (the mTOKEN IS the vault share — D-18, ONE TOKEN).
         // USDC custody stays in the vault; no transfer to this contract.

@@ -118,7 +118,8 @@ contract SessionFactoryTest is Test {
             orchestratorAddr,
             operatorAddr,
             INITIAL_CAPITAL,
-            true // useSepoliaStaleness: 6-hour window for all feeds in tests
+            true, // useSepoliaStaleness: 6-hour window for all feeds in tests
+            address(0) // operatorLpKey: disabled in base tests (D-18 guard off)
         );
 
         // Transfer oracle + journal ownership to the factory so registerVault (onlyOwner) succeeds.
@@ -305,17 +306,42 @@ contract SessionFactoryTest is Test {
     }
 
     // =========================================================================
-    // Test: operatorLpKey stored + threaded to SettlementContract (D-18, Task 2 RED)
+    // Test: operatorLpKey stored + threaded to SettlementContract (D-18, Task 2)
     // =========================================================================
 
     /// @notice SessionFactory stores operatorLpKey and each settlement's mmAddress == operatorLpKey.
     function test_Factory_OperatorLpKey_StoredAndThreaded() public {
         address lpKey = makeAddr("operatorLpKey");
 
-        // SessionFactory must expose operatorLpKey as an immutable
-        assertEq(factory.operatorLpKey(), lpKey, "D-18: factory.operatorLpKey must equal constructor arg");
+        // Deploy a fresh oracle + journal for this isolated factory instance
+        address testOpKey = vm.addr(0xA11CE);
+        PerformanceOracle freshOracle = new PerformanceOracle();
+        JournalRegistry freshJournal = new JournalRegistry(testOpKey);
 
-        address[3] memory vaults = factory.createSession(address(usdc), address(perps), address(0), SESSION_DURATION);
+        // Deploy a SessionFactory with a non-zero operatorLpKey
+        SessionFactory factoryWithLp = new SessionFactory(
+            address(freshOracle),
+            address(freshJournal),
+            address(0),
+            address(ethFeed),
+            address(btcFeed),
+            address(solFeed),
+            orchestratorAddr,
+            operatorAddr,
+            INITIAL_CAPITAL,
+            true,
+            lpKey // operatorLpKey
+        );
+
+        // Transfer oracle + journal ownership to the new factory
+        freshOracle.transferOwnership(address(factoryWithLp));
+        freshJournal.transferOwnership(address(factoryWithLp));
+
+        // SessionFactory must expose operatorLpKey as an immutable
+        assertEq(factoryWithLp.operatorLpKey(), lpKey, "D-18: factory.operatorLpKey must equal constructor arg");
+
+        address[3] memory vaults =
+            factoryWithLp.createSession(address(usdc), address(perps), address(0), SESSION_DURATION);
 
         for (uint256 i = 0; i < 3; i++) {
             address settlementAddr = _getVault(vaults, i).settlement();
