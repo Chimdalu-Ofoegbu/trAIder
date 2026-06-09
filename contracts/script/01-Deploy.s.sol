@@ -6,12 +6,13 @@ import {stdJson} from "forge-std/StdJson.sol";
 import {PerformanceOracle} from "../src/PerformanceOracle.sol";
 import {JournalRegistry} from "../src/JournalRegistry.sol";
 import {SessionFactory} from "../src/SessionFactory.sol";
+import {ArbitragePrimitive} from "../src/ArbitragePrimitive.sol";
 import {MockERC20} from "../src/mocks/MockERC20.sol";
 import {MockPerps} from "../src/mocks/MockPerps.sol";
 import {MockChainlinkAggregator} from "../src/mocks/MockChainlinkAggregator.sol";
 import {MockSequencerUptimeFeed} from "../src/mocks/MockSequencerUptimeFeed.sol";
 
-/// @title DeployPhase1 - trAIder full Phase 1 + Phase 3 stack deploy script (FACT-01, D-12/D-13/D-14)
+/// @title DeployPhase1 - trAIder full Phase 1 + Phase 3 + Phase 4 stack deploy script (FACT-01, D-12/D-13/D-14/D-15)
 /// @notice Deploys the complete on-chain stack in one idempotent, manifest-driven run:
 ///           1. PerformanceOracle
 ///           2. JournalRegistry (with OPERATOR_JOURNAL_KEY ecrecover gate, D-10)
@@ -89,6 +90,14 @@ import {MockSequencerUptimeFeed} from "../src/mocks/MockSequencerUptimeFeed.sol"
 ///        USE_SEPOLIA_STALENESS  (optional) "true" enables 6h staleness window; default = false
 ///        MOCK_USDC_MINT_AMOUNT  (optional) Mock USDC minted to deployer; default = 100_000e6 ($100k)
 ///        MANIFEST_PATH          (optional) Path to write manifest; default = "deployments/sepolia.json"
+///
+///        Phase 4 env vars (AMM + Arbitrage — D-15/D-18):
+///        ARB_SWAP_ROUTER        (optional) Camelot V3 SwapRouter; default = Sepolia address
+///        ALGEBRA_FACTORY        (optional) AlgebraFactory address; default = Sepolia address
+///        ALGEBRA_NPM            (optional) NonfungiblePositionManager; default = Sepolia address
+///        OPERATOR_LP_KEY        (optional) LP key for D-18 guard; default = deployer (msg.sender)
+///        ARB_KEY4               (optional) Arb bot EOA (key #4); default = address(0) (log only)
+///        GATE_DURATION          (optional) Session duration for gate run; default = SESSION_DURATION
 contract DeployPhase1 is Script {
     using stdJson for string;
 
@@ -117,6 +126,24 @@ contract DeployPhase1 is Script {
     int256 internal constant MOCK_ETH_START_PRICE = 350000000000; // $3,500 (8-dec)
     int256 internal constant MOCK_BTC_START_PRICE = 9500000000000; // $95,000 (8-dec)
     int256 internal constant MOCK_SOL_START_PRICE = 18000000000; // $180 (8-dec)
+
+    // =========================================================================
+    // Phase 4 Camelot/Algebra Sepolia defaults (D-15)
+    // Override via ARB_SWAP_ROUTER / ALGEBRA_FACTORY / ALGEBRA_NPM env vars.
+    // =========================================================================
+
+    /// @dev Camelot V3 SwapRouter on Arbitrum Sepolia (Algebra Integral v1).
+    ///      Direct IAlgebraPool.swap() is used in ArbitragePrimitive; this address is
+    ///      stored for reference and future router-path fallbacks.
+    address internal constant DEFAULT_ARB_SWAP_ROUTER = 0x171B925C51565F5D2a7d8C494ba3188D304EFD93;
+
+    /// @dev Camelot/Algebra AlgebraFactory on Arbitrum Sepolia.
+    ///      Probe 2 confirmed bytecode parity with mainnet (0x1a3c9B...5B).
+    address internal constant DEFAULT_ALGEBRA_FACTORY = 0xaA37Bea711D585478E1c04b04707cCb0f10D762a;
+
+    /// @dev Camelot/Algebra NonfungiblePositionManager on Arbitrum Sepolia.
+    ///      Used by 02-SeedPools.s.sol to mint LP positions.
+    address internal constant DEFAULT_ALGEBRA_NPM = 0x79EA6cB3889fe1FC7490A1C69C7861761d882D4A;
 
     // =========================================================================
     // Manifest path
@@ -157,6 +184,20 @@ contract DeployPhase1 is Script {
         // D-10/03-03: operator-journal key for the ecrecover gate (required - no default).
         address operatorJournalKey = vm.envAddress("OPERATOR_JOURNAL_KEY");
 
+        // ── Phase 4 env vars (D-15/D-18) ─────────────────────────────────────
+        // ARB_SWAP_ROUTER: Camelot V3 SwapRouter on Sepolia (ArbitragePrimitive constructor).
+        address arbSwapRouter = vm.envOr("ARB_SWAP_ROUTER", DEFAULT_ARB_SWAP_ROUTER);
+        // ALGEBRA_FACTORY + ALGEBRA_NPM: recorded in manifest for 02-SeedPools.s.sol.
+        address algebraFactory = vm.envOr("ALGEBRA_FACTORY", DEFAULT_ALGEBRA_FACTORY);
+        address algebraNpm = vm.envOr("ALGEBRA_NPM", DEFAULT_ALGEBRA_NPM);
+        // OPERATOR_LP_KEY: LP wallet for D-18 mmAddress guard. Default = deployer (msg.sender).
+        // D-06: LP key MUST be distinct from orchestrator-trade and arb key #4 in production.
+        address operatorLpKey = vm.envOr("OPERATOR_LP_KEY", msg.sender);
+        // ARB_KEY4: arb bot EOA (address only — private key never stored here, SEC-01).
+        address arbKey4 = vm.envOr("ARB_KEY4", address(0));
+        // GATE_DURATION: override session duration for gate runs (D-17). Defaults to SESSION_DURATION.
+        // This is set in the same envOr block so the session.deadline aligns with gate harness timing.
+
         // ── Read optional config with Arbitrum One mainnet defaults ──────────
         address ethFeed = vm.envOr("ETH_FEED", ARB_ONE_ETH_FEED);
         address btcFeed = vm.envOr("BTC_FEED", ARB_ONE_BTC_FEED);
@@ -164,7 +205,9 @@ contract DeployPhase1 is Script {
         // Sepolia: SEQUENCER_FEED="" or "0x0000..." → address(0) skips the sequencer check (D-06/D-07)
         address sequencerFeed = vm.envOr("SEQUENCER_FEED", address(0));
 
-        uint256 sessionDuration = vm.envOr("SESSION_DURATION", uint256(259_200)); // 72 hours
+        // GATE_DURATION overrides SESSION_DURATION when set (D-17 gate run = ~3600s).
+        // If GATE_DURATION is absent, SESSION_DURATION is used (default 72h / 259200s).
+        uint256 sessionDuration = vm.envOr("GATE_DURATION", vm.envOr("SESSION_DURATION", uint256(259_200)));
         uint256 initialCapital = vm.envOr("INITIAL_CAPITAL", uint256(10_000e6)); // $10k in USDC
         bool useSepoliaStaleness = vm.envOr("USE_SEPOLIA_STALENESS", false);
         bool deployMockSubstrate = vm.envOr("DEPLOY_MOCK_SUBSTRATE", false);
@@ -266,6 +309,9 @@ contract DeployPhase1 is Script {
         //    The factory stores static config (feeds, sequencer, orchestrator, operator,
         //    initialCapital, useSepoliaStaleness) at construction. These are shared across
         //    all vault deploys within a createSession call.
+        //    Phase 4 (D-15/D-18): operatorLpKey is now the real LP key (not address(0)).
+        //    This threads into each SettlementContract as mmAddress_ via createSession,
+        //    arming the D-18 endSession guard.
         SessionFactory factory = new SessionFactory(
             address(oracle),
             address(journal),
@@ -277,9 +323,22 @@ contract DeployPhase1 is Script {
             operator,
             initialCapital,
             useSepoliaStaleness,
-            address(0) // operatorLpKey: set post-deploy when AMM pool is seeded (Phase 4)
+            operatorLpKey // Phase 4 (D-15/D-18): real LP key for D-18 mmAddress guard
         );
         console2.log("SessionFactory deployed:", address(factory));
+        console2.log("  operatorLpKey (D-18 mmAddress guard):", operatorLpKey);
+
+        // ── Phase 4 Step 3b: Deploy ArbitragePrimitive ────────────────────────
+        //    BEFORE createSession so its address can be passed as the `arbitrage` param.
+        //    ArbitragePrimitive is STATELESS (D-07) — no constructor args, no registerVault.
+        //    The contract uses direct IAlgebraPool.swap() (no SwapRouter dependency at runtime
+        //    per VENUE-DECISION.md finding #2). arbSwapRouter is stored in the manifest for
+        //    reference and future router-path fallbacks.
+        //    [Rule 1 - Bug fix]: Plan context block stated constructor(address swapRouter) but
+        //    the actual 04-03 implementation is no-arg (fully stateless D-07 design).
+        ArbitragePrimitive arb = new ArbitragePrimitive();
+        console2.log("ArbitragePrimitive deployed:", address(arb));
+        console2.log("  arbSwapRouter (manifest ref):", arbSwapRouter);
 
         // ── Step 4a: Authorize the publisher EOA on JournalRegistry (GAP #5) ──────
         //    The Python JournalPublisher sends recordJournal from the OPERATOR_JOURNAL_KEY
@@ -304,22 +363,24 @@ contract DeployPhase1 is Script {
         //    D-13: Full 3-vault session. mCLA-S1 driven (Claude); mGPT/mGEM idle.
         //    Each vault's ERC-4626 share IS the tradeable mTOKEN (D-18, TOKEN-01).
         //    Tickers: mCLA-S1 / mGPT-S1 / mGEM-S1 (set in SessionFactory.createSession).
-        //    address(0) arbitrage: Phase 4 wires ArbitragePrimitive (FACT-01 Phase 3 scope).
+        //    Phase 4 (D-15): passes real ArbitragePrimitive address (Step-6 validates non-zero).
         //    D-13/GMXAdapter: NOT frozen after Phase 3 - adapter deploy deferred to Phase 6.
         address[3] memory vaults = factory.createSession(
             usdc,
             adapter,
-            address(0), // arbitrage placeholder (Phase 4 wires ArbitragePrimitive)
+            address(arb), // Phase 4 (D-15): REAL ArbitragePrimitive address (not address(0))
             sessionDuration
         );
 
         vm.stopBroadcast();
 
-        // ── Step 6: Write canonical address manifest (D-14) ──────────────────
+        // ── Step 6: Write canonical address manifest (D-14/D-15) ─────────────
         //    Written AFTER vm.stopBroadcast() - vm.writeFile is a cheatcode, not a broadcast.
         //    The manifest is the single source of truth for the orchestrator (Phase 3) and
         //    frontend (Phase 5). No hardcoded addresses consumed downstream.
         //    D-13/GMXAdapter: adapter field = address(0) (deferred to Phase 6 per D-13).
+        //    Phase 4 (D-15): extended with arbitragePrimitive, arbSwapRouter, algebraFactory,
+        //    algebraNpm, operatorLpKey, arbKey4 keys.
         _writeManifest(
             manifestPath,
             address(factory),
@@ -334,14 +395,28 @@ contract DeployPhase1 is Script {
             mockEthFeedAddr,
             mockBtcFeedAddr,
             mockSolFeedAddr,
-            mockSequencerFeedAddr
+            mockSequencerFeedAddr,
+            // Phase 4 (D-15) fields:
+            address(arb),
+            arbSwapRouter,
+            algebraFactory,
+            algebraNpm,
+            operatorLpKey,
+            arbKey4
         );
 
         // ── Step 7: Log summary ───────────────────────────────────────────────
-        console2.log("=== trAIder Phase 3 Deploy Complete (D-12/D-13/D-14) ===");
+        console2.log("=== trAIder Phase 3+4 Deploy Complete (D-12/D-13/D-14/D-15) ===");
         console2.log("PerformanceOracle : ", address(oracle));
         console2.log("JournalRegistry   : ", address(journal));
         console2.log("SessionFactory    : ", address(factory));
+        console2.log("--- Phase 4 (D-15): AMM + Arbitrage ---");
+        console2.log("ArbitragePrimitive: ", address(arb));
+        console2.log("arbSwapRouter     : ", arbSwapRouter);
+        console2.log("algebraFactory    : ", algebraFactory);
+        console2.log("algebraNpm        : ", algebraNpm);
+        console2.log("operatorLpKey     : ", operatorLpKey);
+        console2.log("arbKey4           : ", arbKey4);
         console2.log("--- Mock substrate (D-12/D-06) ---");
         console2.log("MockERC20 (USDC)  : ", mockUsdcAddr);
         console2.log("MockPerps         : ", mockPerpsAddr);
@@ -391,7 +466,7 @@ contract DeployPhase1 is Script {
     // Internal helpers - manifest write
     // =========================================================================
 
-    /// @notice Write the canonical address manifest JSON (D-14).
+    /// @notice Write the canonical address manifest JSON (D-14/D-15).
     /// @dev Called after vm.stopBroadcast() - vm.writeFile is a cheatcode.
     ///      All fields are written as checksummed hex addresses.
     ///      The manifest is the single source of truth for the orchestrator + frontend.
@@ -400,6 +475,10 @@ contract DeployPhase1 is Script {
     ///      the real MockPerps address when PERPS_VENUE=mock, even when adapter=address(0)
     ///      (GMXAdapter deferred to Phase 6 per D-13).  The session reads manifest["mockPerps"]
     ///      for venue=mock and manifest["adapter"] for venue=gmx (fix for address(0) bug).
+    ///
+    ///      Phase 4 (D-15) extension: adds arbitragePrimitive, arbSwapRouter, algebraFactory,
+    ///      algebraNpm, operatorLpKey, arbKey4 keys. Pool + LP-NFT addresses are written by
+    ///      02-SeedPools.s.sol which merges into this manifest post-seeding.
     function _writeManifest(
         string memory manifestPath,
         address sessionFactory,
@@ -414,10 +493,17 @@ contract DeployPhase1 is Script {
         address ethFeed,
         address btcFeed,
         address solFeed,
-        address sequencerFeed
+        address sequencerFeed,
+        // Phase 4 (D-15) fields:
+        address arbitragePrimitive,
+        address arbSwapRouter,
+        address algebraFactory,
+        address algebraNpm,
+        address operatorLpKey,
+        address arbKey4
     ) internal {
         // Build JSON string. vm.toString converts addresses to checksummed hex strings.
-        // abi.encodePacked has a 32KB limit; split into two halves to avoid stack issues.
+        // abi.encodePacked has a 32KB limit; split into multiple parts to avoid stack issues.
         string memory part1 = string(
             abi.encodePacked(
                 "{\n",
@@ -463,11 +549,41 @@ contract DeployPhase1 is Script {
                 '",\n',
                 '  "sequencerFeed": "',
                 vm.toString(sequencerFeed),
-                '"\n',
+                '",\n'
+            )
+        );
+        // Phase 4 (D-15): pool + LP-NFT fields are placeholders here (written by 02-SeedPools.s.sol).
+        // Including them as empty strings so the manifest schema is complete for required_keys validation.
+        string memory part3 = string(
+            abi.encodePacked(
+                '  "arbitragePrimitive": "',
+                vm.toString(arbitragePrimitive),
+                '",\n',
+                '  "arbSwapRouter": "',
+                vm.toString(arbSwapRouter),
+                '",\n',
+                '  "algebraFactory": "',
+                vm.toString(algebraFactory),
+                '",\n',
+                '  "algebraNpm": "',
+                vm.toString(algebraNpm),
+                '",\n',
+                '  "operatorLpKey": "',
+                vm.toString(operatorLpKey),
+                '",\n',
+                '  "arbKey4": "',
+                vm.toString(arbKey4),
+                '",\n',
+                '  "poolClaude": "",\n',
+                '  "poolGpt": "",\n',
+                '  "poolGem": "",\n',
+                '  "lpNftClaude": "0",\n',
+                '  "lpNftGpt": "0",\n',
+                '  "lpNftGem": "0"\n',
                 "}\n"
             )
         );
-        string memory manifest = string(abi.encodePacked(part1, part2));
+        string memory manifest = string(abi.encodePacked(part1, part2, part3));
         vm.writeFile(manifestPath, manifest);
         console2.log("Manifest written:", manifestPath);
     }
