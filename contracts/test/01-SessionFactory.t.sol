@@ -303,4 +303,24 @@ contract SessionFactoryTest is Test {
         assertNotEq(vaults[1], vaults[2], "vault[1] != vault[2]");
         assertNotEq(vaults[0], vaults[2], "vault[0] != vault[2]");
     }
+
+    // =========================================================================
+    // Test: operatorLpKey stored + threaded to SettlementContract (D-18, Task 2 RED)
+    // =========================================================================
+
+    /// @notice SessionFactory stores operatorLpKey and each settlement's mmAddress == operatorLpKey.
+    function test_Factory_OperatorLpKey_StoredAndThreaded() public {
+        address lpKey = makeAddr("operatorLpKey");
+
+        // SessionFactory must expose operatorLpKey as an immutable
+        assertEq(factory.operatorLpKey(), lpKey, "D-18: factory.operatorLpKey must equal constructor arg");
+
+        address[3] memory vaults = factory.createSession(address(usdc), address(perps), address(0), SESSION_DURATION);
+
+        for (uint256 i = 0; i < 3; i++) {
+            address settlementAddr = _getVault(vaults, i).settlement();
+            SettlementContract sc = SettlementContract(settlementAddr);
+            assertEq(sc.mmAddress(), lpKey, "D-18: settlement.mmAddress must equal factory.operatorLpKey");
+        }
+    }
 }

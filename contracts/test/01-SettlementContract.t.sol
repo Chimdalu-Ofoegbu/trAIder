@@ -627,4 +627,132 @@ contract SettlementContractTest is Test {
         vaultUsdc = IERC20(address(usdc)).balanceOf(address(vault));
         assertLe(claimable, vaultUsdc, "solvency: still holds after user1 claim");
     }
+
+    // =========================================================================
+    // D-18 mmAddress guard tests (Task 2 — TDD RED phase)
+    // =========================================================================
+
+    /// @notice SettlementContract stores mmAddress set at construction (D-18 guard, ARB-01).
+    function test_Settlement_MmAddress_StoredAtConstruction() public {
+        address mm = makeAddr("marketMaker");
+        SettlementContract s = new SettlementContract(
+            address(usdc), address(perps), address(vault), sessionFactory, block.timestamp + SESSION_DURATION, mm
+        );
+        assertEq(s.mmAddress(), mm, "D-18: mmAddress must be stored from constructor");
+    }
+
+    /// @notice mmAddress == address(0): endSession proceeds normally (no guard fires).
+    function test_Settlement_MmAddress_Zero_AllowsEndSession() public {
+        // Default settlement was deployed with mmAddress=address(0) in setUp.
+        // endSession should work without the guard blocking.
+        _drainAndEndSession(sessionFactory);
+        assertTrue(settlement.settled(), "D-18: endSession must settle when mmAddress==0");
+    }
+
+    /// @notice mmAddress != address(0) AND still holds shares: endSession REVERTS.
+    function test_Settlement_MmAddress_WithShares_BlocksEndSession() public {
+        // Deploy a new settlement with mm as the mmAddress
+        address mm = makeAddr("marketMaker");
+
+        // Deploy fresh vault for this test
+        MTokenVault freshVault = new MTokenVault(
+            IERC20(address(usdc)),
+            "mCLA-S2",
+            "mCLA-S2",
+            address(perps),
+            address(0),
+            address(ethFeed),
+            address(btcFeed),
+            address(solFeed),
+            sessionFactory,
+            orchestrator,
+            operator,
+            INITIAL_USDC,
+            true
+        );
+        SettlementContract s = new SettlementContract(
+            address(usdc), address(perps), address(freshVault), sessionFactory, block.timestamp + SESSION_DURATION, mm
+        );
+        vm.prank(sessionFactory);
+        freshVault.setSettlement(address(s));
+        vm.prank(sessionFactory);
+        freshVault.startSession(SESSION_DURATION);
+
+        // Mint USDC to mm and deposit so mm holds shares
+        usdc.mint(mm, 50e6);
+        vm.startPrank(mm);
+        usdc.approve(address(freshVault), 50e6);
+        freshVault.deposit(50e6, mm);
+        vm.stopPrank();
+
+        // End vault session first (needed so settlementBurn guard is satisfied)
+        vm.prank(sessionFactory);
+        freshVault.endSession();
+
+        // No positions open, so drain loop is empty
+        // D-18 guard: mm still holds shares → endSession must revert
+        vm.prank(sessionFactory);
+        vm.expectRevert("Settlement: operator/MM must redeem shares before endSession");
+        s.endSession();
+    }
+
+    /// @notice mmAddress != address(0) AND has redeemed all shares: endSession SUCCEEDS.
+    function test_Settlement_MmAddress_AfterRedeem_AllowsEndSession() public {
+        address mm = makeAddr("marketMaker");
+
+        // Deploy fresh vault for this test
+        MTokenVault freshVault = new MTokenVault(
+            IERC20(address(usdc)),
+            "mCLA-S3",
+            "mCLA-S3",
+            address(perps),
+            address(0),
+            address(ethFeed),
+            address(btcFeed),
+            address(solFeed),
+            sessionFactory,
+            orchestrator,
+            operator,
+            INITIAL_USDC,
+            true
+        );
+        SettlementContract s = new SettlementContract(
+            address(usdc), address(perps), address(freshVault), sessionFactory, block.timestamp + SESSION_DURATION, mm
+        );
+        vm.prank(sessionFactory);
+        freshVault.setSettlement(address(s));
+        vm.prank(sessionFactory);
+        freshVault.startSession(SESSION_DURATION);
+
+        // Deposit user1 so vault has non-zero supply (mm also deposits)
+        usdc.mint(mm, 50e6);
+        vm.startPrank(mm);
+        usdc.approve(address(freshVault), 50e6);
+        freshVault.deposit(50e6, mm);
+        vm.stopPrank();
+
+        usdc.mint(user1, USER1_USDC);
+        vm.startPrank(user1);
+        usdc.approve(address(freshVault), USER1_USDC);
+        freshVault.deposit(USER1_USDC, user1);
+        vm.stopPrank();
+
+        // mm redeems all shares before endSession
+        uint256 mmShares = freshVault.balanceOf(mm);
+        vm.startPrank(mm);
+        freshVault.redeem(mmShares, mm, mm);
+        vm.stopPrank();
+
+        assertEq(freshVault.balanceOf(mm), 0, "mm must hold 0 shares before endSession");
+
+        // End vault session
+        vm.prank(sessionFactory);
+        freshVault.endSession();
+
+        // No positions open → drain is empty → D-18 guard passes (mm has 0 shares)
+        vm.prank(sessionFactory);
+        s.endSession();
+
+        assertTrue(s.settled(), "D-18: endSession must settle after mm redeems all shares");
+    }
 }
