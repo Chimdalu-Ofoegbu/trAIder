@@ -516,17 +516,30 @@ async def run_gate(
         from orchestrator.loop.run_session import _load_abi as _load_abi_fn  # noqa: PLC0415
 
         settlement_abi = _load_abi_fn(_contracts_out / "SettlementContract.sol" / "SettlementContract.json")
-        # In the live run, settlement contracts are created inside the session factory.
-        # The operator pre-populates manifest["settlementClaude"] etc. after createSession.
-        # Fallback: derive settlement addresses from manifest or use vault.settlement().
+        # In the live run, settlement contracts are created inside the session factory and
+        # wired into each vault via setSettlement (04-06). MTokenVault exposes
+        # `address public settlement` (auto getter). Prefer a manifest settlement key if the
+        # deploy ever starts writing one; otherwise resolve from the vault on-chain.
+        # FAIL CLOSED: a live gate run must NEVER proceed against a mocked settlement — a
+        # MagicMock here would let the D-18 choreography + assert_hard_gate_set report a
+        # false PASS. Raise loudly instead (project anti-false-green discipline).
         settlement_contracts = []
+        _manifest_settlement_keys = ("settlementClaude", "settlementGpt", "settlementGem")
         for i, vault_contract in enumerate([vp[0] for vp in vault_pool_pairs]):
             try:
-                sc_addr = await vault_contract.functions.settlement().call()
+                sc_addr = manifest.get(_manifest_settlement_keys[i]) or (
+                    await vault_contract.functions.settlement().call()
+                )
+                if not sc_addr or int(str(sc_addr), 16) == 0:
+                    raise ValueError(f"settlement address is zero/empty for vault {i}")
                 settlement_contracts.append(web3.eth.contract(address=sc_addr, abi=settlement_abi))
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("run_gate: could not resolve settlement for vault %d: %s", i, exc)
-                settlement_contracts.append(MagicMock())
+            except Exception as exc:
+                raise RuntimeError(
+                    f"run_gate: cannot resolve settlement contract for vault {i} "
+                    f"({vault_addresses[i]}): {exc}. Refusing to run the live gate against an "
+                    "unresolved settlement (would risk a false PASS). Confirm 04-06 createSession "
+                    "wired setSettlement on each vault, or add settlement addresses to the manifest."
+                ) from exc
 
     # ── Step 6: Build shared_deps for supervisor ───────────────────────────
     if dry_run and _injected_shared_deps is not None:
@@ -550,15 +563,9 @@ async def run_gate(
 
     # ── Step 7: Build model configs ────────────────────────────────────────
     model_configs = [
-        __import__("orchestrator.loop.supervisor", fromlist=["ModelConfig"]).ModelConfig(
-            name="claude", vault_address=vault_addresses[0]
-        ),
-        __import__("orchestrator.loop.supervisor", fromlist=["ModelConfig"]).ModelConfig(
-            name="gpt", vault_address=vault_addresses[1]
-        ),
-        __import__("orchestrator.loop.supervisor", fromlist=["ModelConfig"]).ModelConfig(
-            name="gemini", vault_address=vault_addresses[2]
-        ),
+        ModelConfig(name="claude", vault_address=vault_addresses[0]),
+        ModelConfig(name="gpt", vault_address=vault_addresses[1]),
+        ModelConfig(name="gemini", vault_address=vault_addresses[2]),
     ]
 
     # ── Step 8: Build speculator sim inputs ────────────────────────────────
@@ -742,7 +749,7 @@ async def run_gate(
     arb_stop.set()
 
     try:
-        harness_result = await harness.run()
+        await harness.run()
         accumulator.settlement["all_settled"] = True
         accumulator.settlement["operator_claimed"] = False
         for model in ("claude", "gpt", "gemini"):
