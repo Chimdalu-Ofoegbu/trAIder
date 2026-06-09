@@ -234,9 +234,10 @@ ORDER BY created_at ASC;
 
 ## 5. Session Start and Settlement
 
-> **Filled in by:** Phase 6 (D-49/D-50/D-67/D-68)
+> **Filled in by:** Phase 6 (D-49/D-50/D-67/D-68) for 72h live session.
+> **Phase-4 gate-run commands filled in by Plan 04-08 (Task 3).**
 
-### Pre-Session Checklist (STUB)
+### Pre-Session Checklist (STUB — 72h live; see Phase-4 gate run below for gate session)
 
 - [ ] All four operator keys funded (ETH for gas, USDC for capital)
 - [ ] Ledger Nano X connected for mainnet deploy
@@ -246,7 +247,7 @@ ORDER BY created_at ASC;
 - [ ] Telegram bot channels configured (private + public)
 - [ ] Rate limits confirmed: Anthropic, OpenAI, Google all at hackathon-tier
 
-### Session Lifecycle (STUB)
+### Session Lifecycle (STUB — 72h)
 
 1. `SessionFactory.createSession(durationSeconds=259200)` — 72h
 2. Each vault starts at NAV = 1.0 USDC/mTOKEN
@@ -254,9 +255,108 @@ ORDER BY created_at ASC;
 4. Settlement triggered at session end by keeper or operator
 5. Speculators claim USDC proportional to vault performance via `SettlementContract.claim`
 
-### Post-Settlement Teardown (STUB)
+### Post-Settlement Teardown (STUB — 72h)
 
 > Phase 6 fills in: archive journal entries, capture final NAV, emit final Telegram post.
+
+---
+
+### Phase-4 Gate Run (04-08 Task 4) — REAL Commands
+
+The Phase-4 gate is a mini-session (~45-60 min) that validates all 7 D-16 HARD criteria
+before the 72h live session. Run these commands in order:
+
+#### Step A: Deploy + seed (if not already done)
+
+```bash
+# Deploy contracts + seed pools (Phase-4 specific — pools + LP positions)
+# Requires: SEPOLIA_RPC, DEPLOYER_PRIVATE_KEY, OPERATOR_LP_KEY, all env vars from .env.example
+uv run --project orchestrator python -m gate.deploy_seed  # Phase-6 script; for now: manual forge script
+# Alternatively run the 04-06 pool seeding script:
+cd contracts && forge script script/04-SeedPools.s.sol --rpc-url $SEPOLIA_RPC --broadcast --private-key $DEPLOYER_PRIVATE_KEY
+```
+
+#### Step B: Pre-flight check
+
+```bash
+# Assert pools deployed, on-peg, mmAddress correct, keys funded, venue artifact present.
+# Exits 0 on all PASS; exits 1 on any failure with details.
+export SEPOLIA_RPC=<your-sepolia-rpc-url>
+uv run --project orchestrator python -m gate.preflight
+```
+
+Expected output when ready:
+
+```
+[PASS] POOLS_EXIST: all 3 pools have on-chain code
+[PASS] POOLS_ON_PEG: all 3 pools within 0.5% of NAV
+[PASS] MM_ADDRESS_CORRECT: all vault mmAddresses == operatorLpKey
+[PASS] ARB_KEY4_FUNDED: ARB_KEY4=0x...1 ETH balance=0.0500 ETH >= 0.010 ETH — OK
+[PASS] OPERATOR_LP_FUNDED: OPERATOR_LP_KEY=0x...1 ETH balance=0.0500 ETH >= 0.010 ETH — OK
+[PASS] HOLDER_USDC: HOLDER_*_KEY env vars not set — holder USDC check skipped
+[PASS] VENUE_ARTIFACT: VENUE=V3 confirmed at .planning/phases/.../04-VENUE-DECISION.md
+ALL CHECKS PASSED — gate run is ready to launch.
+```
+
+#### Step C: Set environment variables
+
+```bash
+# Gate timing + bot hysteresis (all env-overridable)
+export GATE_DURATION=3600                # 1 hour gate session (default); use 2700 for 45min
+export FIRE_THRESHOLD_BPS=250            # Probe-justified floor above Algebra max dynamic fee
+export ARB_POLL_INTERVAL=12              # Arb bot poll cadence in seconds
+export KEY4_USDC_MIN_WARNING=500000000   # Alert threshold for key #4 USDC (500 USDC raw)
+
+# LLM API keys (required for live 3-model session)
+export ANTHROPIC_API_KEY=<key>
+export OPENAI_API_KEY=<key>
+export GOOGLE_AI_API_KEY=<key>
+
+# Key material (from .env.* files — never committed)
+export OPERATOR_TRADE_PRIVATE_KEY=<hex>
+export OPERATOR_JOURNAL_KEY_PRIV=<hex>
+export ARB_KEY4_PRIVATE_KEY=<hex>
+export OPERATOR_LP_KEY_PRIVATE_KEY=<hex>
+```
+
+#### Step D: Launch the gate run
+
+```bash
+# Full automated run (3 models + arb bot + speculator sim + 8-step harness)
+uv run --project orchestrator python -m gate.run_gate --full-run
+
+# Interactive step-through (narrated demo — prompts between each harness step)
+uv run --project orchestrator python -m gate.run_gate --full-run --step-through
+
+# Custom gate duration
+uv run --project orchestrator python -m gate.run_gate --full-run --gate-duration 2700
+
+# Supply the venue artifact path explicitly (if using a non-default location)
+uv run --project orchestrator python -m gate.run_gate --full-run \
+  --nav-sim-result .planning/phases/04-multi-model-amm-arbitrage/04-VENUE-DECISION.md
+```
+
+#### Step E: Record the result in 04-GATE.md
+
+The gate run prints an evidence dict on PASS. Copy it into `04-GATE.md`:
+
+```bash
+# Capture gate output to a file
+uv run --project orchestrator python -m gate.run_gate --full-run 2>&1 | tee gate-run-output.txt
+# Then paste the "Evidence dict" section from gate-run-output.txt into .planning/.../04-GATE.md
+```
+
+**Gate PASS criteria (all 7 D-16 HARD criteria):**
+
+| Criterion | Description                                                                          |
+| --------- | ------------------------------------------------------------------------------------ |
+| (a)       | All 3 models ≥1 real open AND ≥1 real close                                          |
+| (b)       | AMM pool globalState().price changed during the run                                  |
+| (c)       | ≥1 synthetic gap closed by arbCloseGap in <60s                                       |
+| (d)       | Clean settlement: all 3 vaults settled, distribute non-empty, operator_claimed=False |
+| (e)       | 04-VENUE-DECISION.md exists with parseable VENUE: V2\|V3 line                        |
+| (f)       | D-14 per-cycle fairness check passed                                                 |
+| (g)       | One continuous run: no crash, no manual intervention                                 |
 
 ---
 
