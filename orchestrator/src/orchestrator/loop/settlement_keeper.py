@@ -1,6 +1,11 @@
 """
 orchestrator.loop.settlement_keeper — Settlement keeper: drain positions + endSession (GAP #9).
 
+Phase-4 addition: `drain_and_settle_multi` runs 3 vaults concurrently via asyncio.gather
+(return_exceptions=True so one vault failure cannot stop the others). Returns a
+{vault_address: result_dict} map for the gate harness D-18 choreography.
+
+
 Implements the settlement flow required to finalize a trAIder session and allow holders
 to call SettlementContract.claim(). The contract cannot wait inside a transaction while
 MockPerps async-executes close orders, so the orchestrator must pre-drain positions and
@@ -676,3 +681,117 @@ async def run_settlement_keeper(
         telegram_bot_token=telegram_bot_token,
         telegram_chat_id=telegram_chat_id,
     )
+
+
+# ---------------------------------------------------------------------------
+# drain_and_settle_multi — Phase-4 multi-vault concurrent settlement (D-18)
+# ---------------------------------------------------------------------------
+
+
+async def drain_and_settle_multi(
+    web3: Any,
+    mock_perps: Any,
+    vault_triples: list[tuple[Any, Any, str]],
+    *,
+    orchestrator_address: str,
+    deployer_address: str,
+    max_drain_wait_blocks: int = DEFAULT_MAX_DRAIN_WAIT_BLOCKS,
+    poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
+    value_check_interval_seconds: float = DEFAULT_VALUE_CHECK_INTERVAL_SECONDS,
+    value_zero_max_polls: int = DEFAULT_VALUE_ZERO_MAX_POLLS,
+    telegram_bot_token: str | None = None,
+    telegram_chat_id: str | None = None,
+) -> dict[str, dict]:
+    """Drain and settle 3 vaults concurrently for the D-18 gate choreography.
+
+    Runs drain_and_settle for each vault triple concurrently via asyncio.gather
+    with return_exceptions=True — a failure on one vault does NOT stop the others.
+
+    Args:
+        web3: AsyncWeb3 instance (shared across all vaults).
+        mock_perps: MockPerps contract instance (shared adapter).
+        vault_triples: List of (vault_contract, settlement_contract, vault_address) tuples.
+            The harness passes 3 triples — one per model vault.
+        orchestrator_address: Operator-trade EOA (onlyOrchestrator for vault.closePosition).
+        deployer_address: EOA for executeOrder (permissionless).
+        max_drain_wait_blocks: Block budget per vault.
+        poll_interval_seconds: Poll cadence for executeOrder retries.
+        value_check_interval_seconds: Poll cadence for positionValueUSDC == 0 check.
+        value_zero_max_polls: Max polls for positionValueUSDC before timeout.
+        telegram_bot_token: Optional Telegram token for CRITICAL alerts.
+        telegram_chat_id: Optional Telegram chat ID for alerts.
+
+    Returns:
+        Dict mapping vault_address -> result_dict (same shape as drain_and_settle).
+        Exceptions are caught per-vault and surfaced as result_dicts with
+        status='error' so the caller can inspect per-vault outcomes.
+
+    D-18 constraint: The harness MUST ensure the operator has removed LP and redeemed
+    all mTOKEN shares (vault.balanceOf(mmAddress)==0) BEFORE calling this function.
+    This function handles step 5 of the D-18 choreography (drain positions); step 4
+    (operator redeem) must be asserted in step 4 of harness.run() before calling here.
+    """
+    if not vault_triples:
+        logger.warning("drain_and_settle_multi: called with empty vault_triples — no-op")
+        return {}
+
+    logger.info(
+        "drain_and_settle_multi: starting concurrent settlement for %d vault(s)",
+        len(vault_triples),
+    )
+
+    async def _drain_one(
+        vault_contract: Any, settlement_contract: Any, vault_address: str
+    ) -> tuple[str, dict]:
+        """Wrapper that returns (vault_address, result) for gather aggregation."""
+        result = await drain_and_settle(
+            web3,
+            mock_perps,
+            settlement_contract,
+            vault_contract,
+            vault_address=vault_address,
+            orchestrator_address=orchestrator_address,
+            deployer_address=deployer_address,
+            max_drain_wait_blocks=max_drain_wait_blocks,
+            poll_interval_seconds=poll_interval_seconds,
+            value_check_interval_seconds=value_check_interval_seconds,
+            value_zero_max_polls=value_zero_max_polls,
+            telegram_bot_token=telegram_bot_token,
+            telegram_chat_id=telegram_chat_id,
+        )
+        return vault_address, result
+
+    # Run all vaults concurrently; return_exceptions=True prevents one failure
+    # from stopping the others (D-18: partial settlement is still progress).
+    gather_results = await asyncio.gather(
+        *[_drain_one(vc, sc, va) for (vc, sc, va) in vault_triples],
+        return_exceptions=True,
+    )
+
+    # Build vault_address -> result map, converting exceptions to error dicts.
+    output: dict[str, dict] = {}
+    for i, raw in enumerate(gather_results):
+        vault_address = vault_triples[i][2]
+        if isinstance(raw, BaseException):
+            logger.error(
+                "drain_and_settle_multi: vault=%s raised an exception: %s",
+                vault_address[:10],
+                raw,
+            )
+            output[vault_address] = {
+                "status": "error",
+                "positions_closed": 0,
+                "message": str(raw),
+            }
+        else:
+            # raw is (vault_address, result_dict) from _drain_one
+            _, result = raw
+            output[vault_address] = result
+
+    settled = sum(1 for r in output.values() if r.get("status") == "settled")
+    logger.info(
+        "drain_and_settle_multi: %d/%d vaults settled successfully",
+        settled,
+        len(vault_triples),
+    )
+    return output
