@@ -83,6 +83,61 @@ PHASE4_REQUIRED_KEYS: list[str] = [
 DEFAULT_GATE_DURATION: int = int(os.environ.get("GATE_DURATION", "3600"))
 
 # ---------------------------------------------------------------------------
+# Minimal inline ABIs for the external Camelot/Algebra contracts.
+# No compiled artifacts exist for these (external dep — ArbitragePrimitive.sol reads
+# globalState() via raw assembly for the same reason), so we declare just the methods
+# the bot / sim / harness actually call. The on-chain selector depends only on the
+# argument TYPES (which are known/stable), not the component names.
+#
+# LIVE-VALIDATION (buffered pre-demo session): real Algebra Integral v1 globalState()
+# returns 256 bytes (8 slots) — VENUE-DECISION finding #1. Reading index 0 (sqrtPriceX96)
+# decodes fine from the leading slot; if web3 raises a decode error against the live pool,
+# switch the pool read to a raw eth_call taking the first 32 bytes. The SwapRouter tuple
+# below matches speculator_sim's params dict (Camelot exactInputSingle).
+_ALGEBRA_POOL_ABI: list = [
+    {
+        "inputs": [],
+        "name": "globalState",
+        "outputs": [
+            {"name": "price", "type": "uint160"},
+            {"name": "tick", "type": "int24"},
+            {"name": "lastFee", "type": "uint16"},
+            {"name": "pluginConfig", "type": "uint8"},
+            {"name": "communityFee", "type": "uint16"},
+            {"name": "unlocked", "type": "bool"},
+        ],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {"inputs": [], "name": "token0", "outputs": [{"name": "", "type": "address"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "token1", "outputs": [{"name": "", "type": "address"}], "stateMutability": "view", "type": "function"},
+]
+
+_SWAP_ROUTER_ABI: list = [
+    {
+        "inputs": [
+            {
+                "components": [
+                    {"name": "tokenIn", "type": "address"},
+                    {"name": "tokenOut", "type": "address"},
+                    {"name": "recipient", "type": "address"},
+                    {"name": "deadline", "type": "uint256"},
+                    {"name": "amountIn", "type": "uint256"},
+                    {"name": "amountOutMinimum", "type": "uint256"},
+                    {"name": "sqrtPriceLimitX96", "type": "uint160"},
+                ],
+                "name": "params",
+                "type": "tuple",
+            }
+        ],
+        "name": "exactInputSingle",
+        "outputs": [{"name": "amountOut", "type": "uint256"}],
+        "stateMutability": "payable",
+        "type": "function",
+    },
+]
+
+# ---------------------------------------------------------------------------
 # Manifest loader (reuses run_session.py pattern — D-14)
 # ---------------------------------------------------------------------------
 
@@ -468,11 +523,7 @@ async def run_gate(
         vault_abi = _load_abi_fn(_contracts_out / "mTokenVault.sol" / "MTokenVault.json")
         arb_abi = _load_abi_fn(_contracts_out / "ArbitragePrimitive.sol" / "ArbitragePrimitive.json")
         settlement_abi = _load_abi_fn(_contracts_out / "SettlementContract.sol" / "SettlementContract.json")
-        pool_abi: list = []  # Algebra pool — use minimal ABI or load if artifact exists
-        try:
-            pool_abi = _load_abi_fn(_contracts_out / "AlgebraPool.sol" / "AlgebraPool.json")
-        except FileNotFoundError:
-            logger.warning("run_gate: AlgebraPool artifact not found — using empty ABI (live pool calls may fail)")
+        pool_abi = _ALGEBRA_POOL_ABI  # inline — no compiled artifact (see module top)
 
         vault_contracts = [
             web3.eth.contract(address=addr, abi=vault_abi)
@@ -573,15 +624,9 @@ async def run_gate(
         swap_router = _make_fake_swap_router()
         demo_wallet = "0xDemoWallet000000000000000000000000000001"
     else:
-        swap_router_abi: list = []
-        try:
-            from orchestrator.loop.run_session import _load_abi as _load_abi_fn  # noqa: PLC0415
-
-            _contracts_out = _REPO_ROOT / "contracts" / "out"
-            swap_router_abi = _load_abi_fn(_contracts_out / "IAlgebraSwapRouter.sol" / "IAlgebraSwapRouter.json")
-        except Exception:  # noqa: BLE001
-            pass
-        swap_router = web3.eth.contract(address=manifest["arbSwapRouter"], abi=swap_router_abi)
+        # Camelot/Algebra SwapRouter: no compiled artifact — inline ABI whose exactInputSingle
+        # tuple matches speculator_sim's params dict (see _SWAP_ROUTER_ABI at module top).
+        swap_router = web3.eth.contract(address=manifest["arbSwapRouter"], abi=_SWAP_ROUTER_ABI)
         demo_wallet = os.environ.get("DEMO_WALLET_ADDRESS", manifest.get("operatorLpKey", ""))
 
     # ── Step 9: Build stop event (shared between sim + harness) ──────────
