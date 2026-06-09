@@ -341,43 +341,24 @@ contract ArbitragePrimitiveTest is Test {
         uint256 mTokenOut = arb.arbMint(address(vault), usdcAmt, 0);
         vm.stopPrank();
 
-        // Trip the circuit breaker by making NAV drop below 30% of initial NAV.
-        // Nav is computed as totalAssets/totalSupply. totalAssets = USDC balance + positionValue.
-        // We can trip the CB by calling vault.checkAndLatchCircuitBreaker() after dropping NAV.
-        // Simplest: use vm.mockCall to fake a low NAV for the circuit breaker check.
-        // Actually, the CB is latched inside deposit() via _checkCircuitBreaker.
-        // The simplest way to trip it: call checkAndLatchCircuitBreaker() with a mock that
-        // makes the vault report low totalAssets.
-        // Alternative: deal the vault a very small USDC balance and call the latch.
-        //
-        // Use vm.mockCall to make vault.totalAssets() return a tiny value → NAV < 30%.
-        // nav = totalAssets * 1e30 / totalSupply
-        // totalSupply ≈ 1_001_000e18 (pool deposit + caller deposit)
-        // Need nav < 0.3e18 → totalAssets < 0.3e18 * totalSupply / 1e30
-        //                                   = 0.3e18 * 1_001_000e18 / 1e30
-        //                                   = 300_300e6 * 0.3 ≈ 300_300 (tiny)
-        uint256 totalSupply = vault.totalSupply();
-        // Compute a low totalAssets that gives nav < 30% of 1e18
-        // nav = assets * 1e30 / supply < 0.3e18
-        // assets < 0.3e18 * supply / 1e30
-        uint256 lowAssets = (3e17 * totalSupply) / 1e30; // slightly below 0.3e18 * supply / 1e30
+        // Trip the circuit breaker by directly writing _mintPaused=true to storage.
+        // vm.mockCall(totalAssets) cannot work here: checkAndLatchCircuitBreaker() calls
+        // _computeNav() which calls totalAssets() via INTERNAL dispatch (same contract),
+        // bypassing the external-call intercept layer.
+        // Storage layout (forge inspect MTokenVault storage-layout):
+        //   slot 13, byte 0 = _mintPaused (bool)
+        //   slot 13, byte 1 = _tradingLocked (bool)
+        //   slot 13, byte 2 = _sessionPaused (bool)
+        // Set slot 13 to uint256(1) → _mintPaused=true, others=false.
+        vm.store(address(vault), bytes32(uint256(13)), bytes32(uint256(1)));
 
-        // Mock the vault's totalAssets to return a tiny value
-        vm.mockCall(address(vault), abi.encodeWithSelector(vault.totalAssets.selector), abi.encode(lowAssets));
-
-        // Latch the circuit breaker
-        vault.checkAndLatchCircuitBreaker();
-
-        // Remove mock so vault works normally after the latch
-        vm.clearMockedCalls();
-
-        // arbMint should now revert because mint is paused
+        // arbMint should now revert because _mintPaused is latched
         vm.startPrank(caller);
         usdc.approve(address(arb), usdcAmt);
         vm.expectRevert("Vault: mint paused");
         arb.arbMint(address(vault), usdcAmt, 0);
 
-        // arbBurn must still succeed (burn stays live during CB pause)
+        // arbBurn must still succeed (vault.redeem() has no CB guard — VAULT-05 asymmetry)
         vault.approve(address(arb), mTokenOut);
         uint256 usdcOut = arb.arbBurn(address(vault), mTokenOut, 0);
         assertGt(usdcOut, 0, "arbBurn must succeed during CB pause");
@@ -391,18 +372,65 @@ contract ArbitragePrimitiveTest is Test {
 
     /// @notice With AMM price within 1% of NAV, arbCloseGap reverts "AP: gap below threshold".
     function test_arbCloseGap_revertsBelow1pct() public {
-        // NAV ≈ 1e18 (at session start, no trades)
-        // Set pool price to EXACTLY NAV (0% gap) → should revert
-        // pool.sqrtPriceX96 is already set to approximately NAV-price in setUp
-        // Force the arb check to fail — set price to within 1% of NAV
-        // Current sqrtPriceX96 corresponds to ~1:1 price
-        // We want it to be 0.5% above NAV → still below 1% threshold → revert
+        // Strategy: mock vault.nav() to return the exact price that _readPoolPrice decodes,
+        // ensuring the gap = 0 → revert. This tests the threshold guard directly.
+        //
+        // First, compute what price _readPoolPrice returns for the current pool.
+        // We mock vault.nav() to match that value so gap = 0 bps < 100 bps threshold.
+        //
+        // token ordering: vault < usdc or usdc < vault (non-deterministic address)
+        // Use vm.mockCall on globalState to return a price that makes gap = 0:
+        // Mock NAV to match the pool price exactly.
+        //
+        // The pool.sqrtPriceX96 = 79_228_162_514 (tiny). We can just mock vault.nav() to be
+        // whatever ammPrice decodes to. But if ammPrice = 0, gap = -infinity, which would
+        // not be < threshold.
+        //
+        // Cleaner: mock globalState to return a sqrtPriceX96 that decodes to nav exactly.
+        // nav = 1e18 (session start with no trades).
+        // If mTokenIsToken0: sqrtP = 1000 * 2^96 (from formula: sqrtP^2 * 1e12/2^192 = 1e18
+        //   → sqrtP = 1e3 * 2^96)
+        // If USDC=token0: sqrtP = 2^96 / 1e3 (from formula: 2^192 * 1e12/sqrtP^2 = 1e18
+        //   → sqrtP = 2^96 / 1e3)
+        //
+        // Since token ordering is non-deterministic, mock vault.nav() to match decoded price.
+        // The decoded price from sqrtP=79228162514 (≈2^36):
+        // mTokenIsToken0: step1 = 79228162514 * 1e12 / 2^96 → 0 (underflows integer division)
+        //   ammPrice = 0, gap = (0 - nav) * 10000 / nav = -10000 bps → abs = 10000 > 100
+        //   → would NOT revert. So we need a different sqrtPriceX96.
+        //
+        // Use vm.mockCall on globalState() to force a specific price return.
+        // At price exactly equal to nav (gap=0):
+        // For mTokenIsToken0 case: sqrtP = 1000 * 2^96 ≈ 7.9e31
+        // For USDC=token0 case: sqrtP = 2^96 / 1000 ≈ 7.9e25
+        //
+        // We mock both: check token0 to determine which formula applies.
+        bool mTokenIsToken0 = address(vault) < address(usdc);
+        uint256 Q96 = 2 ** 96;
+        uint160 sqrtPriceAtNAV;
+        if (mTokenIsToken0) {
+            // sqrtP = sqrt(1e18 * 2^192 / 1e12) = sqrt(1e6 * 2^192) = 1e3 * 2^96
+            sqrtPriceAtNAV = uint160(1000 * Q96);
+        } else {
+            // sqrtP = sqrt(2^192 * 1e12 / 1e18) = sqrt(2^192 / 1e6) = 2^96 / 1e3
+            sqrtPriceAtNAV = uint160(Q96 / 1000);
+        }
 
-        // Give caller some USDC for the arb call
+        // Set pool price to exactly NAV (0% gap)
+        pool.setPrice(sqrtPriceAtNAV);
+
         vm.startPrank(caller);
         usdc.approve(address(arb), 100_000e6);
 
         // With price at NAV (0% gap) — must revert
+        vm.expectRevert("AP: gap below threshold");
+        arb.arbCloseGap(address(vault), address(pool));
+
+        // Also test at 0.5% gap (above NAV but below 1% threshold) — must still revert
+        // price = NAV * 1.005 → sqrtP = sqrt(1.005) * sqrtPAtNAV ≈ 1.0025 * sqrtPAtNAV
+        uint160 sqrtPrice05pct = uint160((uint256(sqrtPriceAtNAV) * 10025) / 10000);
+        pool.setPrice(sqrtPrice05pct);
+
         vm.expectRevert("AP: gap below threshold");
         arb.arbCloseGap(address(vault), address(pool));
 
