@@ -195,10 +195,12 @@ contract ArbitragePrimitive is IArbitragePrimitive, ReentrancyGuardTransient {
 
             IERC20(usdc).forceApprove(pool, 0);
 
-            // Redeem mTOKEN at NAV
+            // Redeem mTOKEN at NAV — USDC goes directly to msg.sender as the receiver.
+            // vault.redeem() already reverts if it cannot pay (ERC-4626 guarantee).
             uint256 mTokenBal = IERC20(vault).balanceOf(address(this));
             if (mTokenBal > 0) {
                 IERC20(vault).forceApprove(vault, mTokenBal);
+                // slither-disable-next-line unused-return — usdcOut delivered to msg.sender via receiver= param; vault reverts on failure
                 IMTokenVault(vault).redeem(mTokenBal, msg.sender, address(this));
                 IERC20(vault).forceApprove(vault, 0);
             }
@@ -218,18 +220,19 @@ contract ArbitragePrimitive is IArbitragePrimitive, ReentrancyGuardTransient {
     /// @notice Algebra pool callback: called by pool.swap() to collect the token input.
     /// @dev Decode the callback data to identify which token to pay and transfer it to the pool.
     ///      The callback data encodes (tokenIn, tokenOut, caller, minAmountOut).
+    ///      Only tokenIn is used in the callback body — the other fields are passed through
+    ///      for documentation / future slippage enforcement at the callsite.
     function algebraSwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external {
         // The pool must be the caller (prevent arbitrary calls)
         // Note: in unit tests the MockAlgebraPool is msg.sender; in production any whitelisted pool.
         // For the stateless primitive we trust that this is called by a legitimate pool.
         // Production use: callers should validate pool addresses before calling arbCloseGap.
 
-        (address tokenIn, address tokenOut, address recipient, uint256 minAmountOut) =
-            abi.decode(data, (address, address, address, uint256));
-        // Suppress unused variable (recipient and minAmountOut checked via output balances)
-        recipient;
-        minAmountOut;
-        tokenOut;
+        // Decode only tokenIn (first field). The remaining fields are logged in calldata but
+        // not used in the callback body — slither-disable-next-line unused-return justified:
+        // tokenOut/recipient/minAmountOut are metadata encoded for the callback callsite,
+        // not consumed here.
+        (address tokenIn,,,) = abi.decode(data, (address, address, address, uint256));
 
         // Pay the pool for the tokens we received
         int256 amountToPay = amount0Delta > 0 ? amount0Delta : amount1Delta;

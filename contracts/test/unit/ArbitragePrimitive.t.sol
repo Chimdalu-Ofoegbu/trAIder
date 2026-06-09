@@ -45,6 +45,10 @@ contract MockAlgebraPool {
     // Whether the pool is locked (simulates Algebra globalState.unlocked)
     bool public poolUnlocked = true;
 
+    // Whether swap() should revert (for error path coverage tests)
+    bool public swapShouldRevert = false;
+    string public swapRevertReason = "";
+
     constructor(address _token0, address _token1, uint160 _sqrtPriceX96) {
         // token0 must be < token1 per Algebra/Uniswap convention
         if (_token0 < _token1) {
@@ -60,6 +64,12 @@ contract MockAlgebraPool {
     /// @dev Update the pool price (for test control)
     function setPrice(uint160 _sqrtPriceX96) external {
         sqrtPriceX96 = _sqrtPriceX96;
+    }
+
+    /// @dev Make swap() revert on next call (for error path coverage)
+    function setSwapReverts(bool reverts, string calldata reason) external {
+        swapShouldRevert = reverts;
+        swapRevertReason = reason;
     }
 
     /// @dev Algebra globalState() — returns 256 bytes (8 slots per VENUE-DECISION.md finding).
@@ -91,6 +101,14 @@ contract MockAlgebraPool {
     ) external returns (int256 amount0, int256 amount1) {
         // Suppress unused variable warnings
         sqrtPriceLimitX96;
+
+        // Error path: revert with configured reason (for coverage tests)
+        if (swapShouldRevert) {
+            if (bytes(swapRevertReason).length > 0) {
+                revert(swapRevertReason);
+            }
+            revert(); // no-reason revert (tests "AP: swap failed" path)
+        }
 
         // Simulate a 1:1 swap (at current price) for testing purposes.
         // In the actual pool, the swap math is complex; here we approximate.
@@ -473,6 +491,123 @@ contract ArbitragePrimitiveTest is Test {
         uint256 callerUsdcAfter = usdc.balanceOf(caller);
         // The caller should have approximately the same USDC as before (within dust)
         assertApproxEqAbs(callerUsdcAfter, callerUsdcBefore, 2, "D-06: net USDC delta must be ~0 (AT-NAV)");
+
+        vm.stopPrank();
+    }
+
+    // =========================================================================
+    // Test 5 (extra): arbCloseGap AMM>NAV path (buy at NAV, sell on AMM)
+    // =========================================================================
+
+    /// @notice With AMM price > NAV by > 1%, arbCloseGap executes the AMM>NAV round-trip:
+    ///         deposits USDC into vault at NAV, then sells mTOKEN on AMM.
+    ///         After: arb holds nothing; caller gets USDC back (possibly with profit).
+    function test_arbCloseGap_ammAboveNav_succeeds() public {
+        // Set AMM price 5% above NAV.
+        // NAV = 1e18 (initial). AMM needs ammPrice_e18 > 1.01e18.
+        // Use same formula as test_arbCloseGap_revertsBelow1pct but apply 1.05x multiplier.
+        bool mTokenIsToken0 = address(vault) < address(usdc);
+        uint256 Q96 = 2 ** 96;
+        uint160 sqrtPriceAtNAV;
+        if (mTokenIsToken0) {
+            sqrtPriceAtNAV = uint160(1000 * Q96);
+        } else {
+            sqrtPriceAtNAV = uint160(Q96 / 1000);
+        }
+        // Multiply sqrtPrice by sqrt(1.05) ≈ 1.0247 to get ~5% price increase.
+        // We use 10247/10000 as integer approximation.
+        uint160 sqrtPriceAboveNav = uint160((uint256(sqrtPriceAtNAV) * 10_247) / 10_000);
+        pool.setPrice(sqrtPriceAboveNav);
+
+        // Caller needs USDC to fund the arb (1000 USDC fixed notional in arbCloseGap)
+        uint256 arbCapital = 1100e6; // a little extra for slippage
+        usdc.mint(caller, arbCapital);
+
+        uint256 callerUsdcBefore = usdc.balanceOf(caller);
+
+        vm.startPrank(caller);
+        usdc.approve(address(arb), arbCapital);
+
+        // arbCloseGap must succeed (gap > 1% threshold)
+        arb.arbCloseGap(address(vault), address(pool));
+
+        vm.stopPrank();
+
+        // D-07: arb contract must hold nothing after the call
+        assertEq(usdc.balanceOf(address(arb)), 0, "D-07: arb holds 0 USDC after AMM>NAV arbCloseGap");
+        assertEq(vault.balanceOf(address(arb)), 0, "D-07: arb holds 0 mTOKEN after AMM>NAV arbCloseGap");
+
+        // Caller's USDC balance may have increased or be close to original (profit from AMM>NAV)
+        // The mock pool is 1:1 so net is roughly 0 change — just verify caller balance is tracked
+        uint256 callerUsdcAfter = usdc.balanceOf(caller);
+        // Caller should have gotten most of their USDC back (pool returns 1:1 in the mock)
+        assertLe(callerUsdcAfter, callerUsdcBefore, "caller USDC not negative");
+    }
+
+    // =========================================================================
+    // Test 5 (extra): arbCloseGap AMM<NAV path (buy on AMM, redeem at NAV)
+    // =========================================================================
+
+    /// @notice With AMM price < NAV by > 1%, arbCloseGap executes the AMM<NAV round-trip:
+    ///         buys mTOKEN on AMM (cheap), then redeems at NAV.
+    function test_arbCloseGap_ammBelowNav_succeeds() public {
+        // Set AMM price 5% below NAV.
+        bool mTokenIsToken0 = address(vault) < address(usdc);
+        uint256 Q96 = 2 ** 96;
+        uint160 sqrtPriceAtNAV;
+        if (mTokenIsToken0) {
+            sqrtPriceAtNAV = uint160(1000 * Q96);
+        } else {
+            sqrtPriceAtNAV = uint160(Q96 / 1000);
+        }
+        // Multiply sqrtPrice by sqrt(0.95) ≈ 0.9747 to get ~5% price decrease.
+        uint160 sqrtPriceBelowNav = uint160((uint256(sqrtPriceAtNAV) * 9_747) / 10_000);
+        pool.setPrice(sqrtPriceBelowNav);
+
+        // Caller needs USDC for the arb (1000 USDC fixed notional in arbCloseGap)
+        uint256 arbCapital = 1100e6;
+        usdc.mint(caller, arbCapital);
+
+        vm.startPrank(caller);
+        usdc.approve(address(arb), arbCapital);
+
+        // arbCloseGap must succeed (gap > 1% threshold, AMM < NAV)
+        arb.arbCloseGap(address(vault), address(pool));
+
+        vm.stopPrank();
+
+        // D-07: arb contract must hold nothing after the call
+        assertEq(usdc.balanceOf(address(arb)), 0, "D-07: arb holds 0 USDC after AMM<NAV arbCloseGap");
+        assertEq(vault.balanceOf(address(arb)), 0, "D-07: arb holds 0 mTOKEN after AMM<NAV arbCloseGap");
+    }
+
+    // =========================================================================
+    // Test: _executeSwap error paths — revert bubbling (coverage for lines 346-352)
+    // =========================================================================
+
+    /// @notice When pool.swap() reverts WITH a reason, arbCloseGap bubbles up the reason.
+    ///         When pool.swap() reverts WITHOUT a reason, arbCloseGap uses "AP: swap failed".
+    function test_arbCloseGap_swapReverts_bubblesUp() public {
+        // Set AMM price 5% above NAV to enter the AMM>NAV branch
+        bool mTokenIsToken0 = address(vault) < address(usdc);
+        uint256 Q96 = 2 ** 96;
+        uint160 sqrtPriceAtNAV = mTokenIsToken0 ? uint160(1000 * Q96) : uint160(Q96 / 1000);
+        uint160 sqrtPriceAboveNav = uint160((uint256(sqrtPriceAtNAV) * 10_247) / 10_000);
+        pool.setPrice(sqrtPriceAboveNav);
+
+        usdc.mint(caller, 1100e6);
+        vm.startPrank(caller);
+        usdc.approve(address(arb), 1100e6);
+
+        // Case 1: swap reverts WITH a reason — bubble up (lines 346-350)
+        pool.setSwapReverts(true, "MockPool: insufficient output");
+        vm.expectRevert("MockPool: insufficient output");
+        arb.arbCloseGap(address(vault), address(pool));
+
+        // Case 2: swap reverts WITHOUT a reason — "AP: swap failed" (lines 351-352)
+        pool.setSwapReverts(true, "");
+        vm.expectRevert("AP: swap failed");
+        arb.arbCloseGap(address(vault), address(pool));
 
         vm.stopPrank();
     }
