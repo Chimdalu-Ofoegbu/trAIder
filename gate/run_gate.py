@@ -26,7 +26,7 @@ Manifest keys required (Phase-4 set from context_facts):
   mockPerps, mockUsdc.
 
 Signing middleware is injected for each EOA that submits transactions:
-  - orchestrator-trade EOA (OPERATOR_TRADE_PRIVATE_KEY)
+  - orchestrator-trade EOA (OPERATOR_TRADE_KEY)
   - operator-journal EOA (OPERATOR_JOURNAL_KEY_PRIV)
   - ARB_KEY4 (ARB_KEY4_PRIVATE_KEY)
   - OPERATOR_LP_KEY (OPERATOR_LP_KEY_PRIVATE_KEY)
@@ -223,6 +223,117 @@ def _build_web3_with_signers(
         logger.info("run_gate: signing middleware loaded for EOA=%s", account.address)
 
     return web3, loaded_signer_addresses
+
+
+# ---------------------------------------------------------------------------
+# Holder wallet derivation (Task 3 — real holder keys, no placeholders)
+# ---------------------------------------------------------------------------
+
+_HOLDER_ENV_KEYS: list[tuple[str, str]] = [
+    ("HOLDER_CLAUDE_KEY", "claude"),
+    ("HOLDER_GPT_KEY", "gpt"),
+    ("HOLDER_GEM_KEY", "gemini"),
+]
+"""Mapping from env var name to model name for the 3 holder wallets."""
+
+_HOLDER_USDC_AMOUNT: int = 5 * 10**6
+"""Default USDC amount per holder in raw units (5 USDC at 6 decimals)."""
+
+
+def build_holder_list(
+    vault_addresses: list[str],
+    *,
+    dry_run: bool = False,
+    holder_usdc_amount: int = _HOLDER_USDC_AMOUNT,
+) -> list[tuple[str, str, int]]:
+    """Derive the 3 demo holder wallets from env keys HOLDER_CLAUDE_KEY/HOLDER_GPT_KEY/HOLDER_GEM_KEY.
+
+    Each holder corresponds to one vault (claude→vault[0], gpt→vault[1], gem→vault[2]).
+    The returned address is derived from Account.from_key(key).address so the holder
+    can actually sign buys + claims (a placeholder cannot sign — D-19 correctness).
+
+    In live mode, all three HOLDER_*_KEY env vars must be set; missing → ValueError
+    (fail loudly rather than silently accepting a placeholder that can't sign).
+
+    In --dry-run mode, missing holder keys are replaced with deterministic test addresses
+    derived from a fixed test private key (0xdead...N). This avoids requiring real keys
+    for the local dry-run path while keeping the address derivation code active.
+
+    Args:
+        vault_addresses: 3-element list [claude_vault, gpt_vault, gem_vault].
+        dry_run: If True, allow missing HOLDER_*_KEY with deterministic fallback.
+        holder_usdc_amount: Raw USDC units per holder (default 5e6 = $5).
+
+    Returns:
+        List of (holder_address, vault_address, usdc_amount) tuples, one per model.
+
+    Raises:
+        ValueError: In live mode, if any HOLDER_*_KEY env var is missing.
+    """
+    from eth_account import Account  # noqa: PLC0415
+
+    holders: list[tuple[str, str, int]] = []
+    errors: list[str] = []
+
+    # Deterministic dry-run fallback keys (not real — only for local testing)
+    _DRY_RUN_FALLBACK_KEYS: list[str] = [
+        "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbe01",
+        "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbe02",
+        "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbe03",
+    ]
+
+    for i, (env_var, model_name) in enumerate(_HOLDER_ENV_KEYS):
+        raw_key = os.environ.get(env_var, "")
+        if not raw_key:
+            if dry_run:
+                # Use deterministic test key so dry-run still exercises the full code path
+                raw_key = _DRY_RUN_FALLBACK_KEYS[i]
+                logger.info(
+                    "build_holder_list: %s not set — using deterministic dry-run fallback for %s",
+                    env_var,
+                    model_name,
+                )
+            else:
+                errors.append(
+                    f"  {env_var} not set (required for holder {model_name} — "
+                    "a placeholder address cannot sign holder buys or claims, "
+                    "which would silently break the D-19 holder-claim proof)"
+                )
+                continue
+
+        if not raw_key.startswith("0x"):
+            raw_key = "0x" + raw_key
+
+        try:
+            account = Account.from_key(raw_key)
+        except Exception as exc:
+            msg = f"{env_var} is not a valid private key: {exc}"
+            if dry_run:
+                logger.warning("build_holder_list: %s — skipping", msg)
+                continue
+            else:
+                errors.append(f"  {msg}")
+                continue
+
+        vault_addr = vault_addresses[i] if i < len(vault_addresses) else "0x" + "0" * 40
+        holders.append((account.address, vault_addr, holder_usdc_amount))
+        logger.info(
+            "build_holder_list: holder[%d] (%s) derived address=%s vault=%s",
+            i,
+            model_name,
+            account.address,
+            vault_addr[:10],
+        )
+
+    if errors and not dry_run:
+        raise ValueError(
+            "run_gate: cannot build holder list in live mode — missing env keys:\n"
+            + "\n".join(errors)
+            + "\n\nSet HOLDER_CLAUDE_KEY, HOLDER_GPT_KEY, HOLDER_GEM_KEY to hex private keys "
+            "for the demo holder wallets, then fund them with mock USDC via fund-holders.sh."
+        )
+
+    return holders
 
 
 # ---------------------------------------------------------------------------
@@ -494,12 +605,21 @@ async def run_gate(
         if not rpc:
             raise ValueError("SEPOLIA_RPC not set — provide --rpc-url or set the env var")
 
-        trade_key = operator_trade_private_key or os.environ.get("OPERATOR_TRADE_PRIVATE_KEY", "")
+        trade_key = operator_trade_private_key or os.environ.get("OPERATOR_TRADE_KEY", "")
         journal_key = operator_journal_private_key or os.environ.get("OPERATOR_JOURNAL_KEY_PRIV", "")
         arb_key4 = arb_key4_private_key or os.environ.get("ARB_KEY4_PRIVATE_KEY", "")
         lp_key = operator_lp_key_private_key or os.environ.get("OPERATOR_LP_KEY_PRIVATE_KEY", "")
 
-        web3, _loaded_signers = _build_web3_with_signers(rpc, trade_key, journal_key, arb_key4, lp_key)
+        # Holder keys for signing buys + claims (Task 3: no placeholder addresses in live mode)
+        holder_claude_key = os.environ.get("HOLDER_CLAUDE_KEY", "")
+        holder_gpt_key = os.environ.get("HOLDER_GPT_KEY", "")
+        holder_gem_key = os.environ.get("HOLDER_GEM_KEY", "")
+
+        web3, _loaded_signers = _build_web3_with_signers(
+            rpc,
+            trade_key, journal_key, arb_key4, lp_key,
+            holder_claude_key, holder_gpt_key, holder_gem_key,
+        )
 
     # ── Step 3: Build or inject vault/pool pairs + contracts ───────────────
     if dry_run and _injected_vault_pool_pairs is not None:
@@ -658,10 +778,7 @@ async def run_gate(
             int(manifest.get("lpNftGem", 0)),
         ],
         operator_lp_key=manifest.get("operatorLpKey", "0x" + "0" * 40),
-        holders=[
-            (f"0xHolderDemo{i + 1:020d}", vault_addresses[i], 5 * 10**6)
-            for i in range(3)
-        ],
+        holders=build_holder_list(vault_addresses, dry_run=dry_run),
         step_through=step_through,
         pause_hook=_dry_run_pause_hook if dry_run else None,
         gap_close_timeout_s=5.0 if dry_run else 60.0,

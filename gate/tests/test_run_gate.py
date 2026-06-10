@@ -36,6 +36,7 @@ from gate.run_gate import (
     _make_fake_vault,
     _make_fake_web3,
     _make_dry_run_shared_deps,
+    build_holder_list,
     load_and_validate_manifest,
     run_gate,
 )
@@ -314,3 +315,108 @@ def test_missing_manifest_file_fails_loudly() -> None:
     """
     with pytest.raises(FileNotFoundError, match="Gate manifest not found"):
         load_and_validate_manifest("/nonexistent/path/sepolia.json")
+
+
+# ---------------------------------------------------------------------------
+# Task 3 tests: OPERATOR_TRADE_KEY rename + holder wallet derivation
+# ---------------------------------------------------------------------------
+
+
+def test_build_holder_list_derives_addresses_from_keys() -> None:
+    """build_holder_list derives correct addresses from HOLDER_*_KEY env vars.
+
+    Uses a known test private key and verifies the derived address matches.
+    The test private key 0x0000...0001 corresponds to address 0x7E5F...9E3c.
+    """
+    from eth_account import Account
+
+    # Three test keys with known derived addresses
+    test_keys = [
+        "0x0000000000000000000000000000000000000000000000000000000000000001",
+        "0x0000000000000000000000000000000000000000000000000000000000000002",
+        "0x0000000000000000000000000000000000000000000000000000000000000003",
+    ]
+    expected_addrs = [Account.from_key(k).address for k in test_keys]
+
+    vault_addresses = [
+        "0xFakeVaultClaude00000000000000000000000001",
+        "0xFakeVaultGpt000000000000000000000000000002",
+        "0xFakeVaultGem000000000000000000000000000003",
+    ]
+
+    env_patch = {
+        "HOLDER_CLAUDE_KEY": test_keys[0],
+        "HOLDER_GPT_KEY": test_keys[1],
+        "HOLDER_GEM_KEY": test_keys[2],
+    }
+
+    with patch.dict("os.environ", env_patch):
+        holders = build_holder_list(vault_addresses)
+
+    assert len(holders) == 3, f"Expected 3 holders; got {len(holders)}"
+    for i, (addr, vault_addr, usdc_amount) in enumerate(holders):
+        assert addr == expected_addrs[i], (
+            f"holder[{i}] address mismatch: expected {expected_addrs[i]}, got {addr}"
+        )
+        assert vault_addr == vault_addresses[i], (
+            f"holder[{i}] vault mismatch: expected {vault_addresses[i]}, got {vault_addr}"
+        )
+        assert usdc_amount == 5 * 10**6, (
+            f"holder[{i}] usdc_amount mismatch: expected 5e6, got {usdc_amount}"
+        )
+
+
+def test_build_holder_list_live_mode_raises_on_missing_key() -> None:
+    """build_holder_list raises ValueError in live mode when a HOLDER_*_KEY is missing.
+
+    A missing key in live mode means the holder cannot sign — fail loudly (not silently
+    use a placeholder) to prevent a false-green D-19 holder-claim proof.
+    """
+    vault_addresses = [
+        "0xFakeVaultClaude00000000000000000000000001",
+        "0xFakeVaultGpt000000000000000000000000000002",
+        "0xFakeVaultGem000000000000000000000000000003",
+    ]
+
+    # Patch out all HOLDER_*_KEY env vars to ensure they are absent
+    with patch.dict("os.environ", {}, clear=False):
+        # Remove all three from the environment
+        for env_var in ("HOLDER_CLAUDE_KEY", "HOLDER_GPT_KEY", "HOLDER_GEM_KEY"):
+            import os as _os
+
+            _os.environ.pop(env_var, None)
+
+        with pytest.raises(ValueError, match="HOLDER_CLAUDE_KEY"):
+            build_holder_list(vault_addresses, dry_run=False)
+
+
+def test_build_holder_list_dry_run_allows_missing_keys() -> None:
+    """build_holder_list in --dry-run mode returns deterministic fallback holders when keys absent.
+
+    The fallback addresses are derived from fixed test keys — not placeholder strings —
+    so the address derivation code path is exercised even without real keys.
+    """
+    vault_addresses = [
+        "0xFakeVaultClaude00000000000000000000000001",
+        "0xFakeVaultGpt000000000000000000000000000002",
+        "0xFakeVaultGem000000000000000000000000000003",
+    ]
+
+    # Remove holder keys from environment
+    import os as _os
+
+    for env_var in ("HOLDER_CLAUDE_KEY", "HOLDER_GPT_KEY", "HOLDER_GEM_KEY"):
+        _os.environ.pop(env_var, None)
+
+    # Should NOT raise in dry-run mode
+    holders = build_holder_list(vault_addresses, dry_run=True)
+
+    assert len(holders) == 3, f"dry-run must return 3 holders even without keys; got {len(holders)}"
+    for i, (addr, vault_addr, _usdc) in enumerate(holders):
+        # Must be a real Ethereum address (42 chars, 0x prefix), not a placeholder
+        assert addr.startswith("0x") and len(addr) == 42, (
+            f"holder[{i}] dry-run address must be a valid hex address; got {addr!r}"
+        )
+        assert vault_addr == vault_addresses[i], (
+            f"holder[{i}] vault address mismatch: expected {vault_addresses[i]}, got {vault_addr}"
+        )
