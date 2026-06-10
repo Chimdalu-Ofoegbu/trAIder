@@ -122,6 +122,61 @@ def decode_pool_price_e18(
 
 
 # ---------------------------------------------------------------------------
+# read_sqrt_price_x96 — raw eth_call globalState (8-slot safe, item 4)
+# ---------------------------------------------------------------------------
+
+# Algebra Integral v1 globalState() 4-byte selector (keccak256("globalState()"))
+_GLOBAL_STATE_SELECTOR: bytes = bytes.fromhex("e76c01e4")
+
+
+async def read_sqrt_price_x96(web3: Any, pool_address: str) -> int:
+    """Read Algebra pool sqrtPriceX96 via raw eth_call, taking only the first 32 bytes.
+
+    Algebra Integral v1 globalState() returns a non-standard 256-byte / 8-slot layout
+    that may not ABI-decode cleanly against the 6-output tuple declared in the inline ABI
+    (VENUE-DECISION finding #1).  A raw call is unconditionally safe: slot 0 of the
+    return data is ALWAYS the sqrtPriceX96 (uint160) regardless of how many extra slots
+    the pool returns.
+
+    Args:
+        web3: AsyncWeb3 instance.
+        pool_address: Checksummed Algebra pool address.
+
+    Returns:
+        sqrtPriceX96 as a Python int (extracted from the first 32 bytes of the return data).
+
+    Raises:
+        ValueError: If the return data is shorter than 32 bytes (pool not initialized or
+            wrong address).
+    """
+    raw: bytes = await web3.eth.call({"to": pool_address, "data": _GLOBAL_STATE_SELECTOR})
+    if len(raw) < 32:
+        raise ValueError(
+            f"read_sqrt_price_x96: pool={pool_address[:10]} returned {len(raw)} bytes "
+            f"(expected ≥32); pool may not be initialized or the address is wrong"
+        )
+    sqrt_price_x96: int = int.from_bytes(raw[:32], "big")
+    return sqrt_price_x96
+
+
+async def detect_mtoken_is_token0(pool: Any, vault_address: str) -> bool:
+    """Detect whether mTOKEN is token0 of the pool by reading pool.token0().
+
+    Compares the lowercased checksummed addresses.  The non-mTOKEN token is USDC.
+
+    Args:
+        pool: Algebra pool contract instance (must expose token0() view method).
+        vault_address: Checksummed mTOKEN vault address.
+
+    Returns:
+        True  if vault_address == pool.token0() (mTOKEN is token0, USDC is token1).
+        False if vault_address == pool.token1() (USDC is token0, mTOKEN is token1).
+    """
+    token0: str = await pool.functions.token0().call()
+    return token0.lower() == vault_address.lower()
+
+
+# ---------------------------------------------------------------------------
 # preflight_key4_balance — Pitfall 4: alert on USDC depletion
 # ---------------------------------------------------------------------------
 
@@ -246,27 +301,29 @@ async def arb_poll_loop(
                     )
                     continue
 
-                # ── 2. Read AMM price from Algebra globalState() ──────────────
-                # globalState() returns (uint160 price, int24 tick, uint16 lastFee,
-                #   uint8 pluginConfig, uint16 communityFee, bool unlocked)
-                # RESEARCH.md § A2: ABI mismatch on Algebra Integral v1 returns 8 slots;
-                # we unpack positionally — index 0 is always the sqrtPriceX96.
-                gs_result = await pool.functions.globalState().call()
-                sqrt_price_x96: int = gs_result[0]
+                # ── 2. Read AMM price from Algebra globalState() via raw eth_call ─
+                # Algebra Integral v1 globalState() returns a non-standard 8-slot
+                # layout (VENUE-DECISION finding #1).  read_sqrt_price_x96 issues a
+                # raw eth_call and extracts only the first 32 bytes (sqrtPriceX96)
+                # without ABI-decoding the full return, avoiding the mismatch.
+                pool_address_str: str = getattr(pool, "address", str(pool))
+                sqrt_price_x96: int = await read_sqrt_price_x96(web3, pool_address_str)
 
-                # Token ordering: mTOKEN is token0 if vault.address < usdc.address.
-                # For the mock/test context we default to mtoken_is_token0=True;
-                # production callers should detect ordering from pool.token0().
-                # The split is handled in the vault_pool_pairs metadata if needed;
-                # for unit test mocks this default is sufficient.
+                # ── 3. Detect token ordering (item 5) ────────────────────────────
+                # mtoken_is_token0 is determined by reading pool.token0() and
+                # comparing to the vault address (mTOKEN address).  This replaces
+                # the previous hardcoded mtoken_is_token0=True.
+                vault_address_str: str = getattr(vault, "address", str(vault))
+                mtoken_is_token0: bool = await detect_mtoken_is_token0(pool, vault_address_str)
+
                 amm_price_e18: int = decode_pool_price_e18(
                     sqrt_price_x96,
                     token0_decimals=18,  # mTOKEN = 18 dec
                     token1_decimals=6,  # USDC = 6 dec
-                    mtoken_is_token0=True,
+                    mtoken_is_token0=mtoken_is_token0,
                 )
 
-                # ── 3. Compute gap ────────────────────────────────────────────
+                # ── 4. Compute gap ────────────────────────────────────────────
                 gap_bps: int = abs(nav_e18 - amm_price_e18) * 10_000 // nav_e18
 
                 logger.debug(
@@ -278,11 +335,11 @@ async def arb_poll_loop(
                     FIRE_THRESHOLD_BPS,
                 )
 
-                # ── 4. Hysteresis check ───────────────────────────────────────
+                # ── 5. Hysteresis check ───────────────────────────────────────
                 if gap_bps < FIRE_THRESHOLD_BPS:
                     continue  # Gap below hysteresis — do not fire
 
-                # ── 5. Phase-6 mainnet economic hook (extension point, D-09) ──
+                # ── 6. Phase-6 mainnet economic hook (extension point, D-09) ──
                 if MAINNET_HOOK_PLACEHOLDER is not None and not MAINNET_HOOK_PLACEHOLDER(gap_bps):
                     logger.info(
                         "arb_poll_loop: mainnet hook vetoed fire (gap_bps=%d, vault=%s)",
@@ -291,9 +348,10 @@ async def arb_poll_loop(
                     )
                     continue
 
-                # ── 6. Fire arbCloseGap on key #4 ────────────────────────────
-                vault_address = vault.address
-                pool_address = pool.address
+                # ── 7. Fire arbCloseGap on key #4 ────────────────────────────
+                # vault_address_str / pool_address_str already resolved above (item 5)
+                vault_address = vault_address_str
+                pool_address = pool_address_str
                 t0 = time.monotonic()
 
                 tx_hash = await arb_nonce_mgr.assign_and_sign(

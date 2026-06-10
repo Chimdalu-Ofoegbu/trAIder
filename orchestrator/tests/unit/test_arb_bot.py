@@ -23,7 +23,9 @@ from orchestrator.loop.arb_bot import (
     FIRE_THRESHOLD_BPS,
     MAINNET_HOOK_PLACEHOLDER,
     arb_poll_loop,
+    detect_mtoken_is_token0,
     preflight_key4_balance,
+    read_sqrt_price_x96,
 )
 
 # ---------------------------------------------------------------------------
@@ -39,11 +41,19 @@ def _make_vault(nav_e18: int = 10**18) -> MagicMock:
     return vault
 
 
-def _make_pool(sqrt_price_x96: int) -> MagicMock:
-    """Return a mock Algebra pool whose globalState() returns [sqrt_price_x96, ...]."""
+def _make_pool(sqrt_price_x96: int, vault_address: str | None = None) -> MagicMock:
+    """Return a mock Algebra pool whose token0() returns vault_address (mTOKEN=token0 default).
+
+    arb_poll_loop now reads sqrtPriceX96 via raw web3.eth.call (item 4) rather than
+    pool.functions.globalState().call().  The raw return is wired on web3 in _make_web3().
+    pool.functions.token0() is used by detect_mtoken_is_token0 (item 5).
+    """
+    _vault_addr = vault_address or "0xAAAA000000000000000000000000000000000001"
     pool = MagicMock()
     pool.address = "0xBBBB000000000000000000000000000000000002"
-    # globalState returns tuple: (price, tick, lastFee, pluginConfig, communityFee, unlocked)
+    # token0 = vault address (mTOKEN is token0 by default in tests)
+    pool.functions.token0.return_value.call = AsyncMock(return_value=_vault_addr)
+    # Keep globalState stub for any legacy callers (not used by arb_poll_loop anymore)
     pool.functions.globalState.return_value.call = AsyncMock(
         return_value=[sqrt_price_x96, 0, 0, 0, 0, True]
     )
@@ -85,12 +95,25 @@ def _make_arb_primitive() -> MagicMock:
     return arb
 
 
-def _make_web3(tx_status: int = 1) -> MagicMock:
-    """Return a mock web3 whose wait_for_transaction_receipt returns a receipt."""
+def _make_web3(tx_status: int = 1, sqrt_price_x96: int | None = None) -> MagicMock:
+    """Return a mock web3 with wait_for_transaction_receipt + eth.call for raw globalState.
+
+    arb_poll_loop uses read_sqrt_price_x96 which issues:
+      await web3.eth.call({"to": pool_address, "data": _GLOBAL_STATE_SELECTOR})
+    and extracts the first 32 bytes as sqrtPriceX96.
+
+    If sqrt_price_x96 is provided, web3.eth.call returns a 256-byte payload with the
+    given sqrtPriceX96 in the first slot (mimicking Algebra Integral v1 8-slot return).
+    If omitted, defaults to the at-peg sqrtPriceX96 (NAV=$1.00).
+    """
+    _sqrt = sqrt_price_x96 if sqrt_price_x96 is not None else 79228162514264337593543950336
+    raw_return = _sqrt.to_bytes(32, "big") + b"\x00" * 224  # 8-slot layout, extras zeroed
+
     web3 = MagicMock()
     receipt = MagicMock()
     receipt.status = tx_status
     web3.eth.wait_for_transaction_receipt = AsyncMock(return_value=receipt)
+    web3.eth.call = AsyncMock(return_value=raw_return)
     return web3
 
 
@@ -115,10 +138,12 @@ async def test_arb_bot_fires_on_gap_above_hysteresis() -> None:
     sqrt_above = _nav_e18_to_sqrt_price_x96(price_ratio_above)
 
     vault = _make_vault(nav_e18)
-    pool = _make_pool(sqrt_above)
+    # pool token0 must match vault address for detect_mtoken_is_token0 (item 5)
+    pool = _make_pool(sqrt_above, vault_address=vault.address)
     nonce_mgr = _make_nonce_mgr()
     arb = _make_arb_primitive()
-    web3 = _make_web3()
+    # web3.eth.call returns the raw globalState payload (item 4)
+    web3 = _make_web3(sqrt_price_x96=sqrt_above)
     stop = asyncio.Event()
 
     # Run one tick then stop
@@ -147,7 +172,7 @@ async def test_arb_bot_fires_on_gap_above_hysteresis() -> None:
     sqrt_below = _nav_e18_to_sqrt_price_x96(price_ratio_below)
 
     vault2 = _make_vault(nav_e18)
-    pool2 = _make_pool(sqrt_below)
+    pool2 = _make_pool(sqrt_below, vault_address=vault2.address)
     nonce_mgr2 = _make_nonce_mgr()
     stop2 = asyncio.Event()
     tick_count2 = 0
@@ -159,7 +184,7 @@ async def test_arb_bot_fires_on_gap_above_hysteresis() -> None:
 
     with patch("orchestrator.loop.arb_bot.asyncio.sleep", side_effect=sleep_and_stop2):
         await arb_poll_loop(
-            _make_web3(),
+            _make_web3(sqrt_price_x96=sqrt_below),
             _make_arb_primitive(),
             [(vault2, pool2)],
             nonce_mgr2,
@@ -190,7 +215,8 @@ async def test_arb_bot_per_pool_fault_isolation() -> None:
     def make_pair(i: int) -> tuple[MagicMock, MagicMock]:
         v = _make_vault(nav_e18)
         v.address = f"0xAAAA00000000000000000000000000000000000{i}"
-        p = _make_pool(sqrt_above)
+        # pool.token0 must match vault address (detect_mtoken_is_token0, item 5)
+        p = _make_pool(sqrt_above, vault_address=v.address)
         p.address = f"0xBBBB00000000000000000000000000000000000{i}"
         return v, p
 
@@ -198,7 +224,8 @@ async def test_arb_bot_per_pool_fault_isolation() -> None:
     v2, p2 = make_pair(2)
     v3, p3 = make_pair(3)
 
-    web3 = _make_web3()
+    # web3.eth.call provides raw globalState payload (item 4)
+    web3 = _make_web3(sqrt_price_x96=sqrt_above)
     arb = _make_arb_primitive()
 
     call_count = 0
@@ -254,8 +281,8 @@ async def test_cb_pause_is_expected_not_error() -> None:
     sqrt_above = _nav_e18_to_sqrt_price_x96(1.026)
 
     vault = _make_vault(nav_e18)
-    pool = _make_pool(sqrt_above)
-    web3 = _make_web3()
+    pool = _make_pool(sqrt_above, vault_address=vault.address)
+    web3 = _make_web3(sqrt_price_x96=sqrt_above)
     arb = _make_arb_primitive()
 
     nonce_mgr = MagicMock()
@@ -366,8 +393,8 @@ async def test_close_time_logged() -> None:
     sqrt_above = _nav_e18_to_sqrt_price_x96(1.026)
 
     vault = _make_vault(nav_e18)
-    pool = _make_pool(sqrt_above)
-    web3 = _make_web3()
+    pool = _make_pool(sqrt_above, vault_address=vault.address)
+    web3 = _make_web3(sqrt_price_x96=sqrt_above)
     arb = _make_arb_primitive()
     nonce_mgr = _make_nonce_mgr(tx_hash="0xabcdef1234567890")
 
@@ -430,4 +457,159 @@ def test_mainnet_hook_placeholder_is_none_by_default() -> None:
     """MAINNET_HOOK_PLACEHOLDER defaults to None (Sepolia: fire every qualifying gap)."""
     assert MAINNET_HOOK_PLACEHOLDER is None, (
         f"MAINNET_HOOK_PLACEHOLDER should default to None; got {MAINNET_HOOK_PLACEHOLDER!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Item 4: raw globalState decode — read_sqrt_price_x96
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_read_sqrt_price_x96_extracts_first_slot() -> None:
+    """read_sqrt_price_x96 extracts sqrtPriceX96 from the first 32 bytes of raw return data.
+
+    The Algebra Integral v1 pool may return 256 bytes (8 slots).  read_sqrt_price_x96 issues
+    a raw eth_call and takes int.from_bytes(raw[:32], 'big') — the first slot is always
+    sqrtPriceX96 regardless of extra slots returned.
+
+    Test: craft a 256-byte return value where the first 32 bytes encode a known sqrtPriceX96
+    and the remaining 224 bytes are filled with 0xFF (would corrupt ABI decode but not raw).
+    Verify read_sqrt_price_x96 returns the expected value.
+    """
+    expected_sqrt_price = 79228162514264337593543950336  # sqrtPriceX96 at NAV=$1.00
+
+    # Craft 256-byte raw return: first 32 bytes = expected_sqrt_price, rest = 0xFF
+    first_slot = expected_sqrt_price.to_bytes(32, "big")
+    filler = bytes([0xFF] * 224)  # 7 extra slots that would corrupt ABI decode
+    raw_return = first_slot + filler
+    assert len(raw_return) == 256
+
+    # Mock web3.eth.call to return the crafted bytes
+    mock_web3 = MagicMock()
+    mock_web3.eth.call = AsyncMock(return_value=raw_return)
+
+    pool_address = "0xBBBB000000000000000000000000000000000002"
+    result = await read_sqrt_price_x96(mock_web3, pool_address)
+
+    assert result == expected_sqrt_price, (
+        f"read_sqrt_price_x96 should return {expected_sqrt_price}; got {result}"
+    )
+    # Verify the call was made with the correct selector
+    mock_web3.eth.call.assert_called_once()
+    call_kwargs = mock_web3.eth.call.call_args[0][0]  # first positional arg (dict)
+    assert call_kwargs["to"] == pool_address
+    assert call_kwargs["data"] == bytes.fromhex("e76c01e4"), (
+        f"selector must be 0xe76c01e4 (globalState()); got {call_kwargs['data'].hex()}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_read_sqrt_price_x96_raises_on_short_return() -> None:
+    """read_sqrt_price_x96 raises ValueError if fewer than 32 bytes are returned."""
+    mock_web3 = MagicMock()
+    mock_web3.eth.call = AsyncMock(return_value=b"\x00" * 16)  # only 16 bytes
+
+    with pytest.raises(ValueError, match="returned 16 bytes"):
+        await read_sqrt_price_x96(mock_web3, "0x" + "0" * 40)
+
+
+# ---------------------------------------------------------------------------
+# Item 5: token ordering detection — detect_mtoken_is_token0
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_detect_mtoken_is_token0_true() -> None:
+    """detect_mtoken_is_token0 returns True when vault_address == pool.token0()."""
+    vault_addr = "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA01"
+
+    pool = MagicMock()
+    pool.functions.token0.return_value.call = AsyncMock(return_value=vault_addr)
+
+    result = await detect_mtoken_is_token0(pool, vault_addr)
+    assert result is True, f"mTOKEN=token0 case: expected True, got {result}"
+
+
+@pytest.mark.asyncio
+async def test_detect_mtoken_is_token0_false() -> None:
+    """detect_mtoken_is_token0 returns False when vault_address == pool.token1() (not token0)."""
+    vault_addr = "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA01"
+    usdc_addr = "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB02"
+
+    pool = MagicMock()
+    # token0 is USDC, not vault
+    pool.functions.token0.return_value.call = AsyncMock(return_value=usdc_addr)
+
+    result = await detect_mtoken_is_token0(pool, vault_addr)
+    assert result is False, f"mTOKEN=token1 case: expected False, got {result}"
+
+
+@pytest.mark.asyncio
+async def test_detect_mtoken_is_token0_case_insensitive() -> None:
+    """detect_mtoken_is_token0 comparison is case-insensitive (checksummed vs lowercase)."""
+    vault_addr_checksum = "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA01"
+    vault_addr_lower = vault_addr_checksum.lower()
+
+    pool = MagicMock()
+    # Pool returns lowercase; vault is passed as checksummed
+    pool.functions.token0.return_value.call = AsyncMock(return_value=vault_addr_lower)
+
+    result = await detect_mtoken_is_token0(pool, vault_addr_checksum)
+    assert result is True, f"Case-insensitive comparison failed: expected True, got {result}"
+
+
+@pytest.mark.asyncio
+async def test_arb_bot_uses_raw_sqrt_price_and_detects_ordering() -> None:
+    """arb_poll_loop calls read_sqrt_price_x96 (raw eth_call) and detect_mtoken_is_token0.
+
+    Verify that arb_poll_loop routes through the new helpers rather than calling
+    pool.functions.globalState() directly.  The pool mock does NOT have globalState()
+    configured — any call to it would raise AttributeError and fail the test.
+    """
+    nav_e18 = 10**18
+    sqrt_above = _nav_e18_to_sqrt_price_x96(1.026)  # 2.6% above NAV
+
+    # Vault + pool mocks — pool has NO globalState configured (ensures it is not called)
+    vault = _make_vault(nav_e18)
+    vault_addr = vault.address
+
+    pool = MagicMock()
+    pool.address = "0xBBBB000000000000000000000000000000000002"
+    # token0 = vault (mTOKEN is token0)
+    pool.functions.token0.return_value.call = AsyncMock(return_value=vault_addr)
+    # Deliberately do NOT wire pool.functions.globalState — raw call bypasses this
+
+    # web3.eth.call returns the sqrt_price in the first 32 bytes (item 4)
+    raw_return = sqrt_above.to_bytes(32, "big") + b"\x00" * 224
+    web3 = MagicMock()
+    web3.eth.call = AsyncMock(return_value=raw_return)
+    receipt = MagicMock()
+    receipt.status = 1
+    web3.eth.wait_for_transaction_receipt = AsyncMock(return_value=receipt)
+
+    nonce_mgr = _make_nonce_mgr()
+    arb = _make_arb_primitive()
+    stop = asyncio.Event()
+
+    async def sleep_and_stop(_: float) -> None:
+        stop.set()
+
+    with patch("orchestrator.loop.arb_bot.asyncio.sleep", side_effect=sleep_and_stop):
+        await arb_poll_loop(
+            web3,
+            arb,
+            [(vault, pool)],
+            nonce_mgr,
+            key4_address="0xKEY4000000000000000000000000000000000004",
+            stop_event=stop,
+        )
+
+    # arbCloseGap must have been fired (gap was above threshold)
+    nonce_mgr.assign_and_sign.assert_called_once()
+    # Confirm web3.eth.call was invoked with globalState selector
+    web3.eth.call.assert_called_once()
+    call_data = web3.eth.call.call_args[0][0]
+    assert call_data["data"] == bytes.fromhex("e76c01e4"), (
+        "arb_poll_loop must call globalState via raw eth_call (selector 0xe76c01e4)"
     )
