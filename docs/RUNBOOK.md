@@ -340,7 +340,7 @@ export KEY4_USDC_MIN_WARNING=500000000   # Alert threshold for key #4 USDC (500 
 # LLM API keys (required for live 3-model session)
 export ANTHROPIC_API_KEY=<key>
 export OPENAI_API_KEY=<key>
-export GOOGLE_AI_API_KEY=<key>
+export GOOGLE_API_KEY=<key>
 
 # Key material (from .env.* files — never committed)
 export OPERATOR_TRADE_PRIVATE_KEY=<hex>

@@ -171,7 +171,7 @@ async def _check_pool_price_on_peg(
     except Exception:  # noqa: BLE001
         # Fallback: raw staticcall — Algebra Integral v1 returns 256 bytes (8 slots)
         try:
-            selector = b"\x26\x8f\xa4\x8b"  # keccak("globalState()")[0:4]
+            selector = b"\xe7\x6c\x01\xe4"  # keccak("globalState()")[0:4] = 0xe76c01e4
             result = await web3.eth.call({"to": pool_address, "data": "0x" + selector.hex()})
             sqrt_price_x96 = int.from_bytes(bytes.fromhex(result.hex().removeprefix("0x"))[:32], "big")
         except Exception as exc:  # noqa: BLE001
