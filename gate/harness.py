@@ -38,6 +38,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from orchestrator.loop.arb_bot import decode_pool_price_e18
 from orchestrator.loop.settlement_keeper import drain_and_settle_multi
 
 logger = logging.getLogger(__name__)
@@ -450,12 +451,17 @@ class GateHarness:
             sqrt_price_x96: int = state[0]
             if sqrt_price_x96 == 0:
                 return 0
-            # Decode pool price (mTOKEN as token0/18dec, USDC as token1/6dec)
-            price_raw = (sqrt_price_x96 * sqrt_price_x96) >> 192
-            amm_price_e18 = price_raw * 10**18 // 10**12
-            # Read NAV from vault
+            # Decode AMM price via the canonical arb_bot decode (ordering-aware, 1e30 factor)
             if self.vaults:
-                vault_contract, _ = self.vaults[0]
+                vault_contract, vault_address = self.vaults[0]
+                token0 = await pool.functions.token0().call()
+                mtoken_is_token0 = str(token0).lower() == str(vault_address).lower()
+                amm_price_e18 = decode_pool_price_e18(
+                    sqrt_price_x96,
+                    token0_decimals=18 if mtoken_is_token0 else 6,
+                    token1_decimals=6 if mtoken_is_token0 else 18,
+                    mtoken_is_token0=mtoken_is_token0,
+                )
                 nav_e18: int = await vault_contract.functions.nav().call()
                 if nav_e18 == 0:
                     return 0

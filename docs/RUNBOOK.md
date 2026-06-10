@@ -1056,4 +1056,32 @@ six items: (a) gate skips, (b) graceful revert catch, (c) keeper resolution clea
 
 ---
 
+### [2026-06-11] Systemic AMM price-decode scaling bug (1e12 vs 1e30) — core mechanism
+
+**Context:** The sqrtPriceX96 → "USD per mTOKEN (1e18-scaled)" decode used scale factor `1e12`
+where the correct factor is `1e30` (= `1e12` decimal gap [18-dec mTOKEN vs 6-dec USDC] × `1e18`
+output scale). A _physically_ on-peg pool (1 mTOKEN = 1 USDC) was therefore read as ~100% off-peg.
+
+**Why it survived to Day 17 (false confidence):** the bug was in the DEPLOYED `ArbitragePrimitive`
+AND in `ArbitragePrimitive.t.sol` — the tests encoded the same wrong factor (on-peg sqrtP set to
+`Q96/1000` / `1000*Q96` instead of the true `1e6*Q96` / `Q96/1e6`), so they passed while the math
+was wrong. Surfaced when `02-SeedPools` reverted on its own (also-buggy) on-peg assertion during
+the 2026-06-11 fresh redeploy — caught in `forge` simulation, nothing broadcast.
+
+**Ground truth (Case B, USDC=token0):** `ammPriceE18 = 1e30·2^192/sqrtP²`; on-peg `sqrtP = 1e6·Q96`
+→ decodes to exactly 1e18 (verified independently, 0 bps off). `arb_bot.decode_pool_price_e18` was
+already correct and is the canonical reference; all other sites now match it.
+
+**Fixed across all sites:** `ArbitragePrimitive.sol` (→ redeployed), `02-SeedPools.s.sol` (decode +
+the two truncated 1:1 constants), `ArbitragePrimitive.t.sol` (on-peg values → ground truth),
+`gate/harness.py` + `gate/preflight.py` (now call the canonical `arb_bot` decode, ordering-aware via
+`token0()`). Added `test_decode_pool_price_e18_ground_truth_anchor` — a first-principles regression
+anchor (`decode(on-peg)==1e18`) the buggy convention cannot pass. Also fixed
+`preflight._check_mm_address` to read `vault.settlement().mmAddress()` (mmAddress lives on the
+SettlementContract, not the vault).
+
+**Reference:** memory `traider-live-preflight-2026-06-10`. The fresh redeploy resumed after this fix.
+
+---
+
 _End of Known Issues log. Append new entries above this line._

@@ -4,6 +4,7 @@ pragma solidity 0.8.24;
 import {Script, console2} from "forge-std/Script.sol";
 import {stdJson} from "forge-std/StdJson.sol";
 import {MockERC20} from "../src/mocks/MockERC20.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 /// @title SeedPools - trAIder Phase 4 pool seeding script (AMM-01/02/03, D-06)
 /// @notice Creates and initializes 3 mTOKEN/USDC Camelot V3 (Algebra Integral v1) pools,
@@ -170,13 +171,13 @@ contract SeedPools is Script {
     // ─── Case A: mTOKEN is token0, USDC is token1, 1:1 NAV sqrtPriceX96 ────────
     // = sqrt(1e6/1e18) * 2^96 = 2^96 / 1e6
     // = 79228162514264337593543950336 / 1000000 = 79228162514264
-    uint160 internal constant SQRT_PRICE_1TO1_MTOKEN_IS_TOKEN0 = 79228162514264;
+    uint160 internal constant SQRT_PRICE_1TO1_MTOKEN_IS_TOKEN0 = 79228162514264337593543; // = 2^96 / 1e6 (Case A on-peg)
 
     // ─── Case B: USDC is token0, mTOKEN is token1, 1:1 NAV sqrtPriceX96 ────────
     // = sqrt(1e18/1e6) * 2^96 = 1e6 * 2^96
     // = 1000000 * 79228162514264337593543950336 / 1e18 ≈ 79228162514264337593
     // This fits in uint160 (max ≈ 1.46e48).
-    uint160 internal constant SQRT_PRICE_1TO1_USDC_IS_TOKEN0 = 79228162514264337593;
+    uint160 internal constant SQRT_PRICE_1TO1_USDC_IS_TOKEN0 = 79228162514264337593543950336000000; // = 1e6 * 2^96 (Case B on-peg)
 
     // =========================================================================
     // Run
@@ -445,13 +446,9 @@ contract SeedPools is Script {
             // Step 1: mid = sqrtP * sqrtP (may overflow uint256 for large sqrtP)
             // For sqrtP ≈ 79228162514264 (1e-6 * 2^96), sqrtP^2 ≈ 6.28e27 — fits uint256
             // (max uint256 ≈ 1.16e77; sqrtP max at tick 887272 ≈ 1.46e29 → sqrtP^2 ≈ 2.1e58 — fits)
-            uint256 num = sqrtP * sqrtP; // safe for all valid tick range sqrtPriceX96 values
-            // priceUsdE18 = num * 1e6 * 1e18 / 2^192
-            // = num * 1e24 / 2^192
-            // 2^192 = 2^96 * 2^96; break division to avoid overflow:
-            // = (num / 2^96) * 1e24 / 2^96
-            uint256 divBy96 = num >> 96; // lose 96 bits — ok since we need 6 dec * 18 dec result
-            priceUsdE18 = (divBy96 * 1e6) >> 96;
+            // ammPriceE18 = sqrtP^2 * 1e30 / 2^192, via two mulDiv steps (no precision loss)
+            uint256 step1 = Math.mulDiv(sqrtP, 1e30, 2 ** 96);
+            priceUsdE18 = Math.mulDiv(sqrtP, step1, 2 ** 96);
         } else {
             // USDC=token0, mTOKEN=token1: price = (2^96 / sqrtP)^2 * (mTOKEN_scale / USDC_scale)
             // = 2^192 / sqrtP^2 * 1e18 / 1e6
@@ -463,8 +460,8 @@ contract SeedPools is Script {
             // step1 = 2^96 / sqrtP (an integer)
             // priceUsdE18 = step1 * step1 * 1e12
             // For sqrtP ≈ 79228162514264337593 (Case B at 1:1), step1 ≈ 1e6 — small, safe
-            uint256 step1 = (1 << 96) / sqrtP;
-            priceUsdE18 = step1 * step1 * 1e12;
+            uint256 step1 = Math.mulDiv(2 ** 96, 1e30, sqrtP);
+            priceUsdE18 = Math.mulDiv(2 ** 96, step1, sqrtP);
         }
     }
 

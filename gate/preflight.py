@@ -130,6 +130,7 @@ async def _check_pool_exists(web3: Any, pool_address: str) -> tuple[bool, str]:
 async def _check_pool_price_on_peg(
     web3: Any,
     pool_address: str,
+    mtoken_address: str = "",
     *,
     tolerance_bps: int = POOL_PEG_TOLERANCE_BPS,
 ) -> tuple[bool, str]:
@@ -180,9 +181,31 @@ async def _check_pool_price_on_peg(
     if sqrt_price_x96 == 0:
         return False, f"pool={pool_address[:10]} sqrtPriceX96=0 (not initialized)"
 
-    # Decode mTOKEN/USDC price (mtoken_is_token0=True formula):
-    # price_e18 = sqrtP^2 * 10^12 * 10^18 / 2^192
-    price_e18 = sqrt_price_x96 * sqrt_price_x96 * 10**12 * 10**18 // 2**192
+    # Decode via the canonical arb_bot decode (ordering-aware, 1e30 factor).
+    from orchestrator.loop.arb_bot import decode_pool_price_e18  # noqa: PLC0415
+
+    try:
+        _t0_abi = [
+            {
+                "inputs": [],
+                "name": "token0",
+                "outputs": [{"name": "", "type": "address"}],
+                "stateMutability": "view",
+                "type": "function",
+            }
+        ]
+        _t0_pool = web3.eth.contract(address=pool_address, abi=_t0_abi)
+        _token0 = await _t0_pool.functions.token0().call()
+        mtoken_is_token0 = bool(mtoken_address) and str(_token0).lower() == str(mtoken_address).lower()
+    except Exception:  # noqa: BLE001
+        mtoken_is_token0 = False  # default Case B (USDC=token0) if token0() unreadable
+
+    price_e18 = decode_pool_price_e18(
+        sqrt_price_x96,
+        token0_decimals=18 if mtoken_is_token0 else 6,
+        token1_decimals=6 if mtoken_is_token0 else 18,
+        mtoken_is_token0=mtoken_is_token0,
+    )
     nav_e18 = 10**18  # Expected NAV = 1 USDC per mTOKEN = 1e18
 
     gap_bps = abs(price_e18 - nav_e18) * 10_000 // nav_e18 if nav_e18 > 0 else 10_000
@@ -241,21 +264,24 @@ async def _check_mm_address(
     abi = settlement_abi or _VAULT_SETTLEMENT_ABI
 
     try:
-        # Try vault.mmAddress() first (mTokenVault stores mmAddress directly)
+        # mmAddress lives on the SettlementContract, not the vault: read vault.settlement()
+        # then settlement.mmAddress() (the vault has no mmAddress() getter).
         vault = web3.eth.contract(address=vault_address, abi=abi)
-        mm_addr: str = await vault.functions.mmAddress().call()
+        settlement_addr: str = await vault.functions.settlement().call()
+        settlement = web3.eth.contract(address=settlement_addr, abi=_SETTLEMENT_PARTIAL_ABI)
+        mm_addr: str = await settlement.functions.mmAddress().call()
         match = mm_addr.lower() == expected_mm_address.lower()
         if match:
             return True, (
-                f"vault={vault_address[:10]} mmAddress={mm_addr[:10]} == operatorLpKey — OK"
+                f"vault={vault_address[:10]} settlement.mmAddress={mm_addr[:10]} == operatorLpKey — OK"
             )
         return False, (
-            f"vault={vault_address[:10]} mmAddress={mm_addr[:10]} != "
+            f"vault={vault_address[:10]} settlement.mmAddress={mm_addr[:10]} != "
             f"operatorLpKey={expected_mm_address[:10]}. "
-            "Re-deploy or reconfigure the vault with the correct operator LP key."
+            "Re-deploy or reconfigure with the correct operator LP key."
         )
     except Exception as exc:  # noqa: BLE001
-        return False, f"vault={vault_address[:10]} mmAddress() call failed: {exc}"
+        return False, f"vault={vault_address[:10]} settlement.mmAddress() check failed: {exc}"
 
 
 async def _check_eth_balance(
@@ -385,6 +411,7 @@ async def preflight_check(
 
     # ── 1+2. Pool existence + peg check ────────────────────────────────────
     pool_keys = ("poolClaude", "poolGpt", "poolGem")
+    _pool_to_vault = {"poolClaude": "vaultClaude", "poolGpt": "vaultGpt", "poolGem": "vaultGem"}
     pools_exist_all = True
     pools_on_peg_all = True
     for pk in pool_keys:
@@ -396,7 +423,8 @@ async def preflight_check(
         exists_ok, exists_detail = await _check_pool_exists(web3, pool_addr)
         if not exists_ok:
             pools_exist_all = False
-        peg_ok, peg_detail = await _check_pool_price_on_peg(web3, pool_addr)
+        mtoken_addr = manifest.get(_pool_to_vault[pk], "")
+        peg_ok, peg_detail = await _check_pool_price_on_peg(web3, pool_addr, mtoken_addr)
         if not peg_ok:
             pools_on_peg_all = False
         logger.info("preflight: %s exists=%s peg=%s", pk, exists_ok, peg_ok)

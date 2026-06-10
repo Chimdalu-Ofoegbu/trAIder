@@ -23,6 +23,7 @@ from orchestrator.loop.arb_bot import (
     FIRE_THRESHOLD_BPS,
     MAINNET_HOOK_PLACEHOLDER,
     arb_poll_loop,
+    decode_pool_price_e18,
     detect_mtoken_is_token0,
     preflight_key4_balance,
     read_sqrt_price_x96,
@@ -450,6 +451,38 @@ def test_fire_threshold_above_contract_floor() -> None:
     )
     assert FIRE_THRESHOLD_BPS == 250 or int(os.environ.get("FIRE_THRESHOLD_BPS", "0")) > 0, (
         f"Default FIRE_THRESHOLD_BPS should be 250 (probe-justified); got {FIRE_THRESHOLD_BPS}"
+    )
+
+
+def test_decode_pool_price_e18_ground_truth_anchor() -> None:
+    """GROUND-TRUTH ANCHOR for the AMM price decode (regression guard for the 1e12-vs-1e30
+    scaling bug fixed 2026-06-11). Derived from token decimals + the Q96 price encoding —
+    NOT from the decode formula. A pool that is physically on-peg (1 mTOKEN = 1 USDC) must
+    decode to exactly 1e18 in BOTH token orderings. The original suite encoded the buggy
+    convention and passed anyway; this anchor cannot.
+
+    On-peg sqrtPriceX96 (18-dec mTOKEN vs 6-dec USDC):
+      Case A (mTOKEN=token0): price token1/token0 = 1e6/1e18 = 1e-12 -> sqrtP = Q96 / 1e6
+      Case B (USDC=token0):   price token1/token0 = 1e18/1e6 = 1e12  -> sqrtP = 1e6 * Q96
+    """
+    Q96 = 2**96
+    # Case B: USDC=token0(6dec), mTOKEN=token1(18dec)
+    case_b = decode_pool_price_e18(
+        10**6 * Q96, token0_decimals=6, token1_decimals=18, mtoken_is_token0=False
+    )
+    assert case_b == 10**18, f"Case B on-peg must decode to exactly 1e18, got {case_b}"
+    # Case A: mTOKEN=token0(18dec), USDC=token1(6dec). floor(Q96/1e6) loses <1 wei of sqrtP.
+    case_a = decode_pool_price_e18(
+        Q96 // 10**6, token0_decimals=18, token1_decimals=6, mtoken_is_token0=True
+    )
+    assert abs(case_a - 10**18) <= 2, f"Case A on-peg must decode to ~1e18, got {case_a}"
+    # The OLD buggy convention treated sqrtP = Q96/1000 (Case B) as on-peg. Under the correct
+    # 1e30 factor it must NOT read on-peg — proving we are off the buggy convention for good.
+    buggy = decode_pool_price_e18(
+        Q96 // 1000, token0_decimals=6, token1_decimals=18, mtoken_is_token0=False
+    )
+    assert buggy != 10**18, (
+        "buggy-convention sqrtP must NOT decode on-peg under the corrected factor"
     )
 
 

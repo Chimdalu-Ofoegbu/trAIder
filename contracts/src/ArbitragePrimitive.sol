@@ -282,7 +282,7 @@ contract ArbitragePrimitive is IArbitragePrimitive, ReentrancyGuardTransient {
             // raw_ratio = sqrtP^2 / 2^192  (dimensionless ratio in token units)
             // 1 mTOKEN = raw_ratio USDC (in token units)
             // 1 mTOKEN in USD = raw_ratio * (1 USDC / 1e6) * 1e18 = raw_ratio * 1e12
-            // ammPrice_e18 = sqrtP^2 * 1e12 / 2^192 = sqrtP^2 * 1e12 >> 192
+            // ammPrice_e18 = sqrtP^2 * 1e30 / 2^192  (1e30 = 1e12 decimal gap x 1e18 output scale)
             // Use Math.mulDiv to avoid overflow:
             // ammPrice_e18 = mulDiv(sqrtP^2, 1e12, 2^192)
             // But sqrtP^2 can overflow uint256 for large sqrtP values.
@@ -298,7 +298,7 @@ contract ArbitragePrimitive is IArbitragePrimitive, ReentrancyGuardTransient {
             //   step2 = sqrtP * step1 / 2^96  (final result)
             uint256 sqrtP = uint256(sqrtPriceX96);
             // step1: (sqrtP * 1e12) / 2^96
-            uint256 step1 = Math.mulDiv(sqrtP, 1e12, 2 ** 96);
+            uint256 step1 = Math.mulDiv(sqrtP, 1e30, 2 ** 96);
             // step2: (sqrtP * step1) / 2^96 = sqrtP^2 * 1e12 / 2^192
             ammPriceE18 = Math.mulDiv(sqrtP, step1, 2 ** 96);
         } else {
@@ -310,11 +310,11 @@ contract ArbitragePrimitive is IArbitragePrimitive, ReentrancyGuardTransient {
             // To get 1e18-scaled:
             // 1 mTOKEN = (2^192 / sqrtP^2) USDC in token units
             // 1 mTOKEN in USD = (2^192 / sqrtP^2) / 1e6 * 1e18 = 2^192 * 1e12 / sqrtP^2
-            // ammPrice_e18 = mulDiv(2^192, 1e12, sqrtP^2)
+            // ammPrice_e18 = mulDiv(2^192, 1e30, sqrtP^2)  (1e30 = 1e12 decimal gap x 1e18 output scale)
             // = mulDiv(2^96, mulDiv(2^96, 1e12, sqrtP), sqrtP)
             uint256 sqrtP = uint256(sqrtPriceX96);
             // step1: (2^96 * 1e12) / sqrtP
-            uint256 step1 = Math.mulDiv(2 ** 96, 1e12, sqrtP);
+            uint256 step1 = Math.mulDiv(2 ** 96, 1e30, sqrtP);
             // step2: (2^96 * step1) / sqrtP = 2^192 * 1e12 / sqrtP^2
             ammPriceE18 = Math.mulDiv(2 ** 96, step1, sqrtP);
         }

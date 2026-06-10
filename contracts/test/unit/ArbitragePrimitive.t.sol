@@ -281,7 +281,7 @@ contract ArbitragePrimitiveTest is Test {
         //   sqrtPriceX96 = 1e-6 * 2^96 ≈ 79228162514 (approx)
         // We use a nominal value here — pool's price won't be perfectly tested in unit tests;
         // the gap-direction logic is tested via setPrice() to force gap above/below threshold.
-        uint160 sqrtPriceAtNAV = 79_228_162_514; // approx sqrt(1e-12) * 2^96
+        uint160 sqrtPriceAtNAV = 79228162514264337593543; // on-peg Case A (mTOKEN=token0) = floor(2^96/1e6) -> decode 1e18
 
         pool = new MockAlgebraPool(address(vault), address(usdc), sqrtPriceAtNAV);
 
@@ -427,11 +427,11 @@ contract ArbitragePrimitiveTest is Test {
         uint256 Q96 = 2 ** 96;
         uint160 sqrtPriceAtNAV;
         if (mTokenIsToken0) {
-            // sqrtP = sqrt(1e18 * 2^192 / 1e12) = sqrt(1e6 * 2^192) = 1e3 * 2^96
-            sqrtPriceAtNAV = uint160(1000 * Q96);
+            // on-peg Case A (mTOKEN=token0) = Q96 / 1e6  (decode: sqrtP^2 * 1e30 / 2^192 = 1e18)
+            sqrtPriceAtNAV = uint160(Q96 / 1e6);
         } else {
-            // sqrtP = sqrt(2^192 * 1e12 / 1e18) = sqrt(2^192 / 1e6) = 2^96 / 1e3
-            sqrtPriceAtNAV = uint160(Q96 / 1000);
+            // on-peg Case B (USDC=token0) = 1e6 * Q96  (decode: 2^192 * 1e30 / sqrtP^2 = 1e18)
+            sqrtPriceAtNAV = uint160(1e6 * Q96);
         }
 
         // Set pool price to exactly NAV (0% gap)
@@ -510,9 +510,9 @@ contract ArbitragePrimitiveTest is Test {
         uint256 Q96 = 2 ** 96;
         uint160 sqrtPriceAtNAV;
         if (mTokenIsToken0) {
-            sqrtPriceAtNAV = uint160(1000 * Q96);
+            sqrtPriceAtNAV = uint160(Q96 / 1e6);
         } else {
-            sqrtPriceAtNAV = uint160(Q96 / 1000);
+            sqrtPriceAtNAV = uint160(1e6 * Q96);
         }
         // Multiply sqrtPrice by sqrt(1.05) ≈ 1.0247 to get ~5% price increase.
         // We use 10247/10000 as integer approximation.
@@ -556,9 +556,9 @@ contract ArbitragePrimitiveTest is Test {
         uint256 Q96 = 2 ** 96;
         uint160 sqrtPriceAtNAV;
         if (mTokenIsToken0) {
-            sqrtPriceAtNAV = uint160(1000 * Q96);
+            sqrtPriceAtNAV = uint160(Q96 / 1e6);
         } else {
-            sqrtPriceAtNAV = uint160(Q96 / 1000);
+            sqrtPriceAtNAV = uint160(1e6 * Q96);
         }
         // Multiply sqrtPrice by sqrt(0.95) ≈ 0.9747 to get ~5% price decrease.
         uint160 sqrtPriceBelowNav = uint160((uint256(sqrtPriceAtNAV) * 9_747) / 10_000);
@@ -591,7 +591,7 @@ contract ArbitragePrimitiveTest is Test {
         // Set AMM price 5% above NAV to enter the AMM>NAV branch
         bool mTokenIsToken0 = address(vault) < address(usdc);
         uint256 Q96 = 2 ** 96;
-        uint160 sqrtPriceAtNAV = mTokenIsToken0 ? uint160(1000 * Q96) : uint160(Q96 / 1000);
+        uint160 sqrtPriceAtNAV = mTokenIsToken0 ? uint160(Q96 / 1e6) : uint160(1e6 * Q96);
         uint160 sqrtPriceAboveNav = uint160((uint256(sqrtPriceAtNAV) * 10_247) / 10_000);
         pool.setPrice(sqrtPriceAboveNav);
 
