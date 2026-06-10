@@ -245,8 +245,8 @@ class TestCallGpt:
         assert mock_client.chat.completions.create.called
         call_kwargs = mock_client.chat.completions.create.call_args
 
-        # temperature=0 must be present
-        assert call_kwargs.kwargs.get("temperature") == 0
+        # temperature must NOT be present (gpt-5.5 rejects any non-default temperature; HTTP 400)
+        assert "temperature" not in call_kwargs.kwargs  # gpt-5.5 rejects non-default temp
 
         # seed=42 must be present
         assert call_kwargs.kwargs.get("seed") == 42
@@ -254,7 +254,9 @@ class TestCallGpt:
         # tool_choice must force submit_decision
         tool_choice = call_kwargs.kwargs.get("tool_choice", {})
         assert tool_choice.get("type") == "function"
-        assert tool_choice.get("name") == "submit_decision"
+        assert tool_choice["function"]["name"] == "submit_decision"
+        assert call_kwargs.kwargs.get("max_completion_tokens") == 1024
+        assert "reasoning" not in call_kwargs.kwargs
 
         # tools must contain submit_decision with strict schema and strict:True
         tools = call_kwargs.kwargs.get("tools", [])

@@ -8,7 +8,7 @@ Exposes four primitives used by the loop driver (Plan 05):
 
   call_gpt(rendered_prompt, model, *, client) -> Any
       Make the forced-tool API call. Returns the raw ChatCompletion object.
-      Passes temperature=0, seed=42, reasoning={"effort":"low"} for inference parity.
+      Passes seed=42 + max_completion_tokens; no temperature/reasoning (gpt-5.5 rejects both).
 
   extract_tool_input(response) -> dict | None
       Extract the tool_calls[0].function.arguments dict from the response,
@@ -28,11 +28,11 @@ D-17 two-counter design (identical to anthropic_adapter):
   malformed_streak   : extract_tool_input is None, OR validate_decision is None → pause at 5
 
 Inference parity (D-13):
-  GPT-5.5 → temperature=0 + seed=42 + reasoning={"effort":"low"}
-  Reasoning tier: "low" avoids 5-15s latency; fast crypto decisions (CLAUDE.md § Provider Quirks)
-  seed=42 for best-effort determinism; temperature=0 for greedy decoding
-  Note: reasoning kwarg is a top-level param in openai>=2.0 (verified against openai==2.41.0
-  via inspect.getsource — 04-PROBE-RESULTS.md Assumption A1 resolved: reasoning IS top-level).
+  GPT-5.5 → seed=42 + max_completion_tokens (NOT max_tokens) + nested tool_choice.
+  Verified live 2026-06-10: gpt-5.5 rejects any non-default temperature (HTTP 400 — only the
+  default 1 is allowed), so temperature is omitted and GPT is non-deterministic like Claude
+  Opus 4.7. reasoning/reasoning_effort is unsupported with function tools on /v1/chat/completions
+  (the API directs callers to /v1/responses), so it is omitted. seed=42 is best-effort only.
 """
 
 from __future__ import annotations
@@ -78,8 +78,10 @@ async def call_gpt(
         Call extract_tool_input() and validate_decision() on the result.
 
     Inference parity (D-13):
-        temperature=0 + seed=42 for best-effort determinism.
-        reasoning={"effort":"low"} to avoid 5-15s reasoning latency (CLAUDE.md).
+        seed=42 only — gpt-5.5 rejects any non-default temperature (HTTP 400), so temperature
+        is omitted (GPT is non-deterministic, like Claude). reasoning_effort is unsupported with
+        function tools on chat.completions, so it is omitted. max_completion_tokens (not
+        max_tokens) is required.
     """
     if client is None:
         client = openai.AsyncOpenAI()
@@ -101,11 +103,9 @@ async def call_gpt(
                 },
             }
         ],
-        tool_choice={"type": "function", "name": "submit_decision"},
-        temperature=0,
+        tool_choice={"type": "function", "function": {"name": "submit_decision"}},
         seed=SEED,
-        reasoning={"effort": "low"},
-        max_tokens=MAX_TOKENS,
+        max_completion_tokens=MAX_TOKENS,
     )
     return response
 
