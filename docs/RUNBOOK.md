@@ -261,6 +261,36 @@ ORDER BY created_at ASC;
 
 ---
 
+### Phase-4 gate — one-command operator scripts
+
+Three bash wrappers under `scripts/gate/` reduce live-session paste-friction.
+Each script loads `.env`, `.env.deployer`, and `orchestrator/.env` automatically.
+Run in this order:
+
+```bash
+# Step 1: Fund demo holder wallets with mock USDC (Sepolia only — MockERC20.mint)
+#   Requires: HOLDER_CLAUDE_KEY, HOLDER_GPT_KEY, HOLDER_GEM_KEY, DEPLOYER_PRIVATE_KEY, SEPOLIA_RPC
+#   Optional arg: raw USDC amount per holder (default 100000000 = 100 USDC)
+bash scripts/gate/fund-holders.sh            # fund each holder with 100 USDC (default)
+bash scripts/gate/fund-holders.sh 50000000   # fund each holder with 50 USDC
+
+# Step 2: Pre-flight check (pools deployed, on-peg, keys funded, venue artifact present)
+#   Delegates to: uv run --project orchestrator python -m gate.preflight
+bash scripts/gate/preflight.sh
+
+# Step 3: Launch the gate run
+#   Delegates to: uv run --project orchestrator python -m gate.run_gate
+#   GATE_DURATION and FIRE_THRESHOLD_BPS are exported with sensible defaults (3600s / 250bps)
+bash scripts/gate/run-gate.sh --full-run
+bash scripts/gate/run-gate.sh --full-run --step-through   # interactive narration
+GATE_DURATION=2700 bash scripts/gate/run-gate.sh --full-run  # 45-min run
+bash scripts/gate/run-gate.sh --dry-run      # in-memory fakes, no network
+```
+
+**Script sources:** `scripts/gate/fund-holders.sh`, `scripts/gate/preflight.sh`, `scripts/gate/run-gate.sh`
+
+---
+
 ### Phase-4 Gate Run (04-08 Task 4) — REAL Commands
 
 The Phase-4 gate is a mini-session (~45-60 min) that validates all 7 D-16 HARD criteria
