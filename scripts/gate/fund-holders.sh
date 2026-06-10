@@ -68,7 +68,7 @@ echo "[INFO] MockUSDC address: ${MOCK_USDC}"
 # 4. Derive holder addresses from private keys (via cast wallet address)
 # ---------------------------------------------------------------------------
 USDC_AMOUNT="${1:-100000000}"  # default: 100 USDC in 6-decimal raw units
-echo "[INFO] Minting ${USDC_AMOUNT} raw USDC units to each holder (= $(echo "scale=2; ${USDC_AMOUNT}/1000000" | bc) USDC)"
+echo "[INFO] Minting ${USDC_AMOUNT} raw USDC units to each holder (= $((USDC_AMOUNT / 1000000)) USDC)"
 
 declare -A HOLDER_KEYS
 HOLDER_KEYS[claude]="${HOLDER_CLAUDE_KEY}"

@@ -231,6 +231,7 @@ class TestSpectatorSimPauseResume:
         swap_calls: list[str] = []
 
         swap_router = MagicMock()
+        swap_router.web3 = None  # force _get_erc20 mock-fallback (awaitable approve) in tests
 
         async def _fake_transact(*args, **kwargs):  # noqa: ANN001
             swap_calls.append("swap")
@@ -239,8 +240,11 @@ class TestSpectatorSimPauseResume:
         swap_router.functions.exactInputSingle.return_value.transact = _fake_transact
 
         vault = _make_vault()
+        vault.address = "0x" + "a1" * 20
         pool = MagicMock()
         pool.address = "0xPool1"
+        pool.functions.token0.return_value.call = AsyncMock(return_value="0x" + "a1" * 20)
+        pool.functions.token1.return_value.call = AsyncMock(return_value="0x" + "b2" * 20)
 
         stop_event = asyncio.Event()
 
@@ -313,6 +317,7 @@ class TestGenuineHolderBuySized:
         usdc_amount = 5 * 10**6  # $5 — within 1.5% of $500 pool depth
 
         swap_router = MagicMock()
+        swap_router.web3 = None  # force _get_erc20 mock-fallback (awaitable approve) in tests
         swap_router.functions.exactInputSingle.return_value.transact = AsyncMock(
             return_value=b"\xde\xad" + b"\x00" * 30
         )
@@ -323,6 +328,8 @@ class TestGenuineHolderBuySized:
 
         pool = MagicMock()
         pool.address = "0xPool1"
+        pool.functions.token0.return_value.call = AsyncMock(return_value="0xVaultMCLA")
+        pool.functions.token1.return_value.call = AsyncMock(return_value="0x" + "b2" * 20)
 
         result_balance = await genuine_holder_buy(
             swap_router,
