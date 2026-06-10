@@ -619,6 +619,11 @@ async def _async_main(argv: list[str] | None = None) -> int:
 
 
 def main(argv: list[str] | None = None) -> None:
+    # Windows consoles default to cp1252 and crash on the >=/<= glyphs in the report.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+    except Exception:  # noqa: BLE001
+        pass
     sys.exit(asyncio.run(_async_main(argv)))
 
 
