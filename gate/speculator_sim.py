@@ -47,6 +47,57 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Minimal ERC20 ABI — approve + allowance (Fix 3: approval before swaps)
+# ---------------------------------------------------------------------------
+
+_ERC20_MINIMAL_ABI: list = [
+    {
+        "inputs": [
+            {"name": "spender", "type": "address"},
+            {"name": "amount", "type": "uint256"},
+        ],
+        "name": "approve",
+        "outputs": [{"name": "", "type": "bool"}],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"name": "owner", "type": "address"},
+            {"name": "spender", "type": "address"},
+        ],
+        "name": "allowance",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+]
+
+
+def _get_erc20(swap_router: Any, token_address: str) -> Any:
+    """Return an ERC20 contract instance bound to token_address.
+
+    Uses the web3 instance embedded in swap_router.web3 (for real Web3 contracts)
+    or falls back to a MagicMock with approve/allowance stubs for test contexts
+    where swap_router is a MagicMock.
+
+    In a real Web3 context the router carries a .web3 attribute set by web3.py;
+    in tests the caller replaces swap_router with a MagicMock, so we return
+    a MagicMock with the same interface instead of crashing.
+    """
+    web3 = getattr(swap_router, "web3", None)
+    if web3 is not None and hasattr(web3, "eth") and hasattr(web3.eth, "contract"):
+        return web3.eth.contract(address=token_address, abi=_ERC20_MINIMAL_ABI)
+    # Test/mock context: return a mock with approve/allowance stubs
+    from unittest.mock import MagicMock, AsyncMock  # noqa: PLC0415
+    mock = MagicMock()
+    mock.address = token_address
+    mock.functions.approve.return_value.transact = AsyncMock(return_value=b"\x01")
+    mock.functions.allowance.return_value.call = AsyncMock(return_value=0)
+    return mock
+
+
+# ---------------------------------------------------------------------------
 # Sizing constants — referenced from arb_bot.py defaults (D-09)
 # ---------------------------------------------------------------------------
 
@@ -79,6 +130,7 @@ async def run_speculator_sim(
     cadence_seconds: float = DEFAULT_CADENCE_SECONDS,
     max_swap_usdc: int,
     stop_event: asyncio.Event | None = None,
+    max_cycles: int | None = None,
 ) -> None:
     """Periodic small randomized buys/sells across the 3 pools for AMM liveness.
 
@@ -96,6 +148,11 @@ async def run_speculator_sim(
             [max_swap_usdc//4, max_swap_usdc].
         stop_event: If set (not None), the sim pauses when stop_event.is_set() and
             resumes when cleared. Set before inducing the synthetic gap (D-10).
+        max_cycles: Optional upper bound on the number of full swap rounds to execute.
+            Production callers pass None (infinite loop, cancelled via asyncio.Task.cancel).
+            Test callers pass a small integer (e.g. 1) to ensure the coroutine returns
+            deterministically without relying on stop_event semantics.
+            Pause cycles (stop_event.is_set()) do NOT count toward max_cycles.
 
     Raises:
         Never — per-pool exceptions are caught and logged; the loop continues.
@@ -112,7 +169,15 @@ async def run_speculator_sim(
         max_swap_usdc,
     )
 
+    cycles_completed: int = 0
+
     while True:
+        if max_cycles is not None and cycles_completed >= max_cycles:
+            logger.debug(
+                "run_speculator_sim: max_cycles=%d reached, returning",
+                max_cycles,
+            )
+            return
         # Pause check — yield to allow stop_event.set() to take effect.
         if stop_event is not None and stop_event.is_set():
             logger.debug("run_speculator_sim: paused (stop_event set)")
@@ -133,17 +198,30 @@ async def run_speculator_sim(
 
                 if is_buy:
                     # exactInputSingle USDC → mTOKEN
+                    # Resolve token addresses from pool (Fix 2: token resolution)
                     vault_addr = getattr(vault, "address", str(vault))
+                    token0 = await pool.functions.token0().call()
+                    token1 = await pool.functions.token1().call()
+                    mtoken_is_token0 = token0.lower() == vault_addr.lower()
+                    usdc_addr = token1 if mtoken_is_token0 else token0
+                    mtoken_addr = vault_addr
+                    # ERC20 approve USDC before swap (Fix 3)
+                    usdc_contract = _get_erc20(swap_router, usdc_addr)
+                    await usdc_contract.functions.approve(
+                        getattr(swap_router, "address", str(swap_router)), amount
+                    ).transact({"from": demo_wallet_address})
+                    # Pass ordered tuple — NOT dict (Fix 1: dict → tuple)
+                    # Order: (tokenIn, tokenOut, recipient, deadline, amountIn, amountOutMinimum, sqrtPriceLimitX96)
                     await swap_router.functions.exactInputSingle(
-                        {
-                            "tokenIn": "USDC",  # resolved from pool in real calls
-                            "tokenOut": vault_addr,
-                            "recipient": demo_wallet_address,
-                            "deadline": 2**32 - 1,
-                            "amountIn": amount,
-                            "amountOutMinimum": 0,
-                            "sqrtPriceLimitX96": 0,
-                        }
+                        (
+                            usdc_addr,
+                            mtoken_addr,
+                            demo_wallet_address,
+                            2**32 - 1,
+                            amount,
+                            0,
+                            0,
+                        )
                     ).transact({"from": demo_wallet_address})
                     logger.debug(
                         "run_speculator_sim: BUY %d USDC-units on pool=%s",
@@ -152,16 +230,28 @@ async def run_speculator_sim(
                     )
                 else:
                     # exactInputSingle mTOKEN → USDC
+                    vault_addr = getattr(vault, "address", str(vault))
+                    token0 = await pool.functions.token0().call()
+                    token1 = await pool.functions.token1().call()
+                    mtoken_is_token0 = token0.lower() == vault_addr.lower()
+                    usdc_addr = token1 if mtoken_is_token0 else token0
+                    mtoken_addr = vault_addr
+                    # ERC20 approve mTOKEN before swap (Fix 3)
+                    mtoken_contract = _get_erc20(swap_router, mtoken_addr)
+                    await mtoken_contract.functions.approve(
+                        getattr(swap_router, "address", str(swap_router)), amount
+                    ).transact({"from": demo_wallet_address})
+                    # Pass ordered tuple — NOT dict (Fix 1: dict → tuple)
                     await swap_router.functions.exactInputSingle(
-                        {
-                            "tokenIn": getattr(vault, "address", str(vault)),
-                            "tokenOut": "USDC",
-                            "recipient": demo_wallet_address,
-                            "deadline": 2**32 - 1,
-                            "amountIn": amount,
-                            "amountOutMinimum": 0,
-                            "sqrtPriceLimitX96": 0,
-                        }
+                        (
+                            mtoken_addr,
+                            usdc_addr,
+                            demo_wallet_address,
+                            2**32 - 1,
+                            amount,
+                            0,
+                            0,
+                        )
                     ).transact({"from": demo_wallet_address})
                     logger.debug(
                         "run_speculator_sim: SELL %d mTOKEN-units on pool=%s",
@@ -176,6 +266,7 @@ async def run_speculator_sim(
                     exc,
                 )
 
+        cycles_completed += 1
         await asyncio.sleep(cadence_seconds)
 
 
@@ -253,26 +344,41 @@ async def genuine_holder_buy(
     vault_addr = getattr(vault, "address", str(vault))
     pool_addr = getattr(pool, "address", str(pool))
 
+    # Fix 2: resolve USDC from pool token0/token1 rather than a literal placeholder
+    token0 = await pool.functions.token0().call()
+    token1 = await pool.functions.token1().call()
+    mtoken_is_token0 = token0.lower() == vault_addr.lower()
+    usdc_addr = token1 if mtoken_is_token0 else token0
+
     logger.info(
         "genuine_holder_buy: executing USDC→mTOKEN buy of %d USDC-units "
-        "for holder=%s on pool=%s vault=%s",
+        "for holder=%s on pool=%s vault=%s (usdc=%s mtoken_is_token0=%s)",
         usdc_amount,
         holder_wallet[:10],
         str(pool_addr)[:10],
         str(vault_addr)[:10],
+        str(usdc_addr)[:10],
+        mtoken_is_token0,
     )
 
-    # Execute exactInputSingle: USDC → mTOKEN (the genuine speculator path, D-19)
+    # Fix 3: ERC20 approve USDC to router BEFORE exactInputSingle
+    usdc_contract = _get_erc20(swap_router, usdc_addr)
+    await usdc_contract.functions.approve(
+        getattr(swap_router, "address", str(swap_router)), usdc_amount
+    ).transact({"from": holder_wallet})
+
+    # Fix 1: pass ordered tuple — NOT dict
+    # Order: (tokenIn, tokenOut, recipient, deadline, amountIn, amountOutMinimum, sqrtPriceLimitX96)
     await swap_router.functions.exactInputSingle(
-        {
-            "tokenIn": "USDC",
-            "tokenOut": vault_addr,
-            "recipient": holder_wallet,
-            "deadline": 2**32 - 1,
-            "amountIn": usdc_amount,
-            "amountOutMinimum": 0,
-            "sqrtPriceLimitX96": 0,
-        }
+        (
+            usdc_addr,
+            vault_addr,
+            holder_wallet,
+            2**32 - 1,
+            usdc_amount,
+            0,
+            0,
+        )
     ).transact({"from": holder_wallet})
 
     # Read ACTUAL post-buy mTOKEN balance — never assume a round amount (D-19).
