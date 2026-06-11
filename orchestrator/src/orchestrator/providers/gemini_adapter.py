@@ -30,13 +30,14 @@ D-17 two-counter design (identical to anthropic_adapter):
   malformed_streak   : extract_tool_input is None, OR validate_decision is None → pause at 5
 
 Inference parity (D-13):
-  Gemini 3.1 Pro → temperature=0.0 + seed=42 (no reasoning_effort knob available)
-  Reasoning tier mapping: Gemini lacks a reasoning_effort equivalent; temp0+seed is the
-  parity lever. This is documented per RESEARCH.md § D3 inference-parity mapping table:
+  Gemini 3.1 Pro → temperature=0.0 + seed=42 + thinking_budget=512 (reasoning cap).
+  Reasoning tier mapping: thinking_budget IS Gemini's reasoning_effort equivalent (it is a
+  thinking model). This is documented per RESEARCH.md § D3 inference-parity mapping table:
     Claude Opus 4.7:  no temp/seed (adaptive sampling — HTTP 400 if passed)
     GPT-5.5:          temp=0 + seed=42 + reasoning_effort=low
-    Gemini 3.1 Pro:   temp=0.0 + seed=42 (no reasoning_effort parameter exposed)
+    Gemini 3.1 Pro:   temp=0.0 + seed=42 + thinking_budget=512 (the "low" reasoning analog)
   All three use strict structured output; schema is shared via strict_provider_schema().
+  NOTE: thinking tokens bill against max_output_tokens — MAX_TOKENS=4096 leaves JSON headroom.
 
 Async path (04-PROBE-RESULTS.md Probe 3 VERDICT):
   client.aio.models.generate_content(...) is a native coroutine on AsyncModels
@@ -62,8 +63,19 @@ from orchestrator.schema import Decision, strict_provider_schema
 # ---------------------------------------------------------------------------
 
 DEFAULT_MODEL = "gemini-3.1-pro-preview"
-MAX_TOKENS = 1024
+# Gemini 3.1 Pro is a THINKING model: reasoning tokens are billed against
+# max_output_tokens. At 1024, thinking (~900 tokens observed) starved the JSON output,
+# intermittently truncating it mid-string (finish_reason=MAX_TOKENS) → malformed
+# structured output that extract_tool_input() rejected as None. 4096 gives enough
+# headroom that the JSON can never be truncated even if thinking overshoots its budget.
+MAX_TOKENS = 4096
 SEED = 42
+# D-13 inference-parity: thinking_budget is Gemini's analog of GPT-5.5's
+# reasoning_effort="low" ("fast, not deep" for trading decisions). Bounding it cuts
+# latency (~13s → ~6s/call) and improves replay determinism. This is an ADVISORY cap
+# (observed ~510 against a 256 budget); the MAX_TOKENS headroom above is the hard
+# guarantee against truncation. Closes the "no reasoning_effort knob" parity gap.
+THINKING_BUDGET = 512
 
 # ---------------------------------------------------------------------------
 # call_gemini — make the JSON-schema constrained API call
@@ -95,7 +107,9 @@ async def call_gemini(
         response_mime_type="application/json" required when response_json_schema is set.
 
     Inference parity (D-13):
-        temperature=0.0 + seed=42. No reasoning_effort knob (Gemini 3.1 Pro).
+        temperature=0.0 + seed=42 + thinking_budget=512 (Gemini's reasoning_effort="low"
+        analog). max_output_tokens=4096 leaves JSON headroom since thinking tokens bill
+        against the output budget (1024 starved the JSON → intermittent MAX_TOKENS truncation).
     """
     if client is None:
         client = genai.Client()
@@ -114,6 +128,8 @@ async def call_gemini(
             max_output_tokens=MAX_TOKENS,
             response_mime_type="application/json",
             response_json_schema=schema,
+            # D-13 reasoning-effort analog + truncation guard (see THINKING_BUDGET above).
+            thinking_config=types.ThinkingConfig(thinking_budget=THINKING_BUDGET),
         ),
     )
     return response

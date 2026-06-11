@@ -257,7 +257,11 @@ class TestCallGemini:
         assert config.seed == 42
         assert config.response_mime_type == "application/json"
         assert config.response_json_schema == strict_provider_schema()
-        assert config.max_output_tokens == 1024
+        # 4096 (not 1024): Gemini thinking tokens bill against max_output_tokens; 1024
+        # starved the JSON → intermittent MAX_TOKENS truncation → malformed output.
+        assert config.max_output_tokens == 4096
+        # thinking_budget = Gemini's reasoning_effort="low" analog (D-13), bounds reasoning.
+        assert config.thinking_config.thinking_budget == 512
 
         # Verify result is the fake response
         assert result is fake_response
