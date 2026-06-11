@@ -1,34 +1,21 @@
 // =============================================================================
-// frontend/app/layout.tsx — Root layout (D-62..D-66, D-71)
+// frontend/app/layout.tsx — Root layout
 //
-// - Inter for prose, JetBrains Mono for numerics (D-64) via next/font
-// - Imports styles/tokens.css design tokens (D-62)
-// - Wraps children in Providers (WagmiProvider + QueryClient + RainbowKit)
-// - Dark-only: no light mode (D-63)
+// Adopts the Claude Design build's visual system as the app-wide baseline:
+//   - styles/traider.css (design tokens, typography, components) + styles/app.css
+//     (app shell) imported AFTER globals.css so the design wins the cascade.
+//   - Design fonts (Newsreader / Hanken Grotesk / IBM Plex Mono) via <link>,
+//     matching the prototype exactly.
+//   - data-theme="dark" (the design keys its themes off [data-theme]).
+//   - Wraps children in Providers (WagmiProvider + QueryClient + RainbowKit).
 // =============================================================================
 
 import type { Metadata } from "next";
-import { Inter, JetBrains_Mono } from "next/font/google";
 
 import { Providers } from "./providers";
-import "../styles/tokens.css";
 import "./globals.css";
-
-// ── Inter — prose font (D-64) ─────────────────────────────────────────────────
-const inter = Inter({
-  subsets: ["latin"],
-  variable: "--font-inter",
-  display: "swap",
-  weight: ["400", "500", "600", "700"],
-});
-
-// ── JetBrains Mono — ALL numerics: NAV, prices, sizes, timestamps (D-64) ─────
-const jetbrainsMono = JetBrains_Mono({
-  subsets: ["latin"],
-  variable: "--font-jetbrains-mono",
-  display: "swap",
-  weight: ["400", "500", "600"],
-});
+import "../styles/traider.css";
+import "../styles/app.css";
 
 export const metadata: Metadata = {
   title: "trAIder — Live AI Trading Performance Markets",
@@ -44,15 +31,20 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" className="dark">
-      <body
-        className={`${inter.variable} ${jetbrainsMono.variable} antialiased`}
-        style={{
-          background: "var(--color-bg-base)",
-          color: "var(--color-text-primary)",
-          fontFamily: "var(--font-prose)",
-        }}
-      >
+    <html lang="en" data-theme="dark" suppressHydrationWarning>
+      <head>
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link
+          rel="preconnect"
+          href="https://fonts.gstatic.com"
+          crossOrigin="anonymous"
+        />
+        <link
+          href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,300;6..72,360;6..72,400;6..72,500&family=Hanken+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap"
+          rel="stylesheet"
+        />
+      </head>
+      <body>
         <Providers>{children}</Providers>
       </body>
     </html>
