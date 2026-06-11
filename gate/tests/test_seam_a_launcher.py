@@ -119,6 +119,7 @@ async def test_three_models_share_one_nonce_manager_no_collision() -> None:
 
     bind_ok: list = []
     models_seen: list = []
+    inject_flags: list = []
 
     async def _spy_run_session(*args, **kwargs):  # noqa: ANN002, ANN003
         # (b) Prove the launcher's actual call binds to the REAL driver.run_session signature.
@@ -126,6 +127,10 @@ async def test_three_models_share_one_nonce_manager_no_collision() -> None:
         _REAL_SIG.bind(*args, **kwargs)
         bind_ok.append(kwargs.get("vault_contract"))
         models_seen.append(args[4])  # 5th positional = model string (provider→model mapping)
+        # A.3: each model must tell the driver to SKIP re-injecting signing middleware on the
+        # shared web3 (run_gate injected it once) — else web3.py "can't add the same un-named
+        # instance twice" crashes all 3 models at startup (caught live, the mock hid it).
+        inject_flags.append(kwargs.get("inject_signing_middleware"))
         nonce_mgr = kwargs["nonce_manager"]
         from_addr = kwargs["deployer_address"]
         # (a) Exercise the shared NonceManager the way the real driver + keeper do: several
@@ -159,6 +164,10 @@ async def test_three_models_share_one_nonce_manager_no_collision() -> None:
         "gpt-5.5-2026-04-23",
         "gemini-3.1-pro-preview",
     }, f"expected the real 3-model mapping; got {models_seen}"
+    # A.3: all 3 models must skip middleware re-injection on the shared web3
+    assert inject_flags == [False, False, False], (
+        f"all 3 models must pass inject_signing_middleware=False (shared-web3 D-11); got {inject_flags}"
+    )
 
     # (a) no duplicate nonce across all shared-EOA writes (3 models × 4 + shared pusher)
     assert None not in nonce_record, "a write went out with no explicit nonce"

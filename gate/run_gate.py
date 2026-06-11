@@ -714,6 +714,10 @@ def build_live_shared_deps(
                 launch_price_pusher=False,
                 external_walk=shared_walk,
                 external_snapshot_queue=snapshot_queues[provider],
+                # D-11: operator-trade middleware was injected ONCE on the shared web3 by
+                # run_gate (_build_web3_with_signers); each model must NOT re-inject it, or
+                # web3.py raises "can't add the same un-named instance twice" → all 3 crash.
+                inject_signing_middleware=False,
             )
         finally:
             try:

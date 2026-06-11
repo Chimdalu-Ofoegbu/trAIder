@@ -1244,6 +1244,13 @@ async def run_session(
     launch_price_pusher: bool = True,
     external_walk: Any = None,
     external_snapshot_queue: Any = None,
+    # D-11 multi-model: when the gate launcher shares ONE web3 across all 3 models, the
+    # operator-trade signing middleware is injected ONCE by the launcher (run_gate
+    # _build_web3_with_signers). Each model's run_session must then SKIP re-injecting it, or
+    # web3.py raises "You can't add the same un-named instance twice" on the 2nd model and all
+    # three crash -> AUTO_PAUSED. Default True preserves single-model behavior (run_session
+    # injects it itself, exactly once).
+    inject_signing_middleware: bool = True,
     # GAP #4/#6: price_pusher_address separates price-push signing from trade-submission
     # signing (SEC-01 key separation). Defaults to deployer_address for backward compat.
     # When set, the price pusher uses this address to sign setPrice() calls instead of
@@ -1326,19 +1333,31 @@ async def run_session(
     # On Sepolia: operator_trade_account is loaded from gitignored OPERATOR_TRADE_KEY env var.
     operator_trade_address: str | None = None
     if operator_trade_account is not None:
-        # web3.py 7.x API: SignAndSendRawMiddlewareBuilder.build is @curry-decorated.
-        # Calling build(account) WITHOUT w3 returns a curry partial that the middleware
-        # onion will call with (w3) during initialization.  This is the correct injection
-        # pattern — passing the fully-built instance (build(account, w3)) causes a
-        # TypeError because the onion then calls the instance as if it were a class.
-        # Replaces the web3.py 6.x construct_sign_and_send_raw_middleware function.
-        signing_mw_partial = SignAndSendRawMiddlewareBuilder.build(operator_trade_account)
-        web3.middleware_onion.inject(signing_mw_partial, layer=0)
+        # Always derive the address (enables the D-16 vault-submit path downstream) even when
+        # injection is skipped — see inject_signing_middleware (D-11 shared-web3 multi-model).
         operator_trade_address = operator_trade_account.address
-        logger.info(
-            "run_session: signing middleware loaded for operator-trade EOA %s (D-16)",
-            operator_trade_address,
-        )
+        if inject_signing_middleware:
+            # web3.py 7.x API: SignAndSendRawMiddlewareBuilder.build is @curry-decorated.
+            # Calling build(account) WITHOUT w3 returns a curry partial that the middleware
+            # onion will call with (w3) during initialization.  This is the correct injection
+            # pattern — passing the fully-built instance (build(account, w3)) causes a
+            # TypeError because the onion then calls the instance as if it were a class.
+            # Replaces the web3.py 6.x construct_sign_and_send_raw_middleware function.
+            signing_mw_partial = SignAndSendRawMiddlewareBuilder.build(operator_trade_account)
+            web3.middleware_onion.inject(signing_mw_partial, layer=0)
+            logger.info(
+                "run_session: signing middleware loaded for operator-trade EOA %s (D-16)",
+                operator_trade_address,
+            )
+        else:
+            # D-11 multi-model: the gate launcher already injected this EOA's middleware ONCE
+            # on the shared web3; re-injecting per-model would raise "can't add the same
+            # un-named instance twice". Skip injection but keep operator_trade_address set.
+            logger.info(
+                "run_session: operator-trade EOA %s — signing middleware injection SKIPPED "
+                "(already loaded on shared web3 by the gate launcher; D-11)",
+                operator_trade_address,
+            )
     else:
         logger.warning(
             "run_session: no operator_trade_account provided — "
