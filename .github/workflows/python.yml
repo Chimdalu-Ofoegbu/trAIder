@@ -18,6 +18,7 @@ on:
       - "orchestrator/**"
       - "backend/**"
       - "migrations/**"
+      - "gate/**"
       - ".github/workflows/python.yml"
   pull_request:
     branches: ["main"]
@@ -25,6 +26,7 @@ on:
       - "orchestrator/**"
       - "backend/**"
       - "migrations/**"
+      - "gate/**"
       - ".github/workflows/python.yml"
 
 # Cancel in-progress runs for the same workflow + branch (D-47)
@@ -116,6 +118,17 @@ jobs:
         working-directory: orchestrator
         env:
           DATABASE_URL: postgresql+asyncpg://traider:traider@localhost:5432/traider
+
+      # ── pytest gate (Seam A real-path launcher + harness/allowance tests) ──
+      # Run from repo root against the orchestrator venv (gate imports orchestrator.*).
+      # Anti-mock-masking guard (04-GATE #4): the live-launcher REAL-signature check + the
+      # shared-NonceManager concurrency test run in CI so the gate-failure class — green on
+      # dry-run mocks while the live path TypeErrors — cannot silently return.
+      - name: pytest gate
+        run: uv run --project orchestrator pytest gate/tests -v --tb=short
+        env:
+          DATABASE_URL: postgresql+asyncpg://traider:traider@localhost:5432/traider
+          ORCHESTRATOR_DATABASE_URL: postgresql+asyncpg://traider:traider@localhost:5432/traider
 
       # ── pytest backend ─────────────────────────────────────────────────────
       - name: pytest backend

@@ -521,6 +521,218 @@ class _GateResultAccumulator:
 
 
 # ---------------------------------------------------------------------------
+# build_live_shared_deps — Seam A live 3-model launcher (D-11)
+# ---------------------------------------------------------------------------
+
+
+def build_live_shared_deps(
+    web3: Any,
+    manifest: dict,
+    vaults_with_addrs: list[tuple[Any, str]],
+    *,
+    trade_key: str,
+    gate_duration: int,
+    gate_cadence: float,
+    gate_seed: int,
+    db_url: str,
+    gate_drift: float = 0.0001,
+    gate_volatility: float = 0.005,
+    contracts_out: Path | None = None,
+) -> tuple[dict[str, Any], Any]:
+    """Assemble the LIVE 3-model ``shared_deps`` + a teardown coroutine (Seam A, D-11).
+
+    This is the per-model session launcher that was NEVER BUILT — the gap the dry-run
+    fake masked (04-GATE Seam A). The old live stub wired the RAW ``driver.run_session``
+    (plus a stray ``"web3"`` key) straight into ``shared_deps``; ``supervisor.py`` then
+    called it as ``driver_run_session(vault_address=…, provider=…, web3=…)`` →
+    ``TypeError: unexpected keyword argument 'vault_address'`` ×3 models ×5 restarts →
+    all AUTO_PAUSED. The fix is a wrapper closure with the supervisor's
+    ``(vault_address, provider)`` contract that translates into the REAL
+    ``driver.run_session(web3, adapter, aggregators, vault, model, *, …)`` signature.
+
+    Builds infra ONCE and SHARES it across all 3 model loops (do NOT spawn 3 independent
+    ``run_mini_session``s — they would collide on the price feeds + the price-pusher /
+    operator nonce):
+      - ONE operator-trade ``Account`` + ``NonceManager`` (shared-EOA nonce discipline:
+        every operator write — 3 models' vault trades, the keeper's executeOrder /
+        clearTradingLock, and the shared pusher's setPrice — serializes through it).
+      - ONE mock-perps adapter + ETH/BTC/SOL aggregator contracts (read / event-decode).
+      - ONE seeded ``PriceWalk`` + ONE price-pusher task fanning the SAME step to 3
+        per-model snapshot queues (fairness — all 3 models see identical market state).
+      - ONE shared async DB engine; each model loop opens its OWN ``AsyncSession`` inside
+        the closure (sessions are NOT task-safe — mirrors ``run_session.py`` keeper_db).
+
+    Reuses the proven ``run_mini_session`` assembly (run_session.py), parameterized per
+    vault. The single-model live loop is left untouched (this is additive).
+
+    Args:
+        web3:               AsyncWeb3 with signing middleware ALREADY injected for the
+                            operator-trade EOA (run_gate Step 2 / _build_web3_with_signers).
+        manifest:           Sepolia manifest (needs mockPerps, ethFeed, btcFeed, solFeed).
+        vaults_with_addrs:  List of (vault_contract, vault_address) — one per model.
+        trade_key:          Operator-trade EOA hex private key (with or without 0x).
+        gate_duration:      Per-model SessionConfig.session_duration_seconds.
+        gate_cadence:       Per-model SessionConfig.cadence_seconds (= pusher cadence).
+        gate_seed:          Shared PriceWalk seed (D-01 replay).
+        db_url:             Async Postgres URL (normalized to +asyncpg here).
+        gate_drift:         PriceWalk per-cycle drift (default 0.0001, matches D-01).
+        gate_volatility:    PriceWalk per-cycle volatility (default 0.005, matches D-01).
+        contracts_out:      Override contracts/out path (defaults to repo contracts/out).
+
+    Returns:
+        (shared_deps, teardown) — ``shared_deps`` is the dict ``run_supervisor`` consumes;
+        ``teardown`` is an async no-arg callable that stops the shared price-pusher task
+        and disposes the shared DB engine. MUST be awaited at gate end (else dangling
+        task / leaked engine).
+    """
+    from eth_account import Account  # noqa: PLC0415
+    from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine  # noqa: PLC0415
+
+    from orchestrator.alerts.sink import send_alert  # noqa: PLC0415
+    from orchestrator.loop import driver as _driver_mod  # noqa: PLC0415
+    from orchestrator.loop.adapter_factory import build_perps_adapter  # noqa: PLC0415
+    from orchestrator.loop.nonce_manager import NonceManager  # noqa: PLC0415
+    from orchestrator.loop.price_pusher import PriceWalk, run_price_pusher  # noqa: PLC0415
+    from orchestrator.loop.run_session import _load_abi as _load_abi_fn  # noqa: PLC0415
+    from orchestrator.loop.session import SessionConfig  # noqa: PLC0415
+
+    _contracts_out = contracts_out or (_REPO_ROOT / "contracts" / "out")
+
+    # ── operator-trade EOA ─────────────────────────────────────────────────
+    # Signing middleware for this EOA is ALREADY on `web3` (run_gate Step 2). We need the
+    # Account object so driver.run_session sets operator_trade_address (→ the D-16
+    # vault-submit path), plus the address for the shared NonceManager + pusher from_address.
+    _tk = trade_key if trade_key.startswith("0x") else "0x" + trade_key
+    operator_trade_account = Account.from_key(_tk)
+    operator_addr = operator_trade_account.address
+
+    # ── ONE shared NonceManager for the operator-trade EOA (D-11 collision fix) ──
+    # Mirrors arb_nonce_mgr (run_gate Step 4) which serializes ARB_KEY4's writes.
+    operator_nonce_mgr = NonceManager(web3, operator_addr)
+
+    # ── shared mock-perps adapter + ETH/BTC/SOL feed contracts ─────────────
+    shared_adapter = build_perps_adapter(
+        web3,
+        venue="mock",
+        mock_perps_address=manifest["mockPerps"],
+        gmx_adapter_address=None,
+        mock_perps_abi=_load_abi_fn(_contracts_out / "MockPerps.sol" / "MockPerps.json"),
+    )
+    _agg_abi = _load_abi_fn(
+        _contracts_out / "MockChainlinkAggregator.sol" / "MockChainlinkAggregator.json"
+    )
+    shared_aggregators = {
+        "ETH": web3.eth.contract(address=manifest["ethFeed"], abi=_agg_abi),
+        "BTC": web3.eth.contract(address=manifest["btcFeed"], abi=_agg_abi),
+        "SOL": web3.eth.contract(address=manifest["solFeed"], abi=_agg_abi),
+    }
+
+    # ── ONE shared DB engine ───────────────────────────────────────────────
+    # Build it BEFORE the pusher task so a bad URL raises here (no dangling task to clean
+    # up). Each model loop opens its OWN AsyncSession off this engine inside the closure.
+    _norm_db_url = db_url
+    if "+asyncpg" not in _norm_db_url and "+psycopg" not in _norm_db_url:
+        _norm_db_url = _norm_db_url.replace(
+            "postgresql://", "postgresql+asyncpg://", 1
+        ).replace("postgres://", "postgresql+asyncpg://", 1)
+    gate_engine = create_async_engine(_norm_db_url)
+
+    # ── ONE seeded walk + 3 per-model snapshot queues + ONE price-pusher task ──
+    # Each model's driver runs with launch_price_pusher=False so it reuses this walk + its
+    # queue and does NOT start a competing pusher (3 pushers would fight over the feeds and
+    # collide on the operator nonce).
+    _models = ["claude", "gpt", "gemini"]
+    shared_walk = PriceWalk(gate_seed, SessionConfig().starting_prices, gate_drift, gate_volatility)
+    snapshot_queues = {m: asyncio.Queue(maxsize=1) for m in _models}
+    pusher_stop = asyncio.Event()
+    pusher_task = asyncio.create_task(
+        run_price_pusher(
+            web3,
+            shared_aggregators,
+            shared_walk,
+            operator_addr,
+            gate_cadence,
+            pusher_stop,
+            snapshot_queues=list(snapshot_queues.values()),
+            nonce_manager=operator_nonce_mgr,
+        ),
+        name="gate-shared-price-pusher",
+    )
+
+    _provider_to_model = {
+        "claude": "claude-opus-4-7",
+        "gpt": "gpt-5.5-2026-04-23",
+        "gemini": "gemini-3.1-pro-preview",
+    }
+    _vault_by_addr = {addr.lower(): vc for vc, addr in vaults_with_addrs}
+
+    async def _live_driver_run_session(*, vault_address: str, provider: str, **_: Any) -> dict:  # noqa: ANN401
+        """Per-model session body the supervisor invokes as (vault_address=…, provider=…).
+
+        Translates that into the REAL driver.run_session(web3, adapter, aggregators, vault,
+        model, *, …) positional signature, sharing the ONE adapter / walk / NonceManager /
+        engine. ``driver.run_session`` is reached via the module (``_driver_mod.run_session``)
+        so it stays patchable for the real-path concurrency test.
+        """
+        model = _provider_to_model.get(provider, "claude-opus-4-7")
+        session_db = AsyncSession(gate_engine)  # per-task session — NOT shared (CR-04)
+        config = SessionConfig(
+            session_duration_seconds=gate_duration,
+            cadence_seconds=gate_cadence,
+            price_seed=gate_seed,
+            drift=gate_drift,
+            volatility=gate_volatility,
+            execution_delay_cycles=1,
+        )
+        try:
+            return await _driver_mod.run_session(
+                web3,
+                shared_adapter,
+                shared_aggregators,
+                vault_address,
+                model,
+                config=config,
+                db=session_db,
+                redis=None,
+                deployer_address=operator_addr,
+                vault_contract=_vault_by_addr.get(vault_address.lower()),
+                operator_trade_account=operator_trade_account,
+                nonce_manager=operator_nonce_mgr,
+                launch_price_pusher=False,
+                external_walk=shared_walk,
+                external_snapshot_queue=snapshot_queues[provider],
+            )
+        finally:
+            try:
+                await session_db.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _reconcile_fn(*, vault_address: str, **kwargs: Any) -> None:  # noqa: ANN401
+        logger.info("run_gate: reconcile placeholder for vault=%s", vault_address[:10])
+
+    shared_deps: dict[str, Any] = {
+        "driver_run_session": _live_driver_run_session,
+        "reconcile_fn": _reconcile_fn,
+        "alert_fn": send_alert,
+    }
+
+    async def _teardown() -> None:
+        """Stop the shared price-pusher task + dispose the shared DB engine."""
+        pusher_stop.set()
+        pusher_task.cancel()
+        await asyncio.gather(pusher_task, return_exceptions=True)
+        await gate_engine.dispose()
+
+    logger.info(
+        "build_live_shared_deps: live 3-model launcher ready — operator=%s, shared "
+        "NonceManager + 1 walk→3 queues + 1 price-pusher + shared DB engine",
+        operator_addr[:10],
+    )
+    return shared_deps, _teardown
+
+
+# ---------------------------------------------------------------------------
 # main run_gate coroutine
 # ---------------------------------------------------------------------------
 
@@ -578,6 +790,10 @@ async def run_gate(
 
     t_start = time.monotonic()
     accumulator = _GateResultAccumulator()
+    # Seam A (D-11): teardown coroutine for the shared price-pusher task + DB engine.
+    # Set by build_live_shared_deps on the live path; stays None in dry-run (which returns
+    # before any teardown). Awaited in the Step-12 finally + on a Step-11c failure.
+    _teardown_shared_infra: Any = None
 
     # ── Step 1: Load manifest ──────────────────────────────────────────────
     if dry_run and _injected_manifest is not None:
@@ -718,19 +934,33 @@ async def run_gate(
     elif dry_run:
         shared_deps = _make_dry_run_shared_deps(vaults_with_addrs, _make_fake_mock_perps())
     else:
-        # Live: use real driver_run_session + reconcile
-        from orchestrator.loop.driver import run_session as driver_run_session  # noqa: PLC0415
-        from orchestrator.alerts.sink import send_alert  # noqa: PLC0415
-
-        async def _reconcile_fn(*, vault_address: str, **kwargs: Any) -> None:  # noqa: ANN401
-            logger.info("run_gate: reconcile placeholder for vault=%s", vault_address[:10])
-
-        shared_deps = {
-            "driver_run_session": driver_run_session,
-            "reconcile_fn": _reconcile_fn,
-            "alert_fn": send_alert,
-            "web3": web3,
-        }
+        # Live (Seam A, D-11): build the shared 3-model infra ONCE + the per-model session
+        # wrapper. This REPLACES the old stub that wired the raw driver.run_session (+ a stray
+        # "web3" key) into shared_deps — which made supervisor.py call it as
+        # driver_run_session(vault_address=…, provider=…, web3=…) → TypeError ×3 → AUTO_PAUSED.
+        _session_duration = int(os.environ.get("SESSION_DURATION", "1800"))
+        _gate_cadence = float(os.environ.get("SESSION_CADENCE", "60.0"))
+        _gate_seed = int(os.environ.get("PRICE_SEED", "42"))
+        _gate_drift = float(os.environ.get("DRIFT", "0.0001"))
+        _gate_volatility = float(os.environ.get("VOLATILITY", "0.005"))
+        _db_url = os.environ.get("ORCHESTRATOR_DATABASE_URL", "")
+        if not _db_url:
+            raise ValueError(
+                "ORCHESTRATOR_DATABASE_URL not set — required for the live gate "
+                "(each model loop opens an AsyncSession off the shared engine)"
+            )
+        shared_deps, _teardown_shared_infra = build_live_shared_deps(
+            web3,
+            manifest,
+            vaults_with_addrs,
+            trade_key=trade_key,
+            gate_duration=_session_duration,
+            gate_cadence=_gate_cadence,
+            gate_seed=_gate_seed,
+            db_url=_db_url,
+            gate_drift=_gate_drift,
+            gate_volatility=_gate_volatility,
+        )
 
     # ── Step 7: Build model configs ────────────────────────────────────────
     model_configs = [
@@ -879,7 +1109,14 @@ async def run_gate(
         holder_addresses=_holder_addrs,
     )
     logger.info("run_gate: ensuring %d standing ERC20 allowances before launch", len(_approvals))
-    await ensure_gate_allowances(web3, _approvals)
+    try:
+        await ensure_gate_allowances(web3, _approvals)
+    except Exception:
+        # Seam A teardown: an allowance failure here must not leak the shared price-pusher
+        # task / DB engine built above (Step 6). Tear them down, then propagate.
+        if _teardown_shared_infra is not None:
+            await _teardown_shared_infra()
+        raise
 
     # ── Step 12: Live run — launch all tasks + harness ─────────────────────
     # Launch supervisor, arb-bot, and speculator sim as concurrent tasks.
@@ -948,6 +1185,10 @@ async def run_gate(
                 await t
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
+        # Seam A (D-11): tear down the shared price-pusher task + DB engine built in Step 6.
+        # None in dry-run (returned earlier); always set on the live path.
+        if _teardown_shared_infra is not None:
+            await _teardown_shared_infra()
 
     run_results = accumulator.finalize(vault_addresses)
     run_results["nav_sim_result_path"] = nav_sim_result
