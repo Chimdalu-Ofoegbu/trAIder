@@ -205,11 +205,8 @@ async def run_speculator_sim(
                     mtoken_is_token0 = token0.lower() == vault_addr.lower()
                     usdc_addr = token1 if mtoken_is_token0 else token0
                     mtoken_addr = vault_addr
-                    # ERC20 approve USDC before swap (Fix 3)
-                    usdc_contract = _get_erc20(swap_router, usdc_addr)
-                    await usdc_contract.functions.approve(
-                        getattr(swap_router, "address", str(swap_router)), amount
-                    ).transact({"from": demo_wallet_address})
+                    # Allowance is set ONCE up-front + awaited by ensure_gate_allowances
+                    # (04-GATE.md Seam B); the racy per-swap approve was what caused STF.
                     # Pass ordered tuple — NOT dict (Fix 1: dict → tuple)
                     # Order: (tokenIn, tokenOut, recipient, deadline, amountIn, amountOutMinimum, sqrtPriceLimitX96)
                     await swap_router.functions.exactInputSingle(
@@ -236,11 +233,8 @@ async def run_speculator_sim(
                     mtoken_is_token0 = token0.lower() == vault_addr.lower()
                     usdc_addr = token1 if mtoken_is_token0 else token0
                     mtoken_addr = vault_addr
-                    # ERC20 approve mTOKEN before swap (Fix 3)
-                    mtoken_contract = _get_erc20(swap_router, mtoken_addr)
-                    await mtoken_contract.functions.approve(
-                        getattr(swap_router, "address", str(swap_router)), amount
-                    ).transact({"from": demo_wallet_address})
+                    # Allowance is set ONCE up-front + awaited by ensure_gate_allowances
+                    # (04-GATE.md Seam B); the racy per-swap approve was what caused STF.
                     # Pass ordered tuple — NOT dict (Fix 1: dict → tuple)
                     await swap_router.functions.exactInputSingle(
                         (
@@ -361,11 +355,8 @@ async def genuine_holder_buy(
         mtoken_is_token0,
     )
 
-    # Fix 3: ERC20 approve USDC to router BEFORE exactInputSingle
-    usdc_contract = _get_erc20(swap_router, usdc_addr)
-    await usdc_contract.functions.approve(
-        getattr(swap_router, "address", str(swap_router)), usdc_amount
-    ).transact({"from": holder_wallet})
+    # Allowance is set ONCE up-front + awaited by ensure_gate_allowances (04-GATE.md Seam B);
+    # the racy per-swap approve was what caused STF. Holder→router allowance is pre-set by the gate.
 
     # Fix 1: pass ordered tuple — NOT dict
     # Order: (tokenIn, tokenOut, recipient, deadline, amountIn, amountOutMinimum, sqrtPriceLimitX96)

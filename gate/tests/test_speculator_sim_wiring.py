@@ -259,56 +259,33 @@ async def test_token_resolution_sell_mtoken_is_token0() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Fix 3 — ERC20 APPROVALS: approve precedes exactInputSingle
+# Fix 3 (SUPERSEDED) — allowances are now STANDING, set once by
+# gate.allowances.ensure_gate_allowances before the gate launches. The racy per-swap approve
+# was 04-GATE.md Seam B (allowance never landed before the swap → STF). The speculator and
+# genuine_holder_buy NO LONGER self-approve. The allowance regression test lives in
+# gate/tests/test_allowances.py; this guard ensures the per-swap approve does not creep back.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_erc20_approve_precedes_exactInputSingle_buy() -> None:
-    """genuine_holder_buy: approve(router, amount) on USDC is called BEFORE exactInputSingle.
+async def test_genuine_holder_buy_does_not_self_approve() -> None:
+    """REGRESSION (04-GATE.md Seam B): genuine_holder_buy must NOT do a per-swap approve.
 
-    The ordering is asserted via inspecting that approve call_args_list precedes
-    the exactInputSingle call (both on the mock — we check the erc20_mock.functions.approve
-    call happened before exactInputSingle on swap_router via sequence tracking).
+    Allowances are pre-set (standing MAX) by ensure_gate_allowances before launch. A per-swap
+    approve raced the swap and left allowance 0 → STF. If `_get_erc20` is ever called again from
+    this path (i.e., a per-swap approve creeps back in), this test fails.
     """
     from gate.speculator_sim import genuine_holder_buy
 
     pool = _make_pool(token0=MTOKEN_ADDR, token1=USDC_ADDR)
     vault = _make_vault(MTOKEN_ADDR)
     swap_router = _make_swap_router()
-    erc20_mock = _make_erc20_mock()
 
-    call_order: list[str] = []
+    def _boom(*_a, **_k):  # noqa: ANN002, ANN003
+        raise AssertionError("genuine_holder_buy must not self-approve — allowance is standing")
 
-    original_approve = erc20_mock.functions.approve.return_value.transact
-    original_swap = swap_router.functions.exactInputSingle.return_value.transact
+    with patch("gate.speculator_sim._get_erc20", side_effect=_boom):
+        await genuine_holder_buy(swap_router, pool, vault, HOLDER, usdc_amount=5 * 10**6)
 
-    async def approve_track(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
-        call_order.append("approve")
-        return await original_approve(*args, **kwargs)
-
-    async def swap_track(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
-        call_order.append("exactInputSingle")
-        return await original_swap(*args, **kwargs)
-
-    erc20_mock.functions.approve.return_value.transact = approve_track
-    swap_router.functions.exactInputSingle.return_value.transact = swap_track
-
-    with patch("gate.speculator_sim._get_erc20", return_value=erc20_mock):
-        await genuine_holder_buy(
-            swap_router, pool, vault, HOLDER, usdc_amount=5 * 10**6
-        )
-
-    assert call_order == ["approve", "exactInputSingle"], (
-        f"approve must be called BEFORE exactInputSingle; actual order: {call_order}"
-    )
-
-    # Also verify approve was called with (router_address, amount)
-    approve_call = erc20_mock.functions.approve.call_args_list[0]
-    approve_args = approve_call[0]  # positional args to approve(spender, amount)
-    assert approve_args[0] == ROUTER_ADDR, (
-        f"approve spender should be router ({ROUTER_ADDR}), got {approve_args[0]}"
-    )
-    assert approve_args[1] == 5 * 10**6, (
-        f"approve amount should be usdc_amount (5e6), got {approve_args[1]}"
-    )
+    # The swap still fires, relying on the standing allowance set up-front.
+    assert len(swap_router.functions.exactInputSingle.call_args_list) == 1

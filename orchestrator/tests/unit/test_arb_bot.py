@@ -197,6 +197,62 @@ async def test_arb_bot_fires_on_gap_above_hysteresis() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Test 1b: Case-B (USDC=token0) on-peg pool must NOT fire (04-GATE.md Seam C regression)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_arb_bot_caseB_onpeg_pool_does_not_fire() -> None:
+    """REGRESSION (04-GATE.md Seam C): a Case-B pool (USDC=token0) that is ON-PEG must NOT fire.
+
+    The live gate fired arbCloseGap every tick on the Case-B Claude pool because arb_poll_loop
+    hardcoded token0_decimals=18/token1_decimals=6 regardless of ordering. For Case B that makes
+    decimal_adj = 10**(6-18) = 1e-12 → the decoded price floors to 0 → gap=10000bps → fire →
+    on-chain revert 'AP: gap below threshold' (the pool is actually on-peg). Decimals MUST follow
+    ordering (mirror preflight). This test FAILS on the old hardcoded code and passes after the fix.
+    Every other arb_bot test uses Case A (token0=vault), which is exactly why the bug slipped CI.
+    """
+    nav_e18 = 10**18
+    usdc_addr = "0x" + "11" * 20  # token0 = USDC (Case B: USDC < mTOKEN address)
+    vault_addr = "0x" + "22" * 20  # mTOKEN / vault address (token1)
+
+    # Case-B on-peg sqrtPriceX96: price_usdc_per_mtoken_e18 == 1e18  ⇒  sqrtP = 2^96 * 1e6.
+    sqrt_caseB_onpeg = (2**96) * (10**6)
+
+    # Sanity: ordering-aware decimals decode this as on-peg (~1e18); the old hardcoded 18/6 floored to 0.
+    price_e18 = decode_pool_price_e18(
+        sqrt_caseB_onpeg, token0_decimals=6, token1_decimals=18, mtoken_is_token0=False
+    )
+    assert abs(price_e18 - nav_e18) * 10_000 // nav_e18 <= 50, (
+        f"Case-B on-peg decode off: {price_e18}"
+    )
+
+    vault = _make_vault(nav_e18)
+    vault.address = vault_addr
+    pool = _make_pool(sqrt_caseB_onpeg, vault_address=usdc_addr)  # token0() = USDC ⇒ Case B
+    nonce_mgr = _make_nonce_mgr()
+    arb = _make_arb_primitive()
+    web3 = _make_web3(sqrt_price_x96=sqrt_caseB_onpeg)
+    stop = asyncio.Event()
+
+    async def sleep_and_stop(_: float) -> None:
+        stop.set()
+
+    with patch("orchestrator.loop.arb_bot.asyncio.sleep", side_effect=sleep_and_stop):
+        await arb_poll_loop(
+            web3,
+            arb,
+            [(vault, pool)],
+            nonce_mgr,
+            key4_address="0xKEY4000000000000000000000000000000000004",
+            stop_event=stop,
+        )
+
+    # On-peg Case-B pool ⇒ gap ≈ 0 ⇒ must NOT fire (old code fired on a bogus 10000bps gap).
+    nonce_mgr.assign_and_sign.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Test 2: Per-pool fault isolation
 # ---------------------------------------------------------------------------
 

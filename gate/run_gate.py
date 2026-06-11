@@ -865,6 +865,22 @@ async def run_gate(
         _print_gate_result(run_results, venue=venue, elapsed=elapsed, dry_run=True)
         return run_results
 
+    # ── Step 11c: ensure standing ERC20 allowances (04-GATE.md Seam B) ──────
+    # Swap actors (speculator demo_wallet, holders) + ARB_KEY4 must hold a standing allowance to
+    # the router / arbitragePrimitive BEFORE any swap fires, else the router's transferFrom reverts
+    # 'STF'. Set once, awaiting receipts (idempotent). Replaces the racy per-swap approve.
+    from gate.allowances import build_gate_approvals, ensure_gate_allowances  # noqa: PLC0415
+
+    _holder_addrs = [h[0] for h in build_holder_list(vault_addresses, dry_run=False)]
+    _approvals = build_gate_approvals(
+        manifest,
+        demo_wallet=demo_wallet,
+        vault_addresses=vault_addresses,
+        holder_addresses=_holder_addrs,
+    )
+    logger.info("run_gate: ensuring %d standing ERC20 allowances before launch", len(_approvals))
+    await ensure_gate_allowances(web3, _approvals)
+
     # ── Step 12: Live run — launch all tasks + harness ─────────────────────
     # Launch supervisor, arb-bot, and speculator sim as concurrent tasks.
     # The harness runs sequentially after the ambient tasks are warmed up.

@@ -316,10 +316,14 @@ async def arb_poll_loop(
                 vault_address_str: str = getattr(vault, "address", str(vault))
                 mtoken_is_token0: bool = await detect_mtoken_is_token0(pool, vault_address_str)
 
+                # Decimals MUST follow token ordering (mirror preflight.py): for a Case-B pool
+                # (USDC=token0, mTOKEN=token1) hardcoding 18/6 makes decimal_adj = 10**(6-18) =
+                # 1e-12 (a float → price floors to 0 → bogus 10000bps gap → arbCloseGap reverts
+                # 'AP: gap below threshold' on an on-peg pool). See 04-GATE.md Seam C.
                 amm_price_e18: int = decode_pool_price_e18(
                     sqrt_price_x96,
-                    token0_decimals=18,  # mTOKEN = 18 dec
-                    token1_decimals=6,  # USDC = 6 dec
+                    token0_decimals=18 if mtoken_is_token0 else 6,  # token0 = mTOKEN(18) or USDC(6)
+                    token1_decimals=6 if mtoken_is_token0 else 18,  # token1 = USDC(6) or mTOKEN(18)
                     mtoken_is_token0=mtoken_is_token0,
                 )
 
