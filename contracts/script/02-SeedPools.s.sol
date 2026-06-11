@@ -113,6 +113,14 @@ interface IERC20 {
     function balanceOf(address account) external view returns (uint256);
 }
 
+/// @dev Minimal MockChainlinkAggregator interface for the Seam E feed-refresh step.
+///      `answer()` is the public getter for the stored price; `setPrice()` writes the same
+///      price back while resetting `updatedAt = block.timestamp` (refreshing freshness).
+interface IMockFeed {
+    function answer() external view returns (int256);
+    function setPrice(int256 _answer) external;
+}
+
 contract SeedPools is Script {
     using stdJson for string;
 
@@ -235,7 +243,27 @@ contract SeedPools is Script {
         address[3] memory pools;
         uint256[3] memory lpNftIds;
 
+        // ── Read mock Chainlink feed addresses from manifest (for Seam E refresh) ─
+        // Read the SAME way as the vault addresses above (stdJson parseRaw + abi.decode).
+        address ethFeed = abi.decode(raw.parseRaw(".ethFeed"), (address));
+        address btcFeed = abi.decode(raw.parseRaw(".btcFeed"), (address));
+        address solFeed = abi.decode(raw.parseRaw(".solFeed"), (address));
+
         vm.startBroadcast();
+
+        // ── Seam E (04-GATE.md): refresh mock feeds before depositing ─────────
+        // The vault blocks mints on a stale oracle (CONTRACTS-08 staleness guard). A standalone
+        // seed must freshen the feeds since no price-pusher is running. setPrice(answer()) rewrites
+        // the EXISTING price (so NAV/positions are unperturbed) while resetting updatedAt = now,
+        // letting the subsequent deposit()'s staleness check pass.
+        address[3] memory feeds = [ethFeed, btcFeed, solFeed];
+        string[3] memory feedNames = ["ethFeed", "btcFeed", "solFeed"];
+        for (uint256 f = 0; f < 3; f++) {
+            int256 currentAnswer = IMockFeed(feeds[f]).answer();
+            IMockFeed(feeds[f]).setPrice(currentAnswer);
+            console2.log(string(abi.encodePacked("  Seam E: refreshed ", feedNames[f], " @")), feeds[f]);
+            console2.log("    price preserved (8-dec answer):", currentAnswer);
+        }
 
         for (uint256 i = 0; i < 3; i++) {
             console2.log("");
@@ -337,9 +365,15 @@ contract SeedPools is Script {
         //   tick  720: 1.0001^(720)  ≈ 1.0452 (≈ LP_RANGE_UPPER_USD 1.0451) ✓
         // Alignment: -720 and 720 are both divisible by tickSpacing=60 ✓
         int24 tickSpacing = IAlgebraPool(pool).tickSpacing();
-        int24 centerTick = 0; // at 1:1 NAV, center tick = 0
-        int24 tickLower = _alignTick(centerTick - 720, tickSpacing);
-        int24 tickUpper = _alignTick(centerTick + 720, tickSpacing);
+        // Seam D fix (04-GATE.md): center the LP range on the pool's ACTUAL price tick, not tick 0.
+        // The pool is initialized at the DECIMALS-ADJUSTED 1:1 price (sqrtPriceX96 above), which sits
+        // at tick ~±276324 (mTOKEN 18-dec vs USDC 6-dec => raw price ratio 1e12 => log_1.0001(1e12) ~
+        // 276324), NOT tick 0. The old centerTick=0 put the [-720,720] range ~276k ticks off the price
+        // => the mint landed entirely on the mTOKEN side (single-sided, 0 USDC). Reading the live tick
+        // is ordering-agnostic (Case A ~ -276324, Case B ~ +276324) and self-correcting.
+        int24 centerTick = _alignTick(_readGlobalStateTick(pool), tickSpacing);
+        int24 tickLower = centerTick - 720;
+        int24 tickUpper = centerTick + 720;
 
         console2.log("  tickSpacing:", uint256(uint24(tickSpacing)));
         console2.log("  tickLower:", int256(tickLower));
@@ -419,6 +453,21 @@ contract SeedPools is Script {
         assembly {
             sqrtPriceX96 := and(mload(add(data, 0x20)), 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF)
         }
+    }
+
+    /// @notice Read the current tick from Algebra Integral v1 pool.globalState() (slot 1).
+    /// @dev Same raw-staticcall pattern as _readGlobalStateSqrtPrice. tick is the 2nd return value
+    ///      (int24), sign-extended into slot 1 of the 8-slot return. Used to center the LP range on
+    ///      the pool's real price tick (Seam D fix) instead of the wrong tick 0.
+    function _readGlobalStateTick(address pool) internal view returns (int24 tick) {
+        bytes4 selector = bytes4(keccak256("globalState()"));
+        (bool ok, bytes memory data) = pool.staticcall(abi.encodePacked(selector));
+        require(ok && data.length >= 64, "SeedPools: globalState staticcall failed (tick)");
+        int256 raw;
+        assembly {
+            raw := mload(add(data, 0x40)) // slot 1 = tick (int24 sign-extended to 32 bytes)
+        }
+        tick = int24(raw);
     }
 
     /// @notice Convert Algebra sqrtPriceX96 to USD price per mTOKEN in 1e18 units.
