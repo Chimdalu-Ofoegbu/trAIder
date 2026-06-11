@@ -664,6 +664,19 @@ def build_live_shared_deps(
         "gpt": "gpt-5.5-2026-04-23",
         "gemini": "gemini-3.1-pro-preview",
     }
+    # MECHANISM-PROOF SCAFFOLDING (Seam A.2 pending) — GATE_FORCE_CLAUDE=1 maps ALL 3 vaults to
+    # claude-opus-4-7 so the billable smoke isolates the MECHANISM (3 concurrent vaults /
+    # shared-nonce safety / AMM arb / settlement) from provider dispatch. driver.run_live_cycle
+    # currently hard-wires call_claude regardless of model string, so the real gpt-5.5 /
+    # gemini-3.1 strings would 404 against the Anthropic API until A.2 (real provider dispatch)
+    # lands. This is SCAFFOLDING ONLY — NEVER the judged demo, which MUST run real
+    # GPT/Gemini/Claude dispatch. Default (env unset) keeps the true 3-model mapping above.
+    if os.environ.get("GATE_FORCE_CLAUDE", "").strip().lower() in ("1", "true", "yes"):
+        _provider_to_model = dict.fromkeys(_provider_to_model, "claude-opus-4-7")
+        logger.warning(
+            "GATE_FORCE_CLAUDE=1 — ALL 3 vaults forced to claude-opus-4-7 (MECHANISM-PROOF "
+            "SCAFFOLDING, NOT the 3-model demo; Seam A.2 real provider dispatch still pending)"
+        )
     _vault_by_addr = {addr.lower(): vc for vc, addr in vaults_with_addrs}
 
     async def _live_driver_run_session(*, vault_address: str, provider: str, **_: Any) -> dict:  # noqa: ANN401

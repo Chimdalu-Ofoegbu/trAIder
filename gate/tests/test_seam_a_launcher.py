@@ -118,12 +118,14 @@ async def test_three_models_share_one_nonce_manager_no_collision() -> None:
     closure = shared_deps["driver_run_session"]
 
     bind_ok: list = []
+    models_seen: list = []
 
     async def _spy_run_session(*args, **kwargs):  # noqa: ANN002, ANN003
         # (b) Prove the launcher's actual call binds to the REAL driver.run_session signature.
         #     A TypeError here = the Seam A bug is back (raises out of gather → test fails).
         _REAL_SIG.bind(*args, **kwargs)
         bind_ok.append(kwargs.get("vault_contract"))
+        models_seen.append(args[4])  # 5th positional = model string (provider→model mapping)
         nonce_mgr = kwargs["nonce_manager"]
         from_addr = kwargs["deployer_address"]
         # (a) Exercise the shared NonceManager the way the real driver + keeper do: several
@@ -151,6 +153,12 @@ async def test_three_models_share_one_nonce_manager_no_collision() -> None:
     assert len(bind_ok) == 3, "all 3 model closures must reach driver.run_session"
     # the per-vault lookup wired the right vault contract into each call (not None)
     assert all(vc is not None for vc in bind_ok), f"vault_contract lookup failed: {bind_ok}"
+    # default (no GATE_FORCE_CLAUDE) → the REAL per-provider model mapping is threaded through
+    assert set(models_seen) == {
+        "claude-opus-4-7",
+        "gpt-5.5-2026-04-23",
+        "gemini-3.1-pro-preview",
+    }, f"expected the real 3-model mapping; got {models_seen}"
 
     # (a) no duplicate nonce across all shared-EOA writes (3 models × 4 + shared pusher)
     assert None not in nonce_record, "a write went out with no explicit nonce"
@@ -161,6 +169,55 @@ async def test_three_models_share_one_nonce_manager_no_collision() -> None:
     )
     assert sorted(nonce_record) == list(range(len(nonce_record))), (
         f"nonces not contiguous from 0 (gap/replacement): {sorted(nonce_record)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_gate_force_claude_maps_all_three_to_claude() -> None:
+    """GATE_FORCE_CLAUDE=1 (mechanism-proof scaffolding) maps ALL 3 vaults to claude-opus-4-7.
+
+    Guards the Seam A.2 scaffolding semantics: the billable smoke can isolate the MECHANISM
+    from provider dispatch, while the env-gate keeps the REAL 3-model mapping the committed
+    default — so Claude-x3 can never silently become the judged demo.
+    """
+    nonce_record: list = []
+    web3 = _make_mock_web3(nonce_record)
+    vaults_with_addrs = [
+        (MagicMock(), _VAULT_ADDRS["claude"]),
+        (MagicMock(), _VAULT_ADDRS["gpt"]),
+        (MagicMock(), _VAULT_ADDRS["gemini"]),
+    ]
+    models_seen: list = []
+
+    async def _spy_run_session(*args, **kwargs):  # noqa: ANN002, ANN003
+        models_seen.append(args[4])  # model string
+        return {"cycles": 1, "seed": 42, "session_id": "force-claude"}
+
+    # GATE_FORCE_CLAUDE must be set BEFORE build (the mapping is resolved at build time).
+    with patch.dict("os.environ", {"GATE_FORCE_CLAUDE": "1"}):
+        shared_deps, teardown = build_live_shared_deps(
+            web3,
+            _MANIFEST,
+            vaults_with_addrs,
+            trade_key=_TEST_TRADE_KEY,
+            gate_duration=60,
+            gate_cadence=3600.0,
+            gate_seed=42,
+            db_url="postgresql+asyncpg://t:t@localhost/t",
+        )
+        closure = shared_deps["driver_run_session"]
+        try:
+            with patch("orchestrator.loop.driver.run_session", _spy_run_session):
+                await asyncio.gather(
+                    closure(vault_address=_VAULT_ADDRS["claude"], provider="claude"),
+                    closure(vault_address=_VAULT_ADDRS["gpt"], provider="gpt"),
+                    closure(vault_address=_VAULT_ADDRS["gemini"], provider="gemini"),
+                )
+        finally:
+            await teardown()
+
+    assert models_seen == ["claude-opus-4-7"] * 3, (
+        f"GATE_FORCE_CLAUDE=1 must force all 3 vaults to claude-opus-4-7; got {models_seen}"
     )
 
 
