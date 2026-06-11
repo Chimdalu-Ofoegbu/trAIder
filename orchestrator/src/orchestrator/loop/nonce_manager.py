@@ -177,3 +177,45 @@ class NonceManager:
         """
         self._pending_txs.pop(nonce, None)
         logger.debug("NonceManager: confirmed nonce=%d", nonce)
+
+
+async def submit_op_tx(
+    contract_call: Any,
+    from_address: str,
+    *,
+    nonce_manager: NonceManager | None = None,
+) -> Any:
+    """Submit one operator-EOA write, serialized through ``nonce_manager`` when provided.
+
+    This is the single choke-point for EVERY write that originates from the shared
+    operator-trade EOA in a multi-model gate run — vault ``openLong``/``openShort``/
+    ``closePosition`` (driver) and ``executeOrder``/``clearTradingLock`` (keeper). Routing
+    them all through ONE ``NonceManager`` is the D-11 collision fix: with three models on a
+    single EOA, web3's auto-nonce (``get_transaction_count('pending')`` per tx) hands the
+    same nonce to two concurrent ``.transact()`` calls and one tx silently replaces the other.
+
+    The NonceManager holds its lock only for assign-nonce → sign → broadcast; the caller still
+    awaits the receipt OUTSIDE the lock, so the 40-60s confirmations across all three models
+    run concurrently.
+
+    When ``nonce_manager is None`` (single-model / legacy / anvil test path) this is byte-for-byte
+    the prior behavior: a bare ``.transact({"from": ...})`` relying on the SignAndSendRaw
+    middleware's auto-nonce. That keeps the proven single-model loop unchanged.
+
+    Args:
+        contract_call: A BUILT web3 ``ContractFunction`` ready to ``.transact()`` — e.g.
+            ``vault.functions.openLong(*args)``. Build it at the call site; only ``.transact()``
+            runs here (under the nonce lock when serialized).
+        from_address: The operator-trade EOA. SignAndSendRaw middleware for this address MUST
+            already be loaded on ``web3`` so the explicit-nonce transact still auto-signs.
+        nonce_manager: Shared ``NonceManager`` bound to ``from_address``, or ``None`` for the
+            legacy auto-nonce path.
+
+    Returns:
+        The transaction hash (hex str / HexBytes, exactly as ``.transact()`` returns it).
+    """
+    if nonce_manager is not None:
+        return await nonce_manager.assign_and_sign(
+            lambda nonce: contract_call.transact({"from": from_address, "nonce": nonce})
+        )
+    return await contract_call.transact({"from": from_address})

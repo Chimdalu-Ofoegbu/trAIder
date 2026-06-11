@@ -32,6 +32,7 @@ from typing import Any
 
 from orchestrator.alerts.sink import AlertSeverity, send_alert
 from orchestrator.journal.publisher import publish_journal_entry
+from orchestrator.loop.nonce_manager import submit_op_tx
 from orchestrator.mock_harness import _make_envelope, _publish
 from orchestrator.state.db import (
     get_pending_orders_ready,
@@ -64,6 +65,8 @@ async def execute_ready_orders(
     # "Vault: order in flight".
     vault_contract: Any | None = None,
     orchestrator_address: str | None = None,
+    # D-11 multi-model: shared NonceManager for the operator EOA (executeOrder + clearTradingLock).
+    nonce_manager: Any | None = None,
     # Journal publisher params (PERPS-02 / D-08/D-09): optional to preserve
     # backward-compat with existing callers (anvil tests, Phase-2 harness).
     # When all three are provided, publish_journal_entry fires after OrderExecuted.
@@ -126,8 +129,10 @@ async def execute_ready_orders(
         decision_snap: dict = order.get("decision_snapshot") or {}
 
         try:
-            exec_tx = await mock_perps.functions.executeOrder(order_key_bytes).transact(
-                {"from": deployer_address}
+            exec_tx = await submit_op_tx(
+                mock_perps.functions.executeOrder(order_key_bytes),
+                deployer_address,
+                nonce_manager=nonce_manager,
             )
             # GAP-1a fix (same race as driver): use wait_for_transaction_receipt so
             # the executeOrder tx is confirmed before we parse its events.
@@ -169,9 +174,11 @@ async def execute_ready_orders(
                 # Failure is logged LOUDLY at ERROR + alert; a stuck lock bricks trading.
                 if vault_contract is not None and orchestrator_address is not None:
                     try:
-                        clear_tx = await vault_contract.functions.clearTradingLock(
-                            order_key_bytes
-                        ).transact({"from": orchestrator_address})
+                        clear_tx = await submit_op_tx(
+                            vault_contract.functions.clearTradingLock(order_key_bytes),
+                            orchestrator_address,
+                            nonce_manager=nonce_manager,
+                        )
                         clear_receipt = await web3.eth.wait_for_transaction_receipt(
                             clear_tx, timeout=30
                         )
@@ -342,6 +349,8 @@ async def run_keeper_monitor(
     # Optional for backward-compat with existing callers; in production MUST be provided.
     vault_contract: Any | None = None,
     orchestrator_address: str | None = None,
+    # D-11 multi-model: shared NonceManager for the operator EOA, forwarded to execute_ready_orders.
+    nonce_manager: Any | None = None,
     # Journal publisher params (PERPS-02): optional, forwarded to execute_ready_orders.
     journal_registry: Any | None = None,
     operator_journal_private_key: bytes | None = None,
@@ -409,6 +418,7 @@ async def run_keeper_monitor(
                 seq_counter=_seq,
                 vault_contract=vault_contract,
                 orchestrator_address=orchestrator_address,
+                nonce_manager=nonce_manager,
                 journal_registry=journal_registry,
                 operator_journal_private_key=operator_journal_private_key,
                 pinata_jwt=pinata_jwt,

@@ -78,6 +78,7 @@ from orchestrator.loop.market_state import (
     build_market_table_from_snapshot,
     read_mark_prices,
 )
+from orchestrator.loop.nonce_manager import submit_op_tx
 from orchestrator.loop.price_pusher import PriceWalk, run_price_pusher
 from orchestrator.loop.session import SessionConfig, format_session_duration, format_time_remaining
 from orchestrator.loop.settlement_keeper import run_settlement_keeper
@@ -238,6 +239,8 @@ async def run_live_cycle(
     market_snapshot: dict[str, dict[str, float]] | None = None,
     vault_contract: Any = None,
     operator_trade_address: str | None = None,
+    # D-11 multi-model: shared NonceManager for the operator-trade EOA. None → auto-nonce.
+    nonce_manager: Any = None,
 ) -> dict:
     """Execute one live trading cycle (ORCH-02 sequence).
 
@@ -775,9 +778,11 @@ async def run_live_cycle(
         try:
             # D-16: submit via vault_contract as operator-trade EOA (Sepolia-capable path)
             if _use_vault_submit:
-                tx = await vault_contract.functions.closePosition(
-                    pos_key_bytes, size_usd_1e30
-                ).transact({"from": operator_trade_address})
+                tx = await submit_op_tx(
+                    vault_contract.functions.closePosition(pos_key_bytes, size_usd_1e30),
+                    operator_trade_address,
+                    nonce_manager=nonce_manager,
+                )
             else:
                 # Legacy anvil from-impersonation (not for Sepolia)
                 tx = await mock_perps.functions.closePosition(
@@ -843,9 +848,11 @@ async def run_live_cycle(
                     if decision.side == "long"
                     else vault_contract.functions.openShort
                 )
-                tx = await open_fn(
-                    decision.market, size_usd_1e30, leverage_1e4, slippage_bps
-                ).transact({"from": operator_trade_address})
+                tx = await submit_op_tx(
+                    open_fn(decision.market, size_usd_1e30, leverage_1e4, slippage_bps),
+                    operator_trade_address,
+                    nonce_manager=nonce_manager,
+                )
             else:
                 # Legacy anvil from-impersonation (not for Sepolia)
                 open_fn = (
@@ -1226,6 +1233,17 @@ async def run_session(
     deployer_address: str,
     vault_contract: Any = None,
     operator_trade_account: Any = None,
+    # D-11 multi-model: shared NonceManager bound to the operator-trade EOA. When provided
+    # (gate 3-model launcher), ALL vault + keeper writes from this EOA serialize through it so
+    # concurrent models cannot collide on nonces. None → single-model auto-nonce (unchanged).
+    nonce_manager: Any = None,
+    # D-11 multi-model: when the gate launcher owns ONE shared price-pusher (one PriceWalk over the
+    # shared feeds, fanned out to all 3 models for identical market conditions), it passes
+    # launch_price_pusher=False + the shared walk + this model's snapshot queue. Single-model leaves
+    # the defaults → each session runs its own walk + price_pusher (unchanged).
+    launch_price_pusher: bool = True,
+    external_walk: Any = None,
+    external_snapshot_queue: Any = None,
     # GAP #4/#6: price_pusher_address separates price-push signing from trade-submission
     # signing (SEC-01 key separation). Defaults to deployer_address for backward compat.
     # When set, the price pusher uses this address to sign setPrice() calls instead of
@@ -1352,7 +1370,9 @@ async def run_session(
 
     # Step 5: Launch background tasks
     stop_event = asyncio.Event()
-    walk = PriceWalk(
+    # D-11 multi-model: reuse the launcher's shared walk when provided (all 3 models see the SAME
+    # market — fairness); else build a per-session walk (single-model, unchanged).
+    walk = external_walk or PriceWalk(
         config.price_seed,
         config.starting_prices,
         config.drift,
@@ -1363,7 +1383,9 @@ async def run_session(
     # price_pusher publishes {asset: {mark, funding, change_24h}} after each step.
     # maxsize=1 ensures the driver always reads the latest snapshot (stale snapshots
     # are discarded by price_pusher before publishing a new one).
-    snapshot_queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+    # D-11 multi-model: use the launcher-provided per-model snapshot queue (fed by the ONE shared
+    # price-pusher) when present; else a private queue fed by this session's own pusher (unchanged).
+    snapshot_queue: asyncio.Queue = external_snapshot_queue or asyncio.Queue(maxsize=1)
 
     # CR-04: The keeper_monitor runs as a SEPARATE asyncio.Task concurrently with the
     # cycle loop.  SQLAlchemy AsyncSession is NOT safe for concurrent access from
@@ -1382,18 +1404,24 @@ async def run_session(
         _price_pusher_from[:10],
         " (PRICE_PUSHER_KEY)" if price_pusher_address else " (OPERATOR_TRADE_KEY fallback)",
     )
-    price_pusher_task = asyncio.create_task(
-        run_price_pusher(
-            web3,
-            aggregators,
-            walk,
-            _price_pusher_from,
-            config.cadence_seconds,
-            stop_event,
-            snapshot_queue=snapshot_queue,
-        ),
-        name=f"price_pusher-{config.session_id[:8]}",
-    )
+    # D-11 multi-model: when the gate launcher owns the ONE shared price-pusher
+    # (launch_price_pusher=False), this session does NOT start its own — three pushers would fight
+    # over the shared feeds + collide on the price-pusher nonce. Single-model (default True) starts
+    # its own, unchanged.
+    price_pusher_task = None
+    if launch_price_pusher:
+        price_pusher_task = asyncio.create_task(
+            run_price_pusher(
+                web3,
+                aggregators,
+                walk,
+                _price_pusher_from,
+                config.cadence_seconds,
+                stop_event,
+                snapshot_queue=snapshot_queue,
+            ),
+            name=f"price_pusher-{config.session_id[:8]}",
+        )
     keeper_task = asyncio.create_task(
         run_keeper_monitor(
             web3,
@@ -1413,6 +1441,7 @@ async def run_session(
             # Phase-2 anvil tests that do not use a vault_contract.
             vault_contract=vault_contract,
             orchestrator_address=operator_trade_address,
+            nonce_manager=nonce_manager,
             # Journal publisher params (PERPS-02 / D-08/D-09/D-10).
             # All default None — backward-compat with Phase-2 anvil tests.
             # When all three required params are non-None, the keeper publishes
@@ -1526,6 +1555,7 @@ async def run_session(
                 market_snapshot=current_snapshot,
                 vault_contract=vault_contract,
                 operator_trade_address=operator_trade_address,
+                nonce_manager=nonce_manager,
             )
 
             # Keep last-5 decision summary
@@ -1551,8 +1581,11 @@ async def run_session(
             elapsed_total,
         )
 
-        # Cancel background tasks gracefully
+        # Cancel background tasks gracefully (price_pusher_task is None when the launcher owns the
+        # shared pusher — D-11 multi-model — so guard against None).
         for task in (price_pusher_task, keeper_task):
+            if task is None:
+                continue
             task.cancel()
             try:
                 await task

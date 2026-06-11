@@ -20,6 +20,8 @@ import math
 import random
 from typing import Any
 
+from orchestrator.loop.nonce_manager import submit_op_tx
+
 logger = logging.getLogger(__name__)
 
 # Pitfall 5: MockPerps requires answer > 0; floor prevents revert.
@@ -125,6 +127,8 @@ async def push_price(
     aggregator_contract: Any,
     new_price_8dec: int,
     from_address: str,
+    *,
+    nonce_manager: Any | None = None,
 ) -> None:
     """Push a new price to a MockChainlinkAggregator via setPrice (D-02).
 
@@ -147,8 +151,13 @@ async def push_price(
     from_address:
         Sender address (deployer EOA).
     """
-    tx_hash = await aggregator_contract.functions.setPrice(new_price_8dec).transact(
-        {"from": from_address}
+    # D-11 multi-model: when the gate runs one shared price-pusher on the operator EOA (no separate
+    # PRICE_PUSHER_KEY), setPrice must serialize through the SAME NonceManager as the trade/keeper
+    # writes or it collides with them. Single-model passes nonce_manager=None → plain transact.
+    tx_hash = await submit_op_tx(
+        aggregator_contract.functions.setPrice(new_price_8dec),
+        from_address,
+        nonce_manager=nonce_manager,
     )
     # GAP-1b fix: use wait_for_transaction_receipt (not get_transaction_receipt) so the price
     # is confirmed on-chain before the driver reads it via _markPrice. get_transaction_receipt
@@ -197,6 +206,11 @@ async def run_price_pusher(
     cadence_seconds: float,
     stop_event: asyncio.Event,
     snapshot_queue: asyncio.Queue | None = None,
+    # D-11 multi-model: the gate launcher runs ONE shared pusher and passes snapshot_queues (one
+    # per model) so all 3 driver loops read the SAME step from the SAME walk (fairness). It also
+    # passes nonce_manager so setPrice serializes with trade/keeper writes on the shared operator EOA.
+    snapshot_queues: list | None = None,
+    nonce_manager: Any | None = None,
 ) -> None:
     """Price-pusher coroutine — runs as a separate asyncio.Task alongside loop_driver.
 
@@ -241,19 +255,25 @@ async def run_price_pusher(
         prices = walk.step()
         for asset, contract in aggregators.items():
             price_8dec = to_8dec(prices[asset])
-            await push_price(web3, contract, price_8dec, from_address)
+            await push_price(web3, contract, price_8dec, from_address, nonce_manager=nonce_manager)
             logger.debug("run_price_pusher: %s → $%.4f (%d 8dec)", asset, prices[asset], price_8dec)
 
-        # CR-03: publish consistent snapshot so driver's market_table uses the same step
-        if snapshot_queue is not None:
+        # CR-03 + D-11 multi-model fan-out: publish the consistent snapshot to EVERY target queue.
+        # Single-model passes one `snapshot_queue`; the gate launcher passes `snapshot_queues` (one
+        # per model) so all 3 driver loops read the SAME step from this ONE shared walk.
+        _targets = ([snapshot_queue] if snapshot_queue is not None else []) + list(
+            snapshot_queues or []
+        )
+        if _targets:
             snapshot = build_consistent_snapshot(walk)
-            # Drain any stale snapshot so the driver always gets the latest step
-            if not snapshot_queue.empty():
-                try:
-                    snapshot_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-            await snapshot_queue.put(snapshot)
+            for _q in _targets:
+                # Drain any stale snapshot so each reader always gets the latest step
+                if not _q.empty():
+                    try:
+                        _q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        pass
+                _q.put_nowait(snapshot)
 
         # NEVER time.sleep — must keep the event loop responsive (asyncio rule)
         await asyncio.sleep(cadence_seconds)
