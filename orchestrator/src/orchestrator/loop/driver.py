@@ -105,6 +105,57 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# _select_provider_callables — Seam A.2 multi-model provider dispatch (D-13)
+# ---------------------------------------------------------------------------
+
+
+def _select_provider_callables(model: str) -> tuple[Any, Any, Any]:
+    """Return (call_fn, extract_tool_input, classify_exception) for the provider owning ``model``.
+
+    Seam A.2: the live loop is provider-blind — it routes each vault's ``model`` string to its
+    OWN frontier-model adapter so a 3-model gate runs Claude / GPT-5.5 / Gemini (not Claude-x3).
+    All three adapters expose the SAME 4-primitive contract (D-13 byte-equal); this picks the
+    right call/extract/classify trio. ``validate_decision`` is identical across providers, so the
+    module-level one is reused unconditionally (no need to dispatch it).
+
+    Routing by model-string prefix (case-insensitive):
+      "gpt*"    → openai_adapter.call_gpt        (GPT-5.5)
+      "gemini*" → gemini_adapter.call_gemini     (Gemini 3.1 Pro)
+      else      → THIS module's call_claude / extract_tool_input / classify_exception (DEFAULT).
+
+    The Claude/default branch returns the module-level names (resolved from driver's globals at
+    call time) so (a) the proven single-model loop is byte-identical and (b) the existing tests
+    that ``patch("orchestrator.loop.driver.call_claude" / ".extract_tool_input")`` keep working.
+    """
+    m = (model or "").strip().lower()
+    if m.startswith("gpt"):
+        from orchestrator.providers.openai_adapter import (  # noqa: PLC0415
+            call_gpt,
+        )
+        from orchestrator.providers.openai_adapter import (
+            classify_exception as _gpt_classify,
+        )
+        from orchestrator.providers.openai_adapter import (
+            extract_tool_input as _gpt_extract,
+        )
+
+        return call_gpt, _gpt_extract, _gpt_classify
+    if m.startswith("gemini"):
+        from orchestrator.providers.gemini_adapter import (  # noqa: PLC0415
+            call_gemini,
+        )
+        from orchestrator.providers.gemini_adapter import (
+            classify_exception as _gem_classify,
+        )
+        from orchestrator.providers.gemini_adapter import (
+            extract_tool_input as _gem_extract,
+        )
+
+        return call_gemini, _gem_extract, _gem_classify
+    return call_claude, extract_tool_input, classify_exception
+
+
+# ---------------------------------------------------------------------------
 # _emit_diagnostic — gated observe-only JSONL capture (TEST-03 trade-gap investigation)
 #
 # Activated ONLY when env var DIAGNOSTIC_CAPTURE is set to a non-empty file path.
@@ -322,11 +373,17 @@ async def run_live_cycle(
     # TEST-03 diagnostic capture — resolved once per cycle; None when env unset/empty.
     _diag_path: str | None = os.environ.get("DIAGNOSTIC_CAPTURE") or None
 
-    # ── Step 4: Call Claude (api_failure path on exception) ───────────────────
+    # ── Seam A.2: resolve THIS model's provider call (multi-model dispatch) ───────
+    # claude-* → module-level call_claude/extract/classify (single-model byte-identical +
+    # patchable by existing tests); gpt-*/gemini-* → their own adapters so each vault calls
+    # its OWN frontier model. validate_decision is provider-identical (reused below).
+    _provider_call, _provider_extract, _provider_classify = _select_provider_callables(model)
+
+    # ── Step 4: Call the model (api_failure path on exception) ────────────────────
     try:
-        response = await call_claude(prompt, model=model)
+        response = await _provider_call(prompt, model=model)
     except Exception as exc:
-        kind = classify_exception(exc)
+        kind = _provider_classify(exc)
         tracker.record_api_failure()
         paused = tracker.should_pause()
         status_str = "paused" if paused else "active"
@@ -373,7 +430,7 @@ async def run_live_cycle(
         return {"status": "api_failure", "reason": str(exc), "kind": kind}
 
     # ── Step 5: Extract + validate ────────────────────────────────────────────
-    raw = extract_tool_input(response)
+    raw = _provider_extract(response)
     if raw is None:
         tracker.record_malformed()
         paused = tracker.should_pause()
