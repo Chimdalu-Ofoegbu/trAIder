@@ -97,3 +97,13 @@ tmp/
 /gate.jsonl
 /confirm.jsonl
 /final.jsonl
+
+# ── Internal planning + agent instructions (kept LOCAL, out of public history) ─
+# Purged from git history 2026-06-12 and kept on disk only, so they never appear
+# when the repo is made public for submission.
+# WARNING: GSD commands (/gsd-*) explicitly `git add .planning/...` and WILL
+# re-add these into history despite this ignore — do not run them before going
+# public, or re-run the history purge afterward.
+.planning/
+CLAUDE.md
+.claude/
