@@ -12,7 +12,8 @@ import { formatUnits, type Address } from "viem";
 import { useModels } from "@/lib/onchain/useModels";
 import { MODELS } from "@/lib/onchain/models";
 import { VAULT_ABI, SEPOLIA_CHAIN_ID } from "@/lib/onchain/contracts";
-import { fmt, fmtUsd, shortAddr } from "@/lib/format";
+import { fmt, fmtUsd } from "@/lib/format";
+import { WalletButton } from "@/components/app/WalletButton";
 
 const ZERO: Address = "0x0000000000000000000000000000000000000000";
 
@@ -49,15 +50,7 @@ export default function PortfolioPage() {
           <span className="crumb">/ your holdings</span>
         </div>
         <div className="topbar-right">
-          {isConnected && address ? (
-            <span
-              className="wallet-chip"
-              style={{ border: "1px solid var(--line)" }}
-            >
-              <span className="dot dot-live" />
-              <span>{shortAddr(address)}</span>
-            </span>
-          ) : null}
+          <WalletButton />
         </div>
       </header>
 

@@ -37,6 +37,7 @@ export const ADDRESSES = {
   poolClaude: "0xE55458A526137BB1cBc413eBb4237A2C4Ba47C5c",
   poolGpt: "0x24e39c038AE3C3ff320c446B730e1c48e673ffdb",
   poolGem: "0xaD23422A7B64BA7fAa874b845c305F4b6B1DC272",
+  arbSwapRouter: "0x171B925C51565F5D2a7d8C494ba3188D304EFD93",
 } as const satisfies Record<string, Address>;
 
 // ── mTokenVault — minimal ERC-4626 + NAV read fragment (mTokenVault.sol) ──────
@@ -90,6 +91,76 @@ export const VAULT_ABI = [
     stateMutability: "view",
     inputs: [],
     outputs: [{ type: "uint8" }],
+  },
+] as const;
+
+// ── Minimal ERC-20 fragment — balances/allowances/approve + mock-USDC faucet ───
+// Works for BOTH mock USDC and the mTOKEN (the vault share IS an ERC-20).
+// mint() is the MockERC20 permissionless faucet (testnet substrate only).
+export const ERC20_ABI = [
+  {
+    type: "function",
+    name: "balanceOf",
+    stateMutability: "view",
+    inputs: [{ name: "account", type: "address" }],
+    outputs: [{ type: "uint256" }],
+  },
+  {
+    type: "function",
+    name: "allowance",
+    stateMutability: "view",
+    inputs: [
+      { name: "owner", type: "address" },
+      { name: "spender", type: "address" },
+    ],
+    outputs: [{ type: "uint256" }],
+  },
+  {
+    type: "function",
+    name: "approve",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "spender", type: "address" },
+      { name: "amount", type: "uint256" },
+    ],
+    outputs: [{ type: "bool" }],
+  },
+  {
+    type: "function",
+    name: "mint",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "to", type: "address" },
+      { name: "amount", type: "uint256" },
+    ],
+    outputs: [],
+  },
+] as const;
+
+// ── Camelot/Algebra SwapRouter — exactInputSingle (live mTOKEN↔USDC swaps) ─────
+// Tuple shape mirrors the orchestrator's proven-live inline ABI (gate/run_gate.py
+// _SWAP_ROUTER_ABI): Algebra has no fee field; deadline lives in the struct.
+export const SWAP_ROUTER_ABI = [
+  {
+    type: "function",
+    name: "exactInputSingle",
+    stateMutability: "payable",
+    inputs: [
+      {
+        name: "params",
+        type: "tuple",
+        components: [
+          { name: "tokenIn", type: "address" },
+          { name: "tokenOut", type: "address" },
+          { name: "recipient", type: "address" },
+          { name: "deadline", type: "uint256" },
+          { name: "amountIn", type: "uint256" },
+          { name: "amountOutMinimum", type: "uint256" },
+          { name: "sqrtPriceLimitX96", type: "uint160" },
+        ],
+      },
+    ],
+    outputs: [{ name: "amountOut", type: "uint256" }],
   },
 ] as const;
 

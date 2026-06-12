@@ -5,8 +5,8 @@
 //
 // Ported from model.html. Centerpiece is the live "mTOKEN price vs vault NAV"
 // convergence chart + the price/NAV/spread/AUM readouts — all live on-chain from
-// Arbitrum Sepolia. Trade panel is a live-priced PREVIEW (execution mocked, as in
-// the design). The journal panel is wired in the audit-logs view.
+// Arbitrum Sepolia. Trade panel executes REAL swaps (TradePanel → Camelot
+// SwapRouter). The journal panel is wired in the audit-logs view.
 //
 // Honesty: range buttons (1D/1W/1M) dropped — there is no historical NAV backfill
 // on-chain, so the chart shows the live session series only.
@@ -14,31 +14,26 @@
 
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import { Suspense, useMemo, useState } from "react";
-import { useAccount } from "wagmi";
+import { Suspense, useMemo } from "react";
 
 import { useModels } from "@/lib/onchain/useModels";
-import { fmtUsd, fmtCompact, fmtInt, sign, shortAddr } from "@/lib/format";
+import { fmtUsd, fmtCompact, fmtInt, sign } from "@/lib/format";
 import { explorerAddress } from "@/lib/onchain/contracts";
 import { ConvergenceChart } from "@/components/charts/ConvergenceChart";
 import { Ticker } from "@/components/app/Ticker";
+import { TradePanel } from "@/components/app/TradePanel";
+import { WalletButton } from "@/components/app/WalletButton";
 
 function ModelDetail() {
   const sp = useSearchParams();
   const id = sp.get("m") ?? "aurelius";
   const { models } = useModels();
-  const { address, isConnected } = useAccount();
 
   const m = useMemo(
     () => models.find((x) => x.id === id) ?? models[0],
     [models, id],
   );
 
-  const [side, setSide] = useState<"buy" | "sell">("buy");
-  const [amount, setAmount] = useState("1,000");
-
-  const amt = parseFloat((amount || "0").replace(/[^0-9.]/g, "")) || 0;
-  const recv = m.price && m.price > 0 ? amt / m.price : null;
   const spread = m.spreadBps;
   const spreadCls =
     spread == null
@@ -65,18 +60,10 @@ function ModelDetail() {
           </span>
         </div>
         <div className="topbar-right">
+          <WalletButton />
           <span className="tag tag-live">
             <span className="dot dot-live" /> NAV live
           </span>
-          {isConnected && address ? (
-            <span
-              className="wallet-chip"
-              style={{ border: "1px solid var(--line)" }}
-            >
-              <span className="dot dot-live" />
-              <span>{shortAddr(address)}</span>
-            </span>
-          ) : null}
         </div>
       </header>
 
@@ -173,96 +160,7 @@ function ModelDetail() {
           </div>
 
           <aside className="stack" style={{ position: "sticky", top: 140 }}>
-            <section className="panel" style={{ padding: 20 }}>
-              <div className="trade-tabs">
-                <button
-                  className="trade-tab"
-                  data-side="buy"
-                  data-on={side === "buy" ? "1" : undefined}
-                  onClick={() => setSide("buy")}
-                >
-                  Buy
-                </button>
-                <button
-                  className="trade-tab"
-                  data-side="sell"
-                  data-on={side === "sell" ? "1" : undefined}
-                  onClick={() => setSide("sell")}
-                >
-                  Sell
-                </button>
-              </div>
-              <div className="field">
-                <label>Amount</label>
-                <div className="field-input">
-                  <input
-                    type="text"
-                    inputMode="decimal"
-                    value={amount}
-                    onChange={(e) => setAmount(e.target.value)}
-                  />
-                  <span className="unit">USDC</span>
-                </div>
-                <div className="quick">
-                  {["250", "1000", "5000", "max"].map((q) => (
-                    <button
-                      key={q}
-                      onClick={() =>
-                        setAmount(
-                          q === "max"
-                            ? "12,500"
-                            : Number(q).toLocaleString("en-US"),
-                        )
-                      }
-                    >
-                      {q === "max"
-                        ? "Max"
-                        : q === "250"
-                          ? "$250"
-                          : `$${Number(q) / 1000}K`}
-                    </button>
-                  ))}
-                </div>
-              </div>
-              <div className="trade-summary">
-                <div className="row">
-                  <span>You receive</span>
-                  <span className="mono">
-                    {recv != null
-                      ? `${recv.toFixed(2)} ${m.short}`
-                      : `— ${m.short}`}
-                  </span>
-                </div>
-                <div className="row">
-                  <span>Price</span>
-                  <span className="mono">
-                    {m.price != null ? fmtUsd(m.price, 3) : "—"}
-                  </span>
-                </div>
-                <div className="row">
-                  <span>vs NAV</span>
-                  <span className={`mono ${spreadCls}`}>{spreadStr}</span>
-                </div>
-                <div className="row">
-                  <span>Network fee</span>
-                  <span className="mono">~$0.04</span>
-                </div>
-              </div>
-              <button
-                className={`btn btn-lg ${side === "buy" ? "btn-buy" : "btn-sell"}`}
-                style={{ width: "100%", justifyContent: "center" }}
-                disabled
-              >
-                {side === "buy" ? "Buy" : "Sell"} {m.short}
-              </button>
-              <p
-                className="faint u-mt3"
-                style={{ fontSize: "var(--t-xs)", textAlign: "center" }}
-              >
-                Preview · live price from Camelot · execution mocked for the
-                demo
-              </p>
-            </section>
+            <TradePanel m={m} />
 
             <section className="panel" style={{ padding: 20 }}>
               <div className="kicker" style={{ marginBottom: 12 }}>

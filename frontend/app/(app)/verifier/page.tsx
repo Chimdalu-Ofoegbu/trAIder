@@ -9,11 +9,9 @@
 // Falls back to clearly-labeled SAMPLE rows only when no on-chain entries exist.
 // =============================================================================
 
-import { useAccount } from "wagmi";
-
 import { useJournal } from "@/lib/onchain/useJournal";
 import { explorerTx, explorerAddress } from "@/lib/onchain/contracts";
-import { shortAddr } from "@/lib/format";
+import { WalletButton } from "@/components/app/WalletButton";
 import type { JournalAttestation } from "@/lib/onchain/journal";
 
 const IPFS_GATEWAY = "https://gateway.pinata.cloud/ipfs";
@@ -100,7 +98,6 @@ function AttestationRow({ a }: { a: JournalAttestation }) {
 
 export default function VerifierPage() {
   const { entries, isFixture, loading, error, refresh } = useJournal();
-  const { address, isConnected } = useAccount();
 
   return (
     <>
@@ -110,19 +107,11 @@ export default function VerifierPage() {
           <span className="crumb">/ on-chain attestations</span>
         </div>
         <div className="topbar-right">
+          <WalletButton />
           <span className="tag tag-live">
             <span className="dot dot-live" />{" "}
             {isFixture ? "sample data" : "on-chain"}
           </span>
-          {isConnected && address ? (
-            <span
-              className="wallet-chip"
-              style={{ border: "1px solid var(--line)" }}
-            >
-              <span className="dot dot-live" />
-              <span>{shortAddr(address)}</span>
-            </span>
-          ) : null}
         </div>
       </header>
 

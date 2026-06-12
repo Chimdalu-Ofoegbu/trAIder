@@ -13,6 +13,7 @@ import { useMemo } from "react";
 import { useModels } from "@/lib/onchain/useModels";
 import { fmtUsd, fmtInt } from "@/lib/format";
 import { explorerAddress, ADDRESSES } from "@/lib/onchain/contracts";
+import { WalletButton } from "@/components/app/WalletButton";
 
 const dirLabel: Record<string, string> = {
   mint: "Mint → sell",
@@ -46,6 +47,7 @@ export default function ArbitragePage() {
           <span className="crumb">/ NAV ↔ AMM peg</span>
         </div>
         <div className="topbar-right">
+          <WalletButton />
           <span className="tag tag-live">
             <span className="dot dot-live" />{" "}
             {loading ? "syncing…" : `block ${blockNumber ?? "—"}`}
