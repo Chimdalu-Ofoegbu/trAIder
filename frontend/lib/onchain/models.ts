@@ -31,6 +31,8 @@ export interface ModelMeta {
   line: string;
   /** Trading style label. */
   style: string;
+  /** Per-model price liveliness for the convergence chart (per-step venue noise). */
+  vol: number;
   vault: Address;
   pool: Address;
 }
@@ -47,6 +49,7 @@ export const MODELS: ModelMeta[] = [
     sym: "mCLA-S1",
     line: "oklch(0.82 0.13 82)",
     style: "Macro-momentum",
+    vol: 0.011,
     vault: ADDRESSES.vaultClaude,
     pool: ADDRESSES.poolClaude,
   },
@@ -61,6 +64,7 @@ export const MODELS: ModelMeta[] = [
     sym: "mGPT-S1",
     line: "oklch(0.76 0.11 205)",
     style: "Mean-reversion",
+    vol: 0.019,
     vault: ADDRESSES.vaultGpt,
     pool: ADDRESSES.poolGpt,
   },
@@ -75,6 +79,7 @@ export const MODELS: ModelMeta[] = [
     sym: "mGEM-S1",
     line: "oklch(0.72 0.14 330)",
     style: "Cross-venue arb",
+    vol: 0.015,
     vault: ADDRESSES.vaultGem,
     pool: ADDRESSES.poolGem,
   },

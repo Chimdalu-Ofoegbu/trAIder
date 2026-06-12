@@ -98,11 +98,7 @@ export function Sidebar() {
   return (
     <aside className="side" data-side>
       <div className="side-top">
-        <Link
-          className="wordmark"
-          href="/coliseum"
-          style={{ fontSize: "1.15rem" }}
-        >
+        <Link className="wordmark" href="/" style={{ fontSize: "1.15rem" }}>
           tr<span className="ai">AI</span>der
         </Link>
         <button

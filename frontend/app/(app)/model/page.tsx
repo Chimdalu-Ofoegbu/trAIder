@@ -109,7 +109,11 @@ function ModelDetail() {
                 </span>
               </div>
               <div className="md-chart-wrap">
-                <ConvergenceChart series={m.series} color={m.line} />
+                <ConvergenceChart
+                  series={m.series}
+                  color={m.line}
+                  vol={m.vol}
+                />
               </div>
               <div className="md-chart-legend">
                 <span className="legrow">

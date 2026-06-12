@@ -3,32 +3,26 @@
 // =============================================================================
 // frontend/app/(app)/coliseum/page.tsx — The Coliseum (thesis view 1)
 //
-// Three frontier LLMs head-to-head, ranked live by on-chain vault NAV. Ported
-// from the Claude Design build's coliseum.html; every number is a live read from
+// Three frontier LLMs head-to-head, ranked live by on-chain vault NAV. Standings
+// render as model token cards (ModelTokenCard); every number is a live read from
 // Arbitrum Sepolia (useModels) — independently verifiable on Arbiscan.
 //
 // Honesty notes (verifiability > literal label match):
 //   - "Arbitrum Sepolia" not "Arbitrum One" (real network).
-//   - "Δ session" (since page load) not "24h" — there is no historical NAV
-//     backfill on-chain, so we accumulate live ticks. Sharpe/spark are likewise
-//     session-derived. Columns show "—" until enough live samples exist.
 //   - statbar uses real on-chain aggregates (no mTOKEN 24h volume feed exists).
+//   - Card scores/charts are session-derived (no historical NAV backfill on-chain).
 // =============================================================================
 
-import Link from "next/link";
-import { useRouter } from "next/navigation";
 import { useMemo } from "react";
-import { useAccount } from "wagmi";
 
 import { useModels } from "@/lib/onchain/useModels";
-import { fmtUsd, fmtCompact, fmtInt, sign, shortAddr } from "@/lib/format";
-import { Sparkline } from "@/components/charts/Sparkline";
+import { fmtCompact, fmtInt } from "@/lib/format";
 import { Ticker } from "@/components/app/Ticker";
+import { WalletButton } from "@/components/app/WalletButton";
+import { ModelTokenCard } from "@/components/app/ModelTokenCard";
 
 export default function ColiseumPage() {
-  const router = useRouter();
   const { models, blockNumber, loading, error } = useModels();
-  const { address, isConnected } = useAccount();
 
   const ranked = useMemo(
     () => [...models].sort((a, b) => b.score - a.score),
@@ -59,18 +53,10 @@ export default function ColiseumPage() {
           <span className="crumb">/ live standings</span>
         </div>
         <div className="topbar-right">
+          <WalletButton />
           <span className="tag tag-live">
             <span className="dot dot-live" /> Arbitrum Sepolia
           </span>
-          {isConnected && address ? (
-            <span
-              className="wallet-chip"
-              style={{ border: "1px solid var(--line)" }}
-            >
-              <span className="dot dot-live" />
-              <span>{shortAddr(address)}</span>
-            </span>
-          ) : null}
         </div>
       </header>
 
@@ -106,112 +92,25 @@ export default function ColiseumPage() {
           </div>
         </div>
 
-        <section className="panel">
-          <div className="panel-hd">
-            <h2>Standings</h2>
-            <span className="crumb">
-              {error
-                ? error
-                : loading
-                  ? "connecting to Arbitrum Sepolia…"
-                  : `live · block ${blockNumber ?? "—"} · ranked by Coliseum Score`}
-            </span>
-          </div>
-          <table className="dtable">
-            <thead>
-              <tr>
-                <th style={{ width: 48 }}>#</th>
-                <th>Model</th>
-                <th>NAV / token</th>
-                <th>mTOKEN</th>
-                <th>Spread</th>
-                <th>Δ session</th>
-                <th>Sharpe</th>
-                <th>Live</th>
-                <th>Score</th>
-                <th />
-              </tr>
-            </thead>
-            <tbody>
-              {ranked.map((m, i) => {
-                const spread = m.spreadBps;
-                const spreadCls =
-                  spread == null
-                    ? ""
-                    : Math.abs(spread) < 6
-                      ? ""
-                      : spread > 0
-                        ? "pos"
-                        : "neg";
-                return (
-                  <tr
-                    key={m.id}
-                    style={{ cursor: "pointer" }}
-                    onClick={() => router.push(`/model?m=${m.id}`)}
-                  >
-                    <td className={`rankcell ${i === 0 ? "lead" : ""}`}>
-                      {String(i + 1).padStart(2, "0")}
-                    </td>
-                    <td>
-                      <div className="lb-model">
-                        <div className="squircle" style={{ color: m.line }}>
-                          {m.initial}
-                        </div>
-                        <div>
-                          <div className="nm">{m.name}</div>
-                          <div className="st">
-                            {m.epithet} · {m.style}
-                          </div>
-                        </div>
-                      </div>
-                    </td>
-                    <td className="num">
-                      {m.nav > 0 ? fmtUsd(m.nav, 3) : "—"}
-                    </td>
-                    <td className="num val pos">
-                      {m.price != null ? fmtUsd(m.price, 3) : "—"}
-                    </td>
-                    <td className={`num ${spreadCls}`}>
-                      {spread == null
-                        ? "—"
-                        : `${spread >= 0 ? "+" : ""}${Math.round(spread)} bps`}
-                    </td>
-                    <td
-                      className={`num ${m.pnlSession == null ? "" : m.pnlSession >= 0 ? "pos" : "neg"}`}
-                    >
-                      {m.pnlSession == null
-                        ? "—"
-                        : `${sign(m.pnlSession)}${m.pnlSession.toFixed(2)}%`}
-                    </td>
-                    <td className="num">
-                      {m.sharpe == null ? "—" : m.sharpe.toFixed(2)}
-                    </td>
-                    <td style={{ textAlign: "right" }}>
-                      <Sparkline
-                        series={m.series}
-                        color={m.line}
-                        w={110}
-                        h={32}
-                      />
-                    </td>
-                    <td style={{ textAlign: "right" }}>
-                      <span className="score-chip">{m.score.toFixed(1)}</span>
-                    </td>
-                    <td style={{ textAlign: "right" }}>
-                      <Link
-                        className="btn btn-plain btn-sm"
-                        href={`/model?m=${m.id}`}
-                        onClick={(e) => e.stopPropagation()}
-                      >
-                        Trade →
-                      </Link>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </section>
+        <div
+          className="between"
+          style={{ alignItems: "flex-end", marginBottom: 16 }}
+        >
+          <h2 className="h4">Standings</h2>
+          <span className="crumb">
+            {error
+              ? error
+              : loading
+                ? "connecting to Arbitrum Sepolia…"
+                : `live · block ${blockNumber ?? "—"} · ranked by Coliseum Score`}
+          </span>
+        </div>
+
+        <div className="token-grid">
+          {ranked.map((m, i) => (
+            <ModelTokenCard key={m.id} model={m} rank={i + 1} />
+          ))}
+        </div>
       </div>
     </>
   );

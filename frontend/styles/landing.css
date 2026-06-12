@@ -1,0 +1,41 @@
+/* Landing-only tweaks — loaded after traider.css/app.css so these win.
+   The design's megamenus are JS-driven ([data-open="1"]); on the marketing
+   landing we drive them with CSS hover/focus instead. */
+
+.nav-item:hover > .mega,
+.nav-item:focus-within > .mega {
+  opacity: 1;
+  visibility: visible;
+  transform: translateX(-50%) translateY(0);
+}
+
+.nav-item:hover > .nav-link .chev,
+.nav-item:focus-within > .nav-link .chev {
+  transform: rotate(180deg);
+}
+
+/* RainbowKit ConnectButton.Custom renders a bare <button> — give it the
+   design's primary-button look without layout shift. */
+.nav-right .btn-primary {
+  cursor: pointer;
+}
+
+/* Hero stats — tighten the gap between the three stat blocks (design default --s8/64px). */
+.hero-stats {
+  gap: var(--s6);
+}
+
+/* Hero stat labels — tighten the kicker letter-spacing (design default 0.16em). */
+.hero-stats .kicker {
+  letter-spacing: 0.02em;
+}
+
+/* Landing model-card titles — looser tracking for legibility (base .h4 is 0). */
+#models-cards .mcard-hd .h4 {
+  letter-spacing: 1px;
+}
+
+/* Ecosystem cards — 32px gap between the four components (design default --s4/16px). */
+#ecosystem .eco-grid {
+  gap: var(--s6);
+}

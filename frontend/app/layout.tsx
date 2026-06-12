@@ -16,6 +16,8 @@ import { Providers } from "./providers";
 import "./globals.css";
 import "../styles/traider.css";
 import "../styles/app.css";
+import "../styles/landing.css";
+import "../styles/cards.css";
 
 export const metadata: Metadata = {
   title: "trAIder — Live AI Trading Performance Markets",
