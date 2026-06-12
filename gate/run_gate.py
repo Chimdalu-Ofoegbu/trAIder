@@ -763,6 +763,7 @@ async def run_gate(
     manifest_path: Path | str | None = None,
     dry_run: bool = False,
     full_run: bool = True,
+    trading_only: bool = False,
     step_through: bool = False,
     nav_sim_result: str | None = None,
     gate_duration: int = DEFAULT_GATE_DURATION,
@@ -826,6 +827,10 @@ async def run_gate(
             "vaultClaude": "0xFakeVaultClaude00000000000000000000000001",
             "vaultGpt": "0xFakeVaultGpt000000000000000000000000000002",
             "vaultGem": "0xFakeVaultGem000000000000000000000000000003",
+            # LP NFT ids are ints (harness does int(...)); fake-hex would crash
+            "lpNftClaude": 101,
+            "lpNftGpt": 102,
+            "lpNftGem": 103,
         })
     else:
         manifest = load_and_validate_manifest(manifest_path)
@@ -1225,6 +1230,42 @@ async def run_gate(
     # Stop ambient sim before harness step 1 (harness step 1 also sets stop_event)
     arb_stop.set()
 
+    # ── trading-only mode (pre-deadline demo window) ───────────────────────
+    # Runs the live 3-model trading + arb + sim for gate_duration, MEASURES the
+    # trading evidence from chain, and exits WITHOUT the settlement choreography
+    # (harness steps 3-6 now perform REAL LP-removal/redeem/endSession — those
+    # must not run before the session deadline). Settlement criteria are
+    # reported as NOT RUN, never asserted.
+    if trading_only:
+        try:
+            await measure_gate_evidence(
+                mock_perps=mock_perps_contract,
+                vaults_with_addrs=vaults_with_addrs,
+                settlement_contracts=settlement_contracts,
+                pools=pools,
+                pool_snapshots_before=pool_snapshots_before,
+                operator_lp_key=manifest.get("operatorLpKey", "0x" + "0" * 40),
+                accumulator=accumulator,
+                from_block=gate_start_block,
+            )
+        finally:
+            spec_task.cancel()
+            supervisor_task.cancel()
+            arb_task.cancel()
+            for t in (spec_task, supervisor_task, arb_task):
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+            if _teardown_shared_infra is not None:
+                await _teardown_shared_infra()
+
+        run_results = accumulator.finalize(vault_addresses)
+        run_results["mode"] = "trading-only"
+        elapsed = time.monotonic() - t_start
+        _print_trading_only_result(run_results, elapsed=elapsed)
+        return run_results
+
     try:
         await harness.run()
         # MEASURED evidence (anti-false-green): every criterion that can be read
@@ -1270,6 +1311,29 @@ async def run_gate(
     return run_results
 
 
+def _print_trading_only_result(run_results: dict, *, elapsed: float) -> None:
+    """Print the measured TRADING-ONLY summary (no settlement — pre-deadline window).
+
+    Honest by construction: every number here is measured from chain by
+    gate/evidence.py; settlement criteria are reported NOT RUN, never asserted.
+    """
+    print(f"\n{'=' * 72}")
+    print("  TRADING-ONLY RUN — live 3-model session (NO settlement; pre-deadline)")
+    print(f"  Duration: {elapsed:.1f}s")
+    print(f"{'=' * 72}")
+    moc = run_results.get("models_open_close", {})
+    for model in ("claude", "gpt", "gemini"):
+        d = moc.get(model, {})
+        print(f"  {model:<8} opens={d.get('opens', 0):<3} closes={d.get('closes', 0):<3} [measured from MockPerps logs]")
+    gaps = run_results.get("gap_closes", [])
+    print(f"  AMM live (pool state changed): {run_results.get('amm_pool_state_changed', False)}")
+    print(f"  arb gap-closes recorded: {len(gaps)}" + (f" (fastest {min(g['close_time_s'] for g in gaps):.1f}s)" if gaps else ""))
+    print("  settlement: NOT RUN (deadline-gated; run --full-run at/after the session deadline)")
+    print("\nEvidence dict:\n")
+    print(json.dumps(run_results, indent=2, default=str))
+    print()
+
+
 def _print_gate_result(run_results: dict, *, venue: str, elapsed: float, dry_run: bool) -> None:
     """Print the PASS banner + evidence dict for pasting into 04-GATE.md."""
     mode = "[DRY-RUN] " if dry_run else ""
@@ -1305,6 +1369,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         default=False,
         help="Wire against in-memory fakes — no network, no LLM spend",
+    )
+    mode_group.add_argument(
+        "--trading-only",
+        action="store_true",
+        default=False,
+        help=(
+            "LIVE 3-model trading + arb + sim for --gate-duration, then measured "
+            "evidence and exit — NO settlement choreography (safe pre-deadline; "
+            "use for the demo window)"
+        ),
     )
     parser.add_argument(
         "--step-through",
@@ -1342,8 +1416,8 @@ async def _async_main(argv: list[str] | None = None) -> int:
     )
     args = _parse_args(argv)
 
-    if not args.full_run and not args.dry_run:
-        # Default: --full-run if neither specified
+    if not args.full_run and not args.dry_run and not args.trading_only:
+        # Default: --full-run if no mode specified
         args.full_run = True
 
     try:
@@ -1351,6 +1425,7 @@ async def _async_main(argv: list[str] | None = None) -> int:
             manifest_path=args.manifest,
             dry_run=args.dry_run,
             full_run=args.full_run,
+            trading_only=args.trading_only,
             step_through=args.step_through,
             nav_sim_result=args.nav_sim_result,
             gate_duration=args.gate_duration,
