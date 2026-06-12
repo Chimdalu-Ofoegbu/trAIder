@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -41,7 +42,95 @@ from typing import Any, Callable
 from orchestrator.loop.arb_bot import decode_pool_price_e18
 from orchestrator.loop.settlement_keeper import drain_and_settle_multi
 
+try:  # same optional-import pattern as speculator_sim (source of truth: arb_bot)
+    from orchestrator.loop.arb_bot import FIRE_THRESHOLD_BPS as _ARB_FIRE_THRESHOLD_BPS
+except ImportError:  # pragma: no cover
+    _ARB_FIRE_THRESHOLD_BPS = int(os.environ.get("FIRE_THRESHOLD_BPS", "150"))
+
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Inline ABIs for live steps (no compiled artifacts for Algebra periphery —
+# selectors depend only on argument types, same rationale as run_gate's inline
+# pool/router ABIs).
+# ---------------------------------------------------------------------------
+
+_NPM_ABI: list = [
+    {
+        "inputs": [{"name": "tokenId", "type": "uint256"}],
+        "name": "positions",
+        "outputs": [
+            {"name": "nonce", "type": "uint96"},
+            {"name": "operator", "type": "address"},
+            {"name": "token0", "type": "address"},
+            {"name": "token1", "type": "address"},
+            {"name": "tickLower", "type": "int24"},
+            {"name": "tickUpper", "type": "int24"},
+            {"name": "liquidity", "type": "uint128"},
+            {"name": "feeGrowthInside0LastX128", "type": "uint256"},
+            {"name": "feeGrowthInside1LastX128", "type": "uint256"},
+            {"name": "tokensOwed0", "type": "uint128"},
+            {"name": "tokensOwed1", "type": "uint128"},
+        ],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {
+                "components": [
+                    {"name": "tokenId", "type": "uint256"},
+                    {"name": "liquidity", "type": "uint128"},
+                    {"name": "amount0Min", "type": "uint256"},
+                    {"name": "amount1Min", "type": "uint256"},
+                    {"name": "deadline", "type": "uint256"},
+                ],
+                "name": "params",
+                "type": "tuple",
+            }
+        ],
+        "name": "decreaseLiquidity",
+        "outputs": [
+            {"name": "amount0", "type": "uint256"},
+            {"name": "amount1", "type": "uint256"},
+        ],
+        "stateMutability": "payable",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {
+                "components": [
+                    {"name": "tokenId", "type": "uint256"},
+                    {"name": "recipient", "type": "address"},
+                    {"name": "amount0Max", "type": "uint128"},
+                    {"name": "amount1Max", "type": "uint128"},
+                ],
+                "name": "params",
+                "type": "tuple",
+            }
+        ],
+        "name": "collect",
+        "outputs": [
+            {"name": "amount0", "type": "uint256"},
+            {"name": "amount1", "type": "uint256"},
+        ],
+        "stateMutability": "payable",
+        "type": "function",
+    },
+]
+
+_ERC20_BALANCE_ABI: list = [
+    {
+        "inputs": [{"name": "account", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+]
+
+_UINT128_MAX: int = 2**128 - 1
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -109,6 +198,15 @@ class GateHarness:
         gap_close_timeout_s: float = DEFAULT_GAP_CLOSE_TIMEOUT_S,
         stop_event: asyncio.Event | None = None,
         gap_log_callback: Callable[[int, float, str], None] | None = None,
+        # Live-step wiring (None in pure unit tests → steps log-and-skip the
+        # on-chain action but NEVER report fake success; run_gate wires all of
+        # these on the live path).
+        swap_router: Any | None = None,
+        usdc_address: str | None = None,
+        demo_wallet: str | None = None,
+        mock_perps: Any | None = None,
+        npm: Any | None = None,
+        gap_swap_usdc: int | None = None,
     ) -> None:
         self.web3 = web3
         self.vaults = vaults  # [(vault_contract, vault_address), ...]
@@ -123,6 +221,12 @@ class GateHarness:
         self.gap_close_timeout_s = gap_close_timeout_s
         self.stop_event = stop_event
         self.gap_log_callback = gap_log_callback
+        self.swap_router = swap_router
+        self.usdc_address = usdc_address
+        self.demo_wallet = demo_wallet
+        self.mock_perps = mock_perps
+        self.npm = npm
+        self.gap_swap_usdc = gap_swap_usdc or int(os.environ.get("GAP_SWAP_USDC", str(25 * 10**6)))
 
         # State set during execution (used by later steps / claim assertions)
         self._holder_pre_claim_balances: dict[str, int] = {}
@@ -166,6 +270,7 @@ class GateHarness:
         logger.info("GateHarness.run() starting — %d vault(s)", len(self.vaults))
 
         try:
+            await self.step("0_HOLDER_BUYS", self._ensure_holder_positions)
             await self.step("1_INDUCE_GAP", self._induce_synthetic_gap)
             await self.step("2_ASSERT_BOT_CLOSES", self._assert_gap_closed_within_60s)
             await self.step("3_OPERATOR_REMOVE_LP", self._operator_remove_lp_all_pools)
@@ -192,22 +297,104 @@ class GateHarness:
     # Step implementations
     # -----------------------------------------------------------------------
 
+    async def _ensure_holder_positions(self) -> None:
+        """D-19 step 0: every demo holder must HOLD mTOKEN before settlement.
+
+        endSession reverts with "no shares outstanding" if supplySnapshot==0 after
+        the operator redeems (step 4), and step 7's claim proof needs real holder
+        balances — so each holder with a zero balance executes a genuine_holder_buy
+        (real SwapRouter exactInputSingle, sized within the arb hysteresis).
+        Skips (with a loud log) when swap_router is not wired (unit tests).
+        """
+        if self.swap_router is None:
+            logger.warning(
+                "_ensure_holder_positions: swap_router not wired — SKIPPING on-chain "
+                "holder buys (test mode; the live gate wires swap_router)"
+            )
+            return
+
+        from gate.speculator_sim import genuine_holder_buy  # noqa: PLC0415
+
+        vault_by_addr = {va.lower(): (vc, va) for vc, va in self.vaults}
+        pool_by_vault = {
+            va.lower(): pool for (vc, va), pool in zip(self.vaults, self.pools)
+        }
+        for holder_address, vault_address, usdc_amount in self.holders:
+            vc_va = vault_by_addr.get(vault_address.lower())
+            pool = pool_by_vault.get(vault_address.lower())
+            if vc_va is None or pool is None:
+                raise AssertionError(
+                    f"_ensure_holder_positions: no vault/pool wired for {vault_address[:10]}"
+                )
+            vault_contract, _ = vc_va
+            balance: int = await vault_contract.functions.balanceOf(holder_address).call()
+            if balance > 0:
+                logger.info(
+                    "_ensure_holder_positions: holder=%s already holds %d — skipping buy",
+                    holder_address[:10], balance,
+                )
+                continue
+            bought = await genuine_holder_buy(
+                self.swap_router, pool, vault_contract, holder_address, usdc_amount
+            )
+            if bought <= 0:
+                raise AssertionError(
+                    f"_ensure_holder_positions: holder {holder_address[:10]} buy executed "
+                    f"but post-buy balance is 0 — holder cannot prove the claim path (D-19)"
+                )
+
     async def _induce_synthetic_gap(self) -> None:
         """D-19: scripted demo wallet swap induces gap > FIRE_THRESHOLD_BPS.
 
         Pauses the ambient speculator-sim first (D-10), then executes a SwapRouter
-        exactInputSingle that moves the pool price off NAV past the bot's hysteresis.
-        Records t0 and gap_at_detection for the endurance log.
+        exactInputSingle (USDC→mTOKEN on pool[0]) that moves the pool price off NAV
+        past the bot's hysteresis. Up to 3 escalating swaps; if the gap still hasn't
+        opened, step 2 will time out and raise (honest failure, not a fake pass).
+        No-op (logged) when swap_router/usdc/demo_wallet are not wired (unit tests).
         """
         # Pause ambient sim
         if self.stop_event is not None:
             self.stop_event.set()
             await asyncio.sleep(0)  # yield to let the sim notice
 
-        logger.info("_induce_synthetic_gap: ambient sim paused; inducing scripted gap")
-        # In the live run: executes a demo-wallet swap large enough to push price
-        # off NAV by > FIRE_THRESHOLD_BPS (1.5% default). In unit tests this step
-        # is a no-op unless the test supplies pool/swap mocks that record calls.
+        if self.swap_router is None or self.usdc_address is None or self.demo_wallet is None:
+            logger.warning(
+                "_induce_synthetic_gap: swap_router/usdc/demo_wallet not wired — "
+                "SKIPPING scripted swap (test mode; ambient gaps only)"
+            )
+            return
+
+        vault_contract, vault_address = self.vaults[0]
+        target_bps = _ARB_FIRE_THRESHOLD_BPS + 50  # clear the hysteresis with margin
+        for attempt in range(1, 4):
+            tx = await self.swap_router.functions.exactInputSingle(
+                (
+                    self.usdc_address,
+                    vault_address,
+                    self.demo_wallet,
+                    2**32 - 1,
+                    self.gap_swap_usdc,
+                    0,
+                    0,
+                )
+            ).transact({"from": self.demo_wallet})
+            receipt = await self.web3.eth.wait_for_transaction_receipt(tx, timeout=60)
+            if receipt.get("status") == 0:
+                raise AssertionError(
+                    f"_induce_synthetic_gap: scripted swap #{attempt} REVERTED "
+                    f"(tx={tx.hex() if hasattr(tx, 'hex') else tx})"
+                )
+            gap_bps = await self._read_gap()
+            logger.info(
+                "_induce_synthetic_gap: swap #%d of %d USDC-units → gap=%d bps (target>%d)",
+                attempt, self.gap_swap_usdc, gap_bps, target_bps,
+            )
+            if gap_bps > target_bps:
+                return
+        logger.warning(
+            "_induce_synthetic_gap: gap still %d bps after 3 swaps — step 2 will "
+            "verify (and honestly fail) the close criterion", gap_bps,
+        )
 
     async def _assert_gap_closed_within_60s(self) -> None:
         """D-10: poll gap until closed (< 1% contract threshold) or timeout.
@@ -242,9 +429,55 @@ class GateHarness:
         The gate harness calls this via the operator LP key (D-06).
         """
         logger.info("_operator_remove_lp_all_pools: removing LP from %d pool(s)", len(self.pools))
-        # Placeholder: in the live run, enumerate npm_positions and call decreaseLiquidity.
-        # Unit tests mock the pool/NPM state; this step is asserted at the contract level
-        # by the D-18 guard in endSession.
+        if self.npm is None:
+            logger.warning(
+                "_operator_remove_lp_all_pools: NPM not wired — SKIPPING on-chain LP "
+                "removal (test mode; the D-18 contract guard in endSession still "
+                "enforces the invariant on the live path)"
+            )
+            return
+
+        import time as _time  # noqa: PLC0415
+
+        deadline = int(_time.time()) + 600
+        for token_id in self.npm_positions:
+            if not token_id:
+                raise AssertionError(
+                    "_operator_remove_lp_all_pools: LP NFT tokenId is 0/missing — "
+                    "manifest lpNft* keys must be populated for the live gate"
+                )
+            pos = await self.npm.functions.positions(int(token_id)).call()
+            liquidity = int(pos[6])
+            if liquidity > 0:
+                tx = await self.npm.functions.decreaseLiquidity(
+                    (int(token_id), liquidity, 0, 0, deadline)
+                ).transact({"from": self.operator_lp_key})
+                receipt = await self.web3.eth.wait_for_transaction_receipt(tx, timeout=60)
+                if receipt.get("status") == 0:
+                    raise AssertionError(
+                        f"_operator_remove_lp_all_pools: decreaseLiquidity REVERTED "
+                        f"for tokenId={token_id}"
+                    )
+            # collect principal + any fees owed (idempotent when nothing is owed)
+            tx = await self.npm.functions.collect(
+                (int(token_id), self.operator_lp_key, _UINT128_MAX, _UINT128_MAX)
+            ).transact({"from": self.operator_lp_key})
+            receipt = await self.web3.eth.wait_for_transaction_receipt(tx, timeout=60)
+            if receipt.get("status") == 0:
+                raise AssertionError(
+                    f"_operator_remove_lp_all_pools: collect REVERTED for tokenId={token_id}"
+                )
+            # Verify on-chain: liquidity must now be zero (anti-false-green readback)
+            pos_after = await self.npm.functions.positions(int(token_id)).call()
+            if int(pos_after[6]) != 0:
+                raise AssertionError(
+                    f"_operator_remove_lp_all_pools: tokenId={token_id} still has "
+                    f"liquidity={pos_after[6]} after decreaseLiquidity+collect"
+                )
+            logger.info(
+                "_operator_remove_lp_all_pools: tokenId=%s liquidity %d → 0 — OK",
+                token_id, liquidity,
+            )
 
     async def _operator_redeem_mtoken_all_vaults(self) -> None:
         """D-18 step 4: operator redeems recovered mTOKEN at vault NAV.
@@ -257,11 +490,44 @@ class GateHarness:
             AssertionError: If any vault still shows non-zero operator balance after
                 the expected redeem call, or if the redeem was not called.
         """
-        logger.info("_operator_redeem_mtoken_all_vaults: asserting operator shares == 0")
+        logger.info("_operator_redeem_mtoken_all_vaults: redeeming operator shares → 0")
         for vault_contract, vault_address in self.vaults:
             balance: int = await vault_contract.functions.balanceOf(
                 self.operator_lp_key
             ).call()
+            if balance > 0:
+                # REAL redeem (ERC-4626): burn the operator/MM's recovered shares at
+                # vault NAV so the D-18 guard in endSession passes. The vault's
+                # operator-no-withdraw restriction applies to the TRADE operator, not
+                # the LP/MM key — the D-18 design requires this key to redeem.
+                logger.info(
+                    "_operator_redeem_mtoken_all_vaults: vault=%s redeeming %d shares",
+                    vault_address[:10], balance,
+                )
+                try:
+                    tx = await vault_contract.functions.redeem(
+                        balance, self.operator_lp_key, self.operator_lp_key
+                    ).transact({"from": self.operator_lp_key})
+                    receipt = await self.web3.eth.wait_for_transaction_receipt(tx, timeout=60)
+                    if receipt.get("status") == 0:
+                        raise AssertionError(
+                            f"_operator_redeem_mtoken_all_vaults: redeem REVERTED for "
+                            f"vault={vault_address[:10]} (shares={balance})"
+                        )
+                except AssertionError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    # Any redeem failure IS the D-18 ordering failure — surface it
+                    # as such (never swallow and proceed to endSession).
+                    raise AssertionError(
+                        f"D-18 ordering violation (Pitfall 5): operator/MM "
+                        f"({self.operator_lp_key[:10]}) holds {balance} shares at "
+                        f"vault {vault_address[:10]} and the redeem attempt failed: "
+                        f"{exc}"
+                    ) from exc
+                balance = await vault_contract.functions.balanceOf(
+                    self.operator_lp_key
+                ).call()
             if balance != 0:
                 raise AssertionError(
                     f"D-18 ordering violation (Pitfall 5): operator/MM ({self.operator_lp_key[:10]}) "
@@ -286,12 +552,19 @@ class GateHarness:
 
         logger.info("_keeper_drain_all_vaults: draining %d vault(s)", len(vault_triples))
 
+        if self.mock_perps is None:
+            # Anti-false-green: a drain against a placeholder adapter would no-op
+            # on-chain while reporting success. Tests must inject mock_perps
+            # explicitly; the live gate wires the real MockPerps contract.
+            raise AssertionError(
+                "_keeper_drain_all_vaults: mock_perps contract not wired — refusing "
+                "to drain against a placeholder (would mask an unsettled vault). "
+                "Pass mock_perps= to GateHarness."
+            )
+
         results = await drain_and_settle_multi(
             self.web3,
-            # mock_perps is not available at this layer; in the live run the harness
-            # receives it via the constructor. For now, use a placeholder that will be
-            # wired in the full __init__ in the live run.
-            getattr(self, "_mock_perps", MagicMock()),
+            self.mock_perps,
             vault_triples,
             orchestrator_address=self.operator_lp_key,
             deployer_address=self.operator_lp_key,
@@ -349,12 +622,25 @@ class GateHarness:
                     ) from exc
 
     async def _assert_holders_claim_correctly(self) -> None:
-        """D-19 step 7: each genuine holder claims; assert claimed ≈ balance × finalNAV.
+        """D-19 step 7: each genuine holder CLAIMS on-chain; assert claimed ≈ shares × rate.
 
-        Reads ACTUAL post-buy mTOKEN balance and asserts claimed_USDC ≈ balance × finalNAV
-        within HOLDER_CLAIM_TOLERANCE_BPS (0.1%). distribute() must be non-empty per vault.
+        For every holder with a non-zero share balance on a SETTLED vault:
+        executes settlement.claim() from the holder key (middleware injected by
+        run_gate), then asserts the holder's USDC delta ≈ shares × redemptionRate
+        within HOLDER_CLAIM_TOLERANCE_BPS (0.1%).
+
+        Pre-deadline runs (settled=False — step 6 logged the not-authorized path)
+        skip the claims with a loud log; evidence measurement then records
+        all_settled=False honestly. Without a wired usdc_address (unit tests),
+        falls back to the read-only balance/NAV snapshot.
         """
         logger.info("_assert_holders_claim_correctly: %d holder(s)", len(self.holders))
+
+        usdc = (
+            self.web3.eth.contract(address=self.usdc_address, abi=_ERC20_BALANCE_ABI)
+            if self.usdc_address is not None
+            else None
+        )
 
         for holder_address, vault_address, _ in self.holders:
             # Find vault contract
@@ -389,20 +675,61 @@ class GateHarness:
 
             self._final_navs[vault_address] = final_nav_e18
 
-            # Check distribution non-empty (harness tracks this via settlement state)
-            settlement_state = self._settlement_states.get(vault_address, {})
-            if settlement_state.get("distribute_nonempty") is False:
+            if usdc is None:
+                # Unit-test mode: read-only snapshot (no on-chain claim path wired).
+                logger.info(
+                    "_assert_holders_claim_correctly: holder=%s vault=%s balance=%d "
+                    "finalNAV=%d [read-only — usdc_address not wired]",
+                    holder_address[:10], vault_address[:10], actual_balance, final_nav_e18,
+                )
+                continue
+
+            settled = bool(await sc.functions.settled().call())
+            if not settled:
+                logger.warning(
+                    "_assert_holders_claim_correctly: vault=%s NOT settled (pre-deadline "
+                    "run) — SKIPPING claim for holder=%s; evidence will record "
+                    "all_settled=False honestly",
+                    vault_address[:10], holder_address[:10],
+                )
+                continue
+            if actual_balance == 0:
+                logger.warning(
+                    "_assert_holders_claim_correctly: holder=%s has 0 shares at "
+                    "vault=%s — nothing to claim",
+                    holder_address[:10], vault_address[:10],
+                )
+                continue
+
+            rate: int = await sc.functions.redemptionRate().call()
+            expected_usdc = actual_balance * rate // 10**18
+            usdc_before: int = await usdc.functions.balanceOf(holder_address).call()
+
+            tx = await sc.functions.claim().transact({"from": holder_address})
+            receipt = await self.web3.eth.wait_for_transaction_receipt(tx, timeout=60)
+            if receipt.get("status") == 0:
                 raise AssertionError(
-                    f"distribute() was empty for vault={vault_address[:10]} — "
-                    "no holders received proceeds (D-19)."
+                    f"_assert_holders_claim_correctly: claim() REVERTED for "
+                    f"holder={holder_address[:10]} vault={vault_address[:10]}"
                 )
 
+            usdc_after: int = await usdc.functions.balanceOf(holder_address).call()
+            claimed = usdc_after - usdc_before
+            tolerance = max(1, expected_usdc * HOLDER_CLAIM_TOLERANCE_BPS // 10000)
+            if abs(claimed - expected_usdc) > tolerance:
+                raise AssertionError(
+                    f"_assert_holders_claim_correctly: holder={holder_address[:10]} "
+                    f"claimed {claimed} USDC-units but expected ≈{expected_usdc} "
+                    f"(shares={actual_balance} × rate={rate} / 1e18, "
+                    f"tolerance={HOLDER_CLAIM_TOLERANCE_BPS} bps) — D-19 FAIL"
+                )
+
+            self._settlement_states.setdefault(vault_address, {})["distribute_nonempty"] = True
             logger.info(
-                "_assert_holders_claim_correctly: holder=%s vault=%s balance=%d finalNAV=%d",
-                holder_address[:10],
-                vault_address[:10],
-                actual_balance,
-                final_nav_e18,
+                "_assert_holders_claim_correctly: holder=%s vault=%s CLAIMED %d "
+                "USDC-units (expected %d, Δ within %d bps) — PASS",
+                holder_address[:10], vault_address[:10], claimed, expected_usdc,
+                HOLDER_CLAIM_TOLERANCE_BPS,
             )
 
     async def _assert_operator_cannot_claim(self) -> None:
@@ -475,13 +802,6 @@ class GateHarness:
     def _default_pause_hook() -> None:
         """Default pause hook: blocking input() for interactive step-through mode."""
         input(">>> Press ENTER to continue to next step ...")
-
-
-# Import MagicMock for the placeholder in _keeper_drain_all_vaults
-try:
-    from unittest.mock import MagicMock
-except ImportError:
-    pass  # In production, this step receives a real mock_perps
 
 
 # ---------------------------------------------------------------------------
@@ -564,6 +884,11 @@ def assert_hard_gate_set(
         "All 3 vaults must complete the drain → endSession → claim flow."
     )
     distribute_nonempty: dict = settlement.get("distribute_nonempty", {})
+    assert distribute_nonempty, (
+        "D-16 (d) FAIL: no distribution evidence recorded — distribute_nonempty is "
+        "empty. Evidence must be measured per vault (an empty dict must not pass "
+        "vacuously — anti-false-green)."
+    )
     for vault_addr, nonempty in distribute_nonempty.items():
         assert nonempty, (
             f"D-16 (d) FAIL: distribute() was empty for vault={vault_addr[:10] if vault_addr else '?'}. "

@@ -504,10 +504,14 @@ class _GateResultAccumulator:
         self.amm_pool_state_changed = True
 
     def finalize(self, vault_addresses: list[str]) -> dict:
-        """Build the final run_results dict for assert_hard_gate_set."""
+        """Build the final run_results dict for assert_hard_gate_set.
+
+        Anti-false-green: this method does NOT invent evidence. settlement
+        fields (all_settled / distribute_nonempty / operator_claimed) must be
+        populated upstream — by measure_gate_evidence (live, from chain) or by
+        the clearly-labeled dry-run synthetic block.
+        """
         self.gate_duration_seconds = time.monotonic() - self._start_time
-        distribute_nonempty = {addr: True for addr in vault_addresses}
-        self.settlement["distribute_nonempty"] = distribute_nonempty
         return {
             "models_open_close": self.models_open_close,
             "amm_pool_state_changed": self.amm_pool_state_changed,
@@ -1013,6 +1017,22 @@ async def run_gate(
 
     HarnessClass = _injected_harness_class if _injected_harness_class is not None else GateHarness
 
+    # Live-step contracts for the real D-18 choreography (steps 0/1/3/5/7).
+    # Dry-run never executes harness.run(), so fakes only need to construct.
+    if dry_run:
+        mock_perps_contract = _make_fake_mock_perps()
+        npm_contract = MagicMock()
+    else:
+        from gate.harness import _NPM_ABI  # noqa: PLC0415
+        from orchestrator.loop.run_session import _load_abi as _load_abi_fn  # noqa: PLC0415
+
+        _contracts_out = _REPO_ROOT / "contracts" / "out"
+        mock_perps_contract = web3.eth.contract(
+            address=manifest["mockPerps"],
+            abi=_load_abi_fn(_contracts_out / "MockPerps.sol" / "MockPerps.json"),
+        )
+        npm_contract = web3.eth.contract(address=manifest["algebraNpm"], abi=_NPM_ABI)
+
     harness = HarnessClass(
         web3=web3,
         vaults=vaults_with_addrs,
@@ -1031,6 +1051,11 @@ async def run_gate(
         gap_close_timeout_s=5.0 if dry_run else 60.0,
         stop_event=stop_event,
         gap_log_callback=_gap_log,
+        swap_router=swap_router,
+        usdc_address=manifest.get("mockUsdc"),
+        demo_wallet=demo_wallet,
+        mock_perps=mock_perps_contract,
+        npm=npm_contract,
     )
 
     # ── Step 11: Dry-run shortcircuit — inject fast harness results ────────
@@ -1090,12 +1115,20 @@ async def run_gate(
             pass
 
         # 5. Inject dry-run harness outcome (all steps pass, 1 per-model trade each)
+        logger.warning(
+            "run_gate: DRY-RUN — injecting SYNTHETIC evidence (wiring test only; "
+            "this is NOT a live result and must never be presented as one). The "
+            "live path measures all evidence from chain via gate/evidence.py."
+        )
         for model in ("claude", "gpt", "gemini"):
             accumulator.record_trade(model, "open")
             accumulator.record_trade(model, "close")
         accumulator.mark_pool_state_changed()
         accumulator.settlement["all_settled"] = True
         accumulator.settlement["operator_claimed"] = False
+        accumulator.settlement["distribute_nonempty"] = {
+            addr: True for addr in vault_addresses
+        }
         # Add a synthetic gap close so criterion (c) passes
         accumulator.record_gap_close(260, 12.5, "0xdryrungapclose")
 
@@ -1138,6 +1171,18 @@ async def run_gate(
     # ── Step 12: Live run — launch all tasks + harness ─────────────────────
     # Launch supervisor, arb-bot, and speculator sim as concurrent tasks.
     # The harness runs sequentially after the ambient tasks are warmed up.
+    # Evidence baseline FIRST (anti-false-green): the gate window's start block +
+    # pool-state snapshots are captured BEFORE any task runs, so every criterion
+    # is measured against chain state rather than asserted by construction.
+    from gate.evidence import measure_gate_evidence, snapshot_pool_states  # noqa: PLC0415
+
+    gate_start_block: int = await web3.eth.get_block_number()
+    pool_snapshots_before = await snapshot_pool_states(pools)
+    logger.info(
+        "run_gate: evidence baseline — start_block=%d pool_states=%s",
+        gate_start_block, pool_snapshots_before,
+    )
+
     logger.info("run_gate: launching 3-model supervisor, arb bot, and speculator sim")
 
     supervisor_task = asyncio.create_task(
@@ -1182,12 +1227,20 @@ async def run_gate(
 
     try:
         await harness.run()
-        accumulator.settlement["all_settled"] = True
-        accumulator.settlement["operator_claimed"] = False
-        for model in ("claude", "gpt", "gemini"):
-            accumulator.record_trade(model, "open")
-            accumulator.record_trade(model, "close")
-        accumulator.mark_pool_state_changed()
+        # MEASURED evidence (anti-false-green): every criterion that can be read
+        # from chain IS read from chain. This replaces the old block that
+        # hardcoded all_settled=True + 1 open/close per model regardless of what
+        # actually happened on-chain (the mock-masking 04-GATE warns against).
+        await measure_gate_evidence(
+            mock_perps=mock_perps_contract,
+            vaults_with_addrs=vaults_with_addrs,
+            settlement_contracts=settlement_contracts,
+            pools=pools,
+            pool_snapshots_before=pool_snapshots_before,
+            operator_lp_key=manifest.get("operatorLpKey", "0x" + "0" * 40),
+            accumulator=accumulator,
+            from_block=gate_start_block,
+        )
     except Exception as exc:  # noqa: BLE001
         accumulator.crashed = True
         logger.error("run_gate: harness failed: %s", exc)
