@@ -39,13 +39,19 @@ const FAUCET_USDC = 1_000n * 10n ** 6n; // "Get test USDC" mints $1,000
 
 type PendingAction = "approve" | "swap" | "mint" | null;
 
-export function TradePanel({ m }: { m: ModelLive }) {
+export function TradePanel({
+  m,
+  initialSide = "buy",
+}: {
+  m: ModelLive;
+  initialSide?: "buy" | "sell";
+}) {
   const { address, isConnected } = useAccount();
   const chainId = useChainId();
   const { switchChain, isPending: switching } = useSwitchChain();
   const { openConnectModal } = useConnectModal();
 
-  const [side, setSide] = useState<"buy" | "sell">("buy");
+  const [side, setSide] = useState<"buy" | "sell">(initialSide);
   const [amount, setAmount] = useState("25");
   const [action, setAction] = useState<PendingAction>(null);
   const [lastFill, setLastFill] = useState<{

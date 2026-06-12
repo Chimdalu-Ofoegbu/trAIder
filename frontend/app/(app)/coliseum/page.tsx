@@ -13,16 +13,27 @@
 //   - Card scores/charts are session-derived (no historical NAV backfill on-chain).
 // =============================================================================
 
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 
 import { useModels } from "@/lib/onchain/useModels";
 import { fmtCompact, fmtInt } from "@/lib/format";
 import { Ticker } from "@/components/app/Ticker";
 import { WalletButton } from "@/components/app/WalletButton";
 import { ModelTokenCard } from "@/components/app/ModelTokenCard";
+import { TradeModal } from "@/components/app/TradeModal";
+import type { ModelLive } from "@/lib/onchain/types";
 
 export default function ColiseumPage() {
   const { models, blockNumber, loading, error } = useModels();
+  const [trade, setTrade] = useState<{
+    id: string;
+    side: "buy" | "sell";
+  } | null>(null);
+  // Resolve from the LIVE models list each render so the open modal keeps
+  // receiving fresh NAV/price ticks from the 6s poll.
+  const tradeModel: ModelLive | null = trade
+    ? (models.find((m) => m.id === trade.id) ?? null)
+    : null;
 
   const ranked = useMemo(
     () => [...models].sort((a, b) => b.score - a.score),
@@ -108,10 +119,24 @@ export default function ColiseumPage() {
 
         <div className="token-grid">
           {ranked.map((m, i) => (
-            <ModelTokenCard key={m.id} model={m} rank={i + 1} />
+            <ModelTokenCard
+              key={m.id}
+              model={m}
+              rank={i + 1}
+              onTrade={(model, side) => setTrade({ id: model.id, side })}
+            />
           ))}
         </div>
       </div>
+
+      {tradeModel && trade ? (
+        <TradeModal
+          key={`${trade.id}-${trade.side}`}
+          m={tradeModel}
+          side={trade.side}
+          onClose={() => setTrade(null)}
+        />
+      ) : null}
     </>
   );
 }

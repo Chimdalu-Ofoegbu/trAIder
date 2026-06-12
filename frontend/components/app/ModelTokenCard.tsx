@@ -28,9 +28,12 @@ const LATEST: Record<string, string> = {
 export function ModelTokenCard({
   model: m,
   rank,
+  onTrade,
 }: {
   model: ModelLive;
   rank: number;
+  /** Open the in-place trade modal (Coliseum flow). */
+  onTrade: (model: ModelLive, side: "buy" | "sell") => void;
 }) {
   const scoreCls = m.nav >= 1 ? "pos" : "neg";
   const change = m.pnlSession;
@@ -97,12 +100,12 @@ export function ModelTokenCard({
       </div>
 
       <div className="token-actions">
-        <Link className="buy" href={`/model?m=${m.id}`}>
+        <button className="buy" onClick={() => onTrade(m, "buy")}>
           BUY
-        </Link>
-        <Link className="sell" href={`/model?m=${m.id}`}>
+        </button>
+        <button className="sell" onClick={() => onTrade(m, "sell")}>
           SELL
-        </Link>
+        </button>
       </div>
     </article>
   );

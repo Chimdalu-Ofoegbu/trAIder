@@ -161,7 +161,8 @@
   margin: 0 -22px;
   border-top: 1px solid var(--line);
 }
-.token-actions a {
+.token-actions a,
+.token-actions button {
   flex: 1;
   text-align: center;
   padding: 15px;
@@ -170,17 +171,104 @@
   font-size: var(--t-sm);
   letter-spacing: 0.02em;
   transition: background var(--t-fast) var(--ease);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
 }
-.token-actions a.buy {
+.token-actions .buy {
   color: var(--pos);
 }
-.token-actions a.buy:hover {
+.token-actions .buy:hover {
   background: color-mix(in oklch, var(--pos) 14%, transparent);
 }
-.token-actions a.sell {
+.token-actions .sell {
   color: var(--neg);
   border-left: 1px solid var(--line);
 }
-.token-actions a.sell:hover {
+.token-actions .sell:hover {
   background: color-mix(in oklch, var(--neg) 14%, transparent);
+}
+
+/* ── Trade modal (Coliseum BUY/SELL → in-place dialog) ─────────────────────── */
+
+.trade-modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: color-mix(in oklch, var(--bg, #0a0b0e) 55%, transparent);
+  backdrop-filter: blur(6px);
+  animation: trade-modal-fade var(--t-fast, 0.15s) var(--ease, ease) both;
+}
+.trade-modal {
+  width: min(420px, 100%);
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  animation: trade-modal-pop 0.18s var(--ease, ease) both;
+}
+.trade-modal .panel {
+  border: 0;
+  background: transparent;
+  border-radius: 0;
+}
+.trade-modal-hd {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.trade-modal-close {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--ink-2);
+  cursor: pointer;
+  transition:
+    color var(--t-fast) var(--ease),
+    border-color var(--t-fast) var(--ease);
+}
+.trade-modal-close:hover {
+  color: var(--ink);
+  border-color: var(--ink-3);
+}
+.trade-modal-ft {
+  padding: 12px 18px 16px;
+  border-top: 1px solid var(--line-soft);
+  font-size: var(--t-xs);
+}
+.trade-modal-ft a {
+  color: var(--nav-line);
+}
+.trade-modal-ft a:hover {
+  color: var(--ink);
+}
+
+@keyframes trade-modal-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes trade-modal-pop {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
