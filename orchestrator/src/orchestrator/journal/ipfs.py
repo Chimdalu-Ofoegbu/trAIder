@@ -43,6 +43,8 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
+from urllib.parse import urlparse
 
 import httpx
 
@@ -54,6 +56,22 @@ logger = logging.getLogger(__name__)
 
 _PINATA_UPLOAD_URL = "https://uploads.pinata.cloud/v3/files"
 _DEFAULT_GATEWAY = "https://gateway.pinata.cloud/ipfs"
+
+# SEC (SSRF hardening): fetch_from_gateway accepts a gateway base URL + CID. Restrict both so
+# neither a caller-supplied gateway nor a crafted CID/redirect can point the fetch at an
+# internal/metadata endpoint. Only https + these known IPFS gateway hosts are allowed.
+_ALLOWED_GATEWAY_HOSTS = frozenset(
+    {
+        "gateway.pinata.cloud",
+        "ipfs.filebase.io",
+        "ipfs.io",
+        "dweb.link",
+        "cloudflare-ipfs.com",
+    }
+)
+# A CID is base32/base58 alphanumerics only — no '/', '.', ':' so it cannot inject a path,
+# host, or scheme into the request URL.
+_CID_RE = re.compile(r"^[A-Za-z0-9]{8,128}$")
 
 
 async def pin_to_pinata(
@@ -231,13 +249,24 @@ async def fetch_from_gateway(
         Deserialized JSON dict of the pinned payload.
 
     Raises:
+        ValueError: If the gateway is not https + allowlisted, or the CID shape is invalid.
         httpx.HTTPStatusError: On non-2xx gateway response.
         json.JSONDecodeError: If gateway returns non-JSON body.
     """
+    # SEC (SSRF hardening): validate the gateway host + CID shape and do NOT follow redirects,
+    # so neither a caller-supplied gateway nor a crafted CID/redirect can reach an internal URL.
+    parsed = urlparse(gateway)
+    if parsed.scheme != "https" or parsed.hostname not in _ALLOWED_GATEWAY_HOSTS:
+        raise ValueError(
+            f"fetch_from_gateway: gateway not allowed (https + allowlist): {gateway!r}"
+        )
+    if not _CID_RE.match(cid):
+        raise ValueError(f"fetch_from_gateway: invalid CID shape: {cid!r}")
+
     url = f"{gateway}/{cid}"
     logger.debug("fetch_from_gateway: GET %s", url)
     async with httpx.AsyncClient() as client:
-        resp = await client.get(url, timeout=30, follow_redirects=True)
+        resp = await client.get(url, timeout=30, follow_redirects=False)
     resp.raise_for_status()
     data = resp.json()
     logger.debug("fetch_from_gateway: fetched %d keys from CID=%s", len(data), cid)

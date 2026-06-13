@@ -30,6 +30,18 @@ The frozen canonical Draft 2020-12 validation schema (additionalProperties:true)
 Do not mutate. Call strict_provider_schema() for the provider-strict variant.
 """
 
+# ---------------------------------------------------------------------------
+# Risk constants (SEC — absolute notional backstop)
+# ---------------------------------------------------------------------------
+
+MAX_NOTIONAL_USD = 1_000_000.0
+"""Absolute hard ceiling on a single decision's notional `sizeUsd` (USD), independent of
+available capital. Backstops against a hallucinated/prompt-injected oversized size slipping
+through if the relative capital gate's `available_usdc` is ever stale or large, and prevents
+an `int(sizeUsd * 1e30)` overflow downstream. Far above any legitimate single-position
+notional for this product (operator capital ≈ $10k/model × ≤3x ≈ $30k). Raise deliberately
+if the product scales. Enforced in BOTH the schema (below) and business_rules (single gate)."""
+
 
 # ---------------------------------------------------------------------------
 # Pydantic v2 model (D-05, D-08)
@@ -61,8 +73,9 @@ class Decision(BaseModel):
     action: Literal["open", "close", "hold", "adjust"]
     """Trade action. 'hold' = no position change this cycle."""
 
-    sizeUsd: float = Field(ge=0)
-    """Notional position size in USD (post-leverage). 0 on hold or close."""
+    sizeUsd: float = Field(ge=0, le=MAX_NOTIONAL_USD)
+    """Notional position size in USD (post-leverage). 0 on hold or close.
+    Upper-bounded by MAX_NOTIONAL_USD (SEC backstop — see constant above)."""
 
     leverage: float = Field(ge=1, le=3)
     """Leverage multiplier. Hard cap: 3x. Use 1 on hold."""

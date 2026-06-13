@@ -165,8 +165,13 @@ def test_check_signing_middleware_present_tuple_entry_legacy() -> None:
     assert result is True, "Expected True when middleware is in (name, mw) tuple form"
 
 
-def test_check_signing_middleware_present_iteration_error_fail_open() -> None:
-    """Legacy path: if iteration raises, guard fails open (returns True)."""
+def test_check_signing_middleware_present_iteration_error_fail_closed() -> None:
+    """Legacy path: if iteration raises, the guard fails CLOSED (returns False).
+
+    SEC: a safety guard must not fail open. On introspection error we assume the signing
+    middleware is absent so the caller errors loudly instead of proceeding to a tx the RPC
+    would reject.
+    """
     from orchestrator.loop.run_session import _check_signing_middleware_present
 
     mock_web3 = MagicMock()
@@ -174,7 +179,7 @@ def test_check_signing_middleware_present_iteration_error_fail_open() -> None:
     mock_web3.middleware_onion.__iter__ = MagicMock(side_effect=RuntimeError("boom"))
 
     result = _check_signing_middleware_present(mock_web3, "0xDEAD" + "0" * 36)
-    assert result is True, "Expected fail-open (True) when iteration raises"
+    assert result is False, "Expected fail-closed (False) when iteration raises"
 
 
 # ---------------------------------------------------------------------------

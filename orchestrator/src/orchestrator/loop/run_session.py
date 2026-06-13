@@ -274,12 +274,18 @@ def _check_signing_middleware_present(
             if acct is not None and getattr(acct, "address", "").lower() == target:
                 return True
     except Exception:  # noqa: BLE001
+        # SEC: fail CLOSED. A security/safety guard that fails open is the wrong default — on
+        # introspection error we assume the middleware is ABSENT so the caller errors loudly
+        # rather than silently proceeding to a tx the RPC will reject. Production always passes
+        # the reliable `loaded_signers` set (primary path above); this only affects legacy
+        # callers that pass loaded_signers=None.
         logger.warning(
             "_check_signing_middleware_present: iteration over middleware_onion failed "
-            "for EOA=%s — guard skipped (fail-open). Check web3.py version compatibility.",
+            "for EOA=%s — FAILING CLOSED (assume middleware absent). Pass loaded_signers to "
+            "avoid this. Check web3.py version compatibility.",
             eoa_address,
         )
-        return True
+        return False
     return False
 
 

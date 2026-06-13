@@ -1571,37 +1571,45 @@ async def run_session(
     # $10k against a $2k vault makes every position ~5x oversized and explodes NAV
     # on any market move. Falls back to the legacy $10k constants when no
     # vault_contract is present (unit tests) or the read fails.
-    nav_table = "| Vault | NAV | mTOKEN Supply |\n|-------|-----|---------------|\n| mock | $10,000 | 10,000 |"
-    available_usdc = 10_000.0
+    async def _refresh_capital() -> tuple[float, str]:
+        """Read (available_usdc, nav_table) from the live vault, RISK_FRACTION applied.
+
+        RISK_FRACTION: per-position deployment limit as a fraction of vault capital
+        (standard fund risk control; default 1.0 = full capital). Falls back to the $10k
+        mock values when there is no vault_contract (unit tests) or the read fails, so the
+        loop never blocks on a transient RPC error.
+        """
+        _nav_table = "| Vault | NAV | mTOKEN Supply |\n|-------|-----|---------------|\n| mock | $10,000 | 10,000 |"
+        _avail = 10_000.0
+        if vault_contract is not None:
+            try:
+                _ta = await vault_contract.functions.totalAssets().call()
+                _nav = await vault_contract.functions.nav().call()
+                _sup = await vault_contract.functions.totalSupply().call()
+                _risk_fraction = float(os.environ.get("RISK_FRACTION", "1.0"))
+                _avail = (_ta / 1e6) * _risk_fraction
+                _nav_table = (
+                    "| Vault | NAV/token | mTOKEN Supply |\n"
+                    "|-------|-----------|---------------|\n"
+                    f"| {str(vault)[:8]} | ${_nav / 1e18:.4f} | {_sup / 1e18:,.0f} |"
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "run_session: vault capital read failed (%s) — using $10k fallback", exc
+                )
+        return _avail, _nav_table
+
+    # SEC (risk-control freshness): the capital cap + NAV view are refreshed EACH CYCLE inside
+    # the loop (below), not frozen at session start. A stale cap over a long session can let a
+    # model keep sizing against capital it no longer has after losses (or be wrongly throttled
+    # after gains), and reason on a stale NAV. Initial read here is logged once for ops.
+    available_usdc, nav_table = await _refresh_capital()
     if vault_contract is not None:
-        try:
-            _ta = await vault_contract.functions.totalAssets().call()
-            _nav = await vault_contract.functions.nav().call()
-            _sup = await vault_contract.functions.totalSupply().call()
-            # RISK_FRACTION: per-position deployment limit as a fraction of vault
-            # capital (standard fund risk control). Defaults to 1.0 (full capital,
-            # no behavior change). The demo sets it < 1 so a single position
-            # deploys only a sane slice of collateral — keeps book NAV believable.
-            _risk_fraction = float(os.environ.get("RISK_FRACTION", "1.0"))
-            available_usdc = (_ta / 1e6) * _risk_fraction
-            nav_table = (
-                "| Vault | NAV/token | mTOKEN Supply |\n"
-                "|-------|-----------|---------------|\n"
-                f"| {str(vault)[:8]} | ${_nav / 1e18:.4f} | {_sup / 1e18:,.0f} |"
-            )
-            logger.info(
-                "run_session: model capital from live vault — available_usdc=%.2f "
-                "(risk_fraction=%.2f) nav=%.4f supply=%.0f",
-                available_usdc,
-                _risk_fraction,
-                _nav / 1e18,
-                _sup / 1e18,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "run_session: vault capital read failed (%s) — using $10k fallback",
-                exc,
-            )
+        logger.info(
+            "run_session: initial model capital from live vault — available_usdc=%.2f "
+            "(RISK_FRACTION applied; refreshed each cycle)",
+            available_usdc,
+        )
     recent_decisions: list[str] = []
 
     try:
@@ -1621,6 +1629,11 @@ async def run_session(
             # This reflects chain reality rather than in-memory guesses and makes
             # the D-10 one-position-per-asset check authoritative.
             open_positions = await _build_open_positions(mock_perps, vault)
+
+            # SEC (risk-control freshness): re-read capital + NAV from the live vault each cycle
+            # so the model's size cap (available_usdc) and NAV view track realized PnL / NAV
+            # drift, rather than being frozen at session start (stale cap → over-deployment).
+            available_usdc, nav_table = await _refresh_capital()
 
             positions_table = (
                 "No open positions."

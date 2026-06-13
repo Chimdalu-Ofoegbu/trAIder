@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from orchestrator.schema import Decision
+from orchestrator.schema import MAX_NOTIONAL_USD, Decision
 
 # ---------------------------------------------------------------------------
 # Public constants
@@ -77,6 +77,13 @@ def validate_business_rules(
     # ── Rule 2a: defensive leverage cap ──────────────────────────────────────
     if decision.leverage > _LEVERAGE_CAP:
         return f"leverage {decision.leverage:g}x exceeds 3x cap — no trade"
+
+    # ── Rule 2a′: absolute notional ceiling (SEC backstop) ───────────────────
+    # Independent of available_usdc: blocks a hallucinated/oversized sizeUsd even if the
+    # relative capital figure is ever stale or large. Schema already enforces le=MAX_NOTIONAL_USD;
+    # re-checked here so business_rules remains the single runtime gate (mirrors the leverage cap).
+    if decision.sizeUsd > MAX_NOTIONAL_USD:
+        return f"sizeUsd {decision.sizeUsd:.0f} exceeds absolute cap {MAX_NOTIONAL_USD:.0f} USD — no trade"
 
     # ── Rule 2b: capital check (D-09) ────────────────────────────────────────
     required_collateral = decision.sizeUsd / decision.leverage
