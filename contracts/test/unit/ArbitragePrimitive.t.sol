@@ -49,6 +49,10 @@ contract MockAlgebraPool {
     bool public swapShouldRevert = false;
     string public swapRevertReason = "";
 
+    // Output haircut in bps — simulates slippage/sandwich by shrinking the swap output,
+    // so tests can push the arbCloseGap round-trip below the solvency floor.
+    uint256 public outputHaircutBps = 0;
+
     constructor(address _token0, address _token1, uint160 _sqrtPriceX96) {
         // token0 must be < token1 per Algebra/Uniswap convention
         if (_token0 < _token1) {
@@ -70,6 +74,11 @@ contract MockAlgebraPool {
     function setSwapReverts(bool reverts, string calldata reason) external {
         swapShouldRevert = reverts;
         swapRevertReason = reason;
+    }
+
+    /// @dev Shrink swap output by `bps` to simulate slippage/sandwich (solvency-floor tests)
+    function setOutputHaircut(uint256 bps) external {
+        outputHaircutBps = bps;
     }
 
     /// @dev Algebra globalState() — returns 256 bytes (8 slots per VENUE-DECISION.md finding).
@@ -137,6 +146,8 @@ contract MockAlgebraPool {
             } else {
                 amountOut = absAmount * (10 ** (decimalsOut - decimalsIn));
             }
+            // Apply slippage haircut (0 by default — exact 1:1 for normal tests)
+            amountOut = amountOut * (10_000 - outputHaircutBps) / 10_000;
 
             // Transfer output to recipient
             if (amountOut > 0) {
@@ -163,6 +174,8 @@ contract MockAlgebraPool {
             } else {
                 amountOut = absAmount * (10 ** (decimalsOut - decimalsIn));
             }
+            // Apply slippage haircut (0 by default — exact 1:1 for normal tests)
+            amountOut = amountOut * (10_000 - outputHaircutBps) / 10_000;
 
             if (amountOut > 0) {
                 IERC20(tokenOut).transfer(recipient, amountOut);
@@ -185,6 +198,22 @@ contract MockAlgebraPool {
 
 interface IAlgebraSwapCallback {
     function algebraSwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external;
+}
+
+/// @dev Minimal Algebra factory mock — maps a token pair to its canonical pool (order-independent),
+///      mirroring IAlgebraFactory.poolByPair. ArbitragePrimitive uses it to authenticate the swap
+///      callback and validate the pool passed to arbCloseGap.
+contract MockAlgebraFactory {
+    mapping(address => mapping(address => address)) internal _pools;
+
+    function setPool(address tokenA, address tokenB, address pool) external {
+        _pools[tokenA][tokenB] = pool;
+        _pools[tokenB][tokenA] = pool;
+    }
+
+    function poolByPair(address tokenA, address tokenB) external view returns (address) {
+        return _pools[tokenA][tokenB];
+    }
 }
 
 // =========================================================================
@@ -220,6 +249,7 @@ contract ArbitragePrimitiveTest is Test {
     MTokenVault internal vault;
     ArbitragePrimitive internal arb;
     MockAlgebraPool internal pool;
+    MockAlgebraFactory internal factory;
 
     address internal sessionFactory;
     address internal orchestrator;
@@ -270,8 +300,9 @@ contract ArbitragePrimitiveTest is Test {
         vm.prank(sessionFactory);
         vault.startSession(SESSION_DURATION);
 
-        // Deploy ArbitragePrimitive (no swapRouter needed — uses direct pool.swap())
-        arb = new ArbitragePrimitive();
+        // Deploy the Algebra factory mock + ArbitragePrimitive (factory authenticates pools).
+        factory = new MockAlgebraFactory();
+        arb = new ArbitragePrimitive(address(factory));
 
         // Compute sqrtPriceX96 for 1:1 price (NAV = 1 mTOKEN = 1 USDC).
         // Token ordering: MockAlgebraPool sorts by address.
@@ -284,6 +315,10 @@ contract ArbitragePrimitiveTest is Test {
         uint160 sqrtPriceAtNAV = 79228162514264337593543; // on-peg Case A (mTOKEN=token0) = floor(2^96/1e6) -> decode 1e18
 
         pool = new MockAlgebraPool(address(vault), address(usdc), sqrtPriceAtNAV);
+
+        // Register the pool as the canonical pool for (mTOKEN, USDC) so the primitive's
+        // factory-based pool/callback authentication accepts it.
+        factory.setPool(address(vault), address(usdc), address(pool));
 
         // Seed USDC to the caller so they can call arbMint
         usdc.mint(caller, 1_000_000e6); // 1M USDC
@@ -610,6 +645,70 @@ contract ArbitragePrimitiveTest is Test {
         arb.arbCloseGap(address(vault), address(pool));
 
         vm.stopPrank();
+    }
+
+    // =========================================================================
+    // SEC: swap callback authentication (CRITICAL-01)
+    // =========================================================================
+
+    /// @notice algebraSwapCallback must reject any caller that is not the canonical pool.
+    ///         A direct external call (msg.sender = test, not the pool) must revert — this is
+    ///         what prevents an attacker from draining the primitive's tokens/allowances by
+    ///         invoking the callback with crafted data.
+    function test_algebraSwapCallback_revertsForUnauthorizedCaller() public {
+        bytes memory data = abi.encode(address(usdc), address(vault), caller, uint256(0));
+        vm.expectRevert("AP: unauthorized callback");
+        arb.algebraSwapCallback(int256(1000e6), int256(0), data);
+
+        // Even a real-looking but unregistered contract as the pair must fail.
+        bytes memory data2 = abi.encode(address(vault), address(usdc), caller, uint256(0));
+        vm.prank(caller);
+        vm.expectRevert("AP: unauthorized callback");
+        arb.algebraSwapCallback(int256(0), int256(1000e6), data2);
+    }
+
+    // =========================================================================
+    // SEC: pool must be the canonical factory pool (HIGH-04)
+    // =========================================================================
+
+    /// @notice arbCloseGap must reject a pool that is not the factory's canonical pool for the
+    ///         (mTOKEN, USDC) pair — blocks spoofed-pool price/gap manipulation.
+    function test_arbCloseGap_revertsForNonCanonicalPool() public {
+        MockAlgebraPool rogue = new MockAlgebraPool(address(vault), address(usdc), pool.sqrtPriceX96());
+        vm.startPrank(caller);
+        usdc.approve(address(arb), 100_000e6);
+        vm.expectRevert("AP: not canonical pool");
+        arb.arbCloseGap(address(vault), address(rogue));
+        vm.stopPrank();
+    }
+
+    // =========================================================================
+    // SEC: solvency floor — round-trip can never run at a loss (CRITICAL-02 / HIGH-03)
+    // =========================================================================
+
+    /// @notice With a >1% gap but the swap output sandbagged 10% (simulated sandwich), the
+    ///         round-trip would return less than the slippage floor → arbCloseGap reverts and
+    ///         the caller's pulled USDC is fully rolled back. Previously the buy leg had
+    ///         minAmountOut=0, so this loss was unbounded.
+    function test_arbCloseGap_revertsWhenRoundTripWouldLose() public {
+        bool mTokenIsToken0 = address(vault) < address(usdc);
+        uint256 Q96 = 2 ** 96;
+        uint160 sqrtPriceAtNAV = mTokenIsToken0 ? uint160(Q96 / 1e6) : uint160(1e6 * Q96);
+        // 5% below NAV → enters the AMM<NAV buy branch (gap > 1% threshold).
+        pool.setPrice(uint160((uint256(sqrtPriceAtNAV) * 9_747) / 10_000));
+        pool.setOutputHaircut(1_000); // 10% haircut >> 0.5% solvency floor
+
+        usdc.mint(caller, 1100e6);
+        uint256 callerBefore = usdc.balanceOf(caller);
+
+        vm.startPrank(caller);
+        usdc.approve(address(arb), 1100e6);
+        vm.expectRevert("AP: arb would run at a loss");
+        arb.arbCloseGap(address(vault), address(pool));
+        vm.stopPrank();
+
+        assertEq(usdc.balanceOf(caller), callerBefore, "caller USDC fully refunded on revert");
+        assertEq(usdc.balanceOf(address(arb)), 0, "arb holds nothing after revert");
     }
 
     // =========================================================================

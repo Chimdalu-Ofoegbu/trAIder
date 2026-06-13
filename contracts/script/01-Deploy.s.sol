@@ -330,13 +330,12 @@ contract DeployPhase1 is Script {
 
         // ── Phase 4 Step 3b: Deploy ArbitragePrimitive ────────────────────────
         //    BEFORE createSession so its address can be passed as the `arbitrage` param.
-        //    ArbitragePrimitive is STATELESS (D-07) — no constructor args, no registerVault.
-        //    The contract uses direct IAlgebraPool.swap() (no SwapRouter dependency at runtime
-        //    per VENUE-DECISION.md finding #2). arbSwapRouter is stored in the manifest for
-        //    reference and future router-path fallbacks.
-        //    [Rule 1 - Bug fix]: Plan context block stated constructor(address swapRouter) but
-        //    the actual 04-03 implementation is no-arg (fully stateless D-07 design).
-        ArbitragePrimitive arb = new ArbitragePrimitive();
+        //    ArbitragePrimitive is STATELESS/NON-CUSTODIAL (D-07) — its only constructor arg is
+        //    the AlgebraFactory, an immutable used to authenticate the swap callback and validate
+        //    the pool passed to arbCloseGap (SEC: blocks spoofed-pool drains). The contract uses
+        //    direct IAlgebraPool.swap() (no SwapRouter dependency at runtime per
+        //    VENUE-DECISION.md finding #2); arbSwapRouter is stored in the manifest for reference.
+        ArbitragePrimitive arb = new ArbitragePrimitive(algebraFactory);
         console2.log("ArbitragePrimitive deployed:", address(arb));
         console2.log("  arbSwapRouter (manifest ref):", arbSwapRouter);
 

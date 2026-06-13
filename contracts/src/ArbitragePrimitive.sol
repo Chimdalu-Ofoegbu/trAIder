@@ -8,6 +8,13 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {IArbitragePrimitive} from "./interfaces/IArbitragePrimitive.sol";
 import {IMTokenVault} from "./interfaces/IMTokenVault.sol";
 
+/// @notice Minimal Algebra/Camelot V3 factory interface — `poolByPair` resolves the canonical
+///         pool for a token pair (order-independent). Used to authenticate the swap callback and
+///         validate the pool passed to arbCloseGap, so neither can be pointed at a spoofed pool.
+interface IAlgebraFactory {
+    function poolByPair(address tokenA, address tokenB) external view returns (address pool);
+}
+
 /// @title ArbitragePrimitive — stateless/non-custodial NAV-peg arbitrage primitive (ARB-01/02, D-07)
 /// @notice Provides three permissionless primitives for NAV-peg arbitrage:
 ///           - `arbMint`:     USDC → vault deposit → mTOKEN at NAV  (ARB-01)
@@ -48,6 +55,25 @@ contract ArbitragePrimitive is IArbitragePrimitive, ReentrancyGuardTransient {
     /// @inheritdoc IArbitragePrimitive
     /// @notice 100 bps = 1% gap threshold for arbCloseGap (ARB-02 default).
     uint256 public constant GAP_THRESHOLD_BPS = 100;
+
+    /// @notice Max tolerated slippage on the arbCloseGap round-trip, in bps (0.5%). The
+    ///         permissionless round-trip MUST return at least (1 - this) × notional to the
+    ///         caller, bounding worst-case sandwich/slippage loss. (Production hardening:
+    ///         make this a caller-supplied minOut, as arbMint/arbBurn already are.)
+    uint256 public constant MAX_ARB_SLIPPAGE_BPS = 50;
+
+    // =========================================================================
+    // Immutable state
+    // =========================================================================
+
+    /// @notice Canonical Algebra/Camelot V3 factory — authenticates pools (callback + arbCloseGap).
+    address public immutable factory;
+
+    /// @param factory_ AlgebraFactory address (Camelot V3). Must be non-zero.
+    constructor(address factory_) {
+        require(factory_ != address(0), "AP: zero factory");
+        factory = factory_;
+    }
 
     // =========================================================================
     // Errors
@@ -133,6 +159,16 @@ contract ArbitragePrimitive is IArbitragePrimitive, ReentrancyGuardTransient {
     ///         Reverts if |gap| < GAP_THRESHOLD_BPS.
     // slither-disable-next-line reentrancy-no-eth — ReentrancyGuardTransient prevents re-entry
     function arbCloseGap(address vault, address pool) external override nonReentrant {
+        address usdc = IMTokenVault(vault).asset();
+
+        // SEC (HIGH-04 / CRITICAL-02): only the canonical Algebra pool for this (mTOKEN, USDC)
+        // pair may be used. Blocks a caller from pointing the primitive at a spoofed pool to
+        // fake the AMM price (_readPoolPrice) or drain via the swap callback. This is also the
+        // exact pair `algebraSwapCallback` authenticates msg.sender against.
+        require(
+            pool != address(0) && pool == IAlgebraFactory(factory).poolByPair(vault, usdc), "AP: not canonical pool"
+        );
+
         // Read NAV and AMM price
         uint256 navE18 = IMTokenVault(vault).nav();
         uint256 ammPriceE18 = _readPoolPrice(pool, vault);
@@ -140,77 +176,55 @@ contract ArbitragePrimitive is IArbitragePrimitive, ReentrancyGuardTransient {
         // Compute gap in bps: positive = AMM > NAV, negative = AMM < NAV
         int256 gapBps = (int256(ammPriceE18) - int256(navE18)) * 10_000 / int256(navE18);
         int256 absGap = gapBps < 0 ? -gapBps : gapBps;
-
         require(absGap >= int256(GAP_THRESHOLD_BPS), "AP: gap below threshold");
 
-        address usdc = IMTokenVault(vault).asset();
+        // Fixed notional (production bot iterates). SEC (CRITICAL-02 / HIGH-03): the round-trip
+        // must return at least `minUsdcBack` to the caller — a hard floor bounding worst-case
+        // sandwich/slippage loss. Previously the AMM-buy leg passed minAmountOut=0, so a
+        // sandwich could drain the caller's pulled USDC without limit, and nothing stopped the
+        // permissionless arb from running at the caller's expense.
+        uint256 arbUsdc = 1000e6;
+        uint256 minUsdcBack = arbUsdc * (10_000 - MAX_ARB_SLIPPAGE_BPS) / 10_000;
+
+        IERC20(usdc).safeTransferFrom(msg.sender, address(this), arbUsdc);
 
         if (gapBps > 0) {
-            // AMM > NAV: buy at NAV via vault.deposit(), sell on AMM
-            // Pull USDC from caller
-            // Arb size: use a fixed notional of 1000 USDC (production bot iterates)
-            uint256 arbUsdc = 1000e6;
-            IERC20(usdc).safeTransferFrom(msg.sender, address(this), arbUsdc);
-
-            // Deposit at NAV (inherits VAULT-05 CB-pause)
+            // AMM > NAV: buy at NAV via vault.deposit(), then sell mTOKEN on the AMM.
             IERC20(usdc).forceApprove(vault, arbUsdc);
             uint256 mTokenOut = IMTokenVault(vault).deposit(arbUsdc, address(this));
             IERC20(usdc).forceApprove(vault, 0);
 
-            // Sell mTOKEN on AMM (swap mTOKEN → USDC)
-            bool mTokenIsToken0 = vault < usdc;
-            bool zeroToOne = mTokenIsToken0; // selling mTOKEN → token0→token1 if mToken=token0
-
-            // Approve pool to take mTOKEN via callback
+            bool zeroToOne = vault < usdc; // selling mTOKEN: token0->token1 if mTOKEN=token0
             IERC20(vault).forceApprove(pool, mTokenOut);
-
-            // amountOutMinimum: 0.5% below arbUsdc (sandwich mitigation — T-04-03-02)
-            uint256 minUsdcFromSwap = arbUsdc * 9950 / 10_000;
-
-            bytes memory callbackData = abi.encode(vault, usdc, msg.sender, minUsdcFromSwap);
+            bytes memory callbackData = abi.encode(vault, usdc, msg.sender, minUsdcBack);
             _executeSwap(pool, address(this), zeroToOne, int256(mTokenOut), callbackData);
-
-            // Zero-out remaining approvals
             IERC20(vault).forceApprove(pool, 0);
-
-            // Return any residual USDC to caller
-            uint256 residualUsdc = IERC20(usdc).balanceOf(address(this));
-            if (residualUsdc > 0) {
-                IERC20(usdc).safeTransfer(msg.sender, residualUsdc);
-            }
         } else {
-            // AMM < NAV: buy mTOKEN on AMM (cheap), redeem at NAV
-            // Pull USDC from caller
-            uint256 arbUsdc = 1000e6;
-            IERC20(usdc).safeTransferFrom(msg.sender, address(this), arbUsdc);
-
-            // Buy mTOKEN on AMM (swap USDC → mTOKEN)
-            bool mTokenIsToken0 = vault < usdc;
-            bool zeroToOne = !mTokenIsToken0; // buying mTOKEN → token1→token0 if mToken=token0
-
+            // AMM < NAV: buy mTOKEN on the AMM (cheap), then redeem at NAV.
+            bool zeroToOne = !(vault < usdc); // buying mTOKEN: token1->token0 if mTOKEN=token0
             IERC20(usdc).forceApprove(pool, arbUsdc);
-
-            bytes memory callbackData = abi.encode(usdc, vault, msg.sender, uint256(0));
+            bytes memory callbackData = abi.encode(usdc, vault, msg.sender, minUsdcBack);
             _executeSwap(pool, address(this), zeroToOne, int256(arbUsdc), callbackData);
-
             IERC20(usdc).forceApprove(pool, 0);
 
-            // Redeem mTOKEN at NAV — USDC goes directly to msg.sender as the receiver.
-            // vault.redeem() already reverts if it cannot pay (ERC-4626 guarantee).
+            // Redeem the mTOKEN we bought, at NAV, INTO THIS CONTRACT so the solvency floor
+            // below can be enforced before paying the caller (previously redeemed straight to
+            // the caller with no check — the unbounded-loss hole).
             uint256 mTokenBal = IERC20(vault).balanceOf(address(this));
             if (mTokenBal > 0) {
                 IERC20(vault).forceApprove(vault, mTokenBal);
-                // slither-disable-next-line unused-return — usdcOut delivered to msg.sender via receiver= param; vault reverts on failure
-                IMTokenVault(vault).redeem(mTokenBal, msg.sender, address(this));
+                // slither-disable-next-line unused-return — proceeds measured via balance below
+                IMTokenVault(vault).redeem(mTokenBal, address(this), address(this));
                 IERC20(vault).forceApprove(vault, 0);
             }
-
-            // Return any residual USDC to caller
-            uint256 residualUsdc = IERC20(usdc).balanceOf(address(this));
-            if (residualUsdc > 0) {
-                IERC20(usdc).safeTransfer(msg.sender, residualUsdc);
-            }
         }
+
+        // SEC: solvency floor + sweep. The primitive is non-custodial (D-07), so whatever USDC
+        // it holds now is the full round-trip proceeds. Require it clears the floor (else revert
+        // the whole tx — the caller's pulled USDC is rolled back, no loss), then return all of it.
+        uint256 usdcBack = IERC20(usdc).balanceOf(address(this));
+        require(usdcBack >= minUsdcBack, "AP: arb would run at a loss");
+        IERC20(usdc).safeTransfer(msg.sender, usdcBack);
     }
 
     // =========================================================================
@@ -223,18 +237,17 @@ contract ArbitragePrimitive is IArbitragePrimitive, ReentrancyGuardTransient {
     ///      Only tokenIn is used in the callback body — the other fields are passed through
     ///      for documentation / future slippage enforcement at the callsite.
     function algebraSwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external {
-        // The pool must be the caller (prevent arbitrary calls)
-        // Note: in unit tests the MockAlgebraPool is msg.sender; in production any whitelisted pool.
-        // For the stateless primitive we trust that this is called by a legitimate pool.
-        // Production use: callers should validate pool addresses before calling arbCloseGap.
+        // Decode the (tokenIn, tokenOut) pair encoded by arbCloseGap.
+        (address tokenIn, address tokenOut,,) = abi.decode(data, (address, address, address, uint256));
 
-        // Decode only tokenIn (first field). The remaining fields are logged in calldata but
-        // not used in the callback body — slither-disable-next-line unused-return justified:
-        // tokenOut/recipient/minAmountOut are metadata encoded for the callback callsite,
-        // not consumed here.
-        (address tokenIn,,,) = abi.decode(data, (address, address, address, uint256));
+        // SEC (CRITICAL-01): authenticate the caller. Require msg.sender to be the canonical
+        // Algebra pool for the encoded pair. An external caller cannot spoof msg.sender, so they
+        // cannot invoke this callback with arbitrary `data` to siphon this contract's tokens or
+        // standing allowances — only a real pool, mid-swap, can reach this. (Previously the
+        // callback trusted any caller and transferred out the decoded token unconditionally.)
+        require(msg.sender == IAlgebraFactory(factory).poolByPair(tokenIn, tokenOut), "AP: unauthorized callback");
 
-        // Pay the pool for the tokens we received
+        // Pay the pool for the tokens we received.
         int256 amountToPay = amount0Delta > 0 ? amount0Delta : amount1Delta;
         if (amountToPay > 0) {
             IERC20(tokenIn).safeTransfer(msg.sender, uint256(amountToPay));
