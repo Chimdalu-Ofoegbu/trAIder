@@ -93,6 +93,26 @@ td .score-chip { font-family: var(--font-mono); }
 .jrow .jhash { color: var(--ink-3); display: flex; align-items: center; gap: 5px; justify-content: flex-end; margin-top: 4px; }
 .verified-ico { width: 12px; height: 12px; color: var(--pos); }
 
+/* journal action colors + footer */
+.jrow .jutc { opacity: .55; }
+.jside[data-act="open"] { color: var(--pos); }
+.jside[data-act="close"] { color: var(--neg); }
+.jside[data-act="adjust"] { color: var(--ink); }
+.jside[data-act="hold"] { color: var(--ink-3); }
+.journal-foot { padding: 14px 20px; border-top: 1px solid var(--line-soft); font-size: var(--t-xs); color: var(--ink-3); line-height: 1.55; }
+
+/* model switcher (segmented toggle) */
+.model-toggle { display: flex; gap: 6px; padding: 6px; background: var(--bg-inset); border: 1px solid var(--line-soft); border-radius: var(--radius); margin-bottom: 18px; }
+.model-tog-btn { flex: 1; display: inline-flex; align-items: center; justify-content: center; gap: 9px; padding: 11px 14px; border: 1px solid transparent; background: transparent; color: var(--ink-2); font: inherit; font-weight: 600; font-size: var(--t-sm); border-radius: 7px; cursor: pointer; transition: background var(--t-mid) var(--ease), color var(--t-mid) var(--ease); }
+.model-tog-btn:hover { color: var(--ink); background: var(--bg-2); }
+.model-tog-btn[data-on="1"] { color: var(--ink); background: var(--bg-2); }
+.model-tog-dot { width: 9px; height: 9px; border-radius: 999px; flex: none; }
+.model-tog-ep { font-family: var(--font-mono); font-size: var(--t-xs); color: var(--ink-3); font-weight: 500; }
+@media (max-width: 680px) {
+  .model-tog-ep { display: none; }
+  .model-tog-btn { padding: 10px 8px; gap: 7px; }
+}
+
 /* arbitrage rows */
 .arb-row { display: grid; grid-template-columns: 1.4fr 1fr 1fr 1fr auto; gap: 16px; align-items: center; padding: 18px 20px; border-top: 1px solid var(--line-soft); }
 .arb-row:first-of-type { border-top: 0; }

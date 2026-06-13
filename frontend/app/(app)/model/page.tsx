@@ -13,10 +13,11 @@
 // =============================================================================
 
 import Link from "next/link";
-import { useSearchParams } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useMemo } from "react";
 
 import { useModels } from "@/lib/onchain/useModels";
+import { JOURNAL, JOURNAL_CAPTURED } from "@/lib/journal/journal";
 import { fmtUsd, fmtCompact, fmtInt, sign } from "@/lib/format";
 import { explorerAddress } from "@/lib/onchain/contracts";
 import { ConvergenceChart } from "@/components/charts/ConvergenceChart";
@@ -26,6 +27,7 @@ import { WalletButton } from "@/components/app/WalletButton";
 
 function ModelDetail() {
   const sp = useSearchParams();
+  const router = useRouter();
   const id = sp.get("m") ?? "aurelius";
   const { models } = useModels();
 
@@ -33,6 +35,10 @@ function ModelDetail() {
     () => models.find((x) => x.id === id) ?? models[0],
     [models, id],
   );
+
+  // Captured reasoning for the viewed model (real model-written rationale,
+  // snapshot from orchestrator.journal_entries — see lib/journal/journal.ts).
+  const entries = JOURNAL[m.id] ?? [];
 
   const spread = m.spreadBps;
   const spreadCls =
@@ -70,6 +76,45 @@ function ModelDetail() {
       <Ticker models={models} />
 
       <div className="app-body">
+        <div className="model-toggle" role="tablist" aria-label="Switch model">
+          {models.map((x) => {
+            const on = x.id === m.id;
+            return (
+              <button
+                key={x.id}
+                type="button"
+                role="tab"
+                aria-selected={on}
+                data-on={on ? "1" : undefined}
+                className="model-tog-btn"
+                style={
+                  on
+                    ? {
+                        borderColor: `color-mix(in oklch, ${x.line} 50%, var(--line))`,
+                      }
+                    : undefined
+                }
+                onClick={() => {
+                  if (!on)
+                    router.replace(`/model?m=${x.id}`, { scroll: false });
+                }}
+              >
+                <span
+                  className="model-tog-dot"
+                  style={{ background: x.line }}
+                />
+                <span>{x.name}</span>
+                <span
+                  className="model-tog-ep"
+                  style={on ? { color: x.line } : undefined}
+                >
+                  {x.epithet}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+
         <div className="md-head">
           <div className="squircle squircle-lg" style={{ color: m.line }}>
             {m.initial}
@@ -143,18 +188,52 @@ function ModelDetail() {
               <div className="panel-hd">
                 <h2>Trade journal</h2>
                 <span className="crumb">
-                  Public · model-written reasoning, attested on settlement
+                  {m.name} · captured reasoning · {JOURNAL_CAPTURED} session
                 </span>
               </div>
               <div className="journal">
-                <div className="empty">
-                  Per-trade journal (model reasoning + IPFS CID + on-chain
-                  attestation) renders here — see the{" "}
-                  <Link href="/verifier" style={{ color: "var(--ink)" }}>
-                    Verifier
-                  </Link>{" "}
-                  for the live on-chain audit log.
-                </div>
+                {entries.length === 0 ? (
+                  <div className="empty">
+                    No journaled decisions captured for {m.name} yet — see the{" "}
+                    <Link href="/verifier" style={{ color: "var(--ink)" }}>
+                      Verifier
+                    </Link>{" "}
+                    for the on-chain audit log.
+                  </div>
+                ) : (
+                  entries.map((e, i) => (
+                    <div className="jrow" key={`${e.ts}-${i}`}>
+                      <div className="jtime">
+                        {e.ts.slice(11, 16)}
+                        <span className="jutc"> UTC</span>
+                      </div>
+                      <div className="jside" data-act={e.action}>
+                        {e.action.toUpperCase()}
+                      </div>
+                      <div className="jbody">
+                        <div className="jasset">
+                          {e.market} {e.side}
+                          {e.sizeUsd > 0
+                            ? ` · $${fmtInt(e.sizeUsd)} @ ${e.leverage}×`
+                            : ""}
+                        </div>
+                        <div className="jr">{e.rationale}</div>
+                      </div>
+                      <div className="jmeta">
+                        {e.sizeUsd > 0 ? `$${fmtInt(e.sizeUsd)}` : "flat"}
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+              <div className="journal-foot">
+                Real model-written rationale, captured live to the orchestrator
+                journal during the session. IPFS pin + on-chain attestation
+                finalize on settlement — see the{" "}
+                <Link href="/verifier" style={{ color: "var(--ink)" }}>
+                  Verifier
+                </Link>{" "}
+                for the audit trail.
               </div>
             </section>
           </div>
