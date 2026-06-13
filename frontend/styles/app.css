@@ -82,7 +82,12 @@ td .score-chip { font-family: var(--font-mono); }
 .trade-summary .row .mono { color: var(--ink); }
 
 /* journal */
-.journal { display: flex; flex-direction: column; }
+.journal { display: flex; flex-direction: column; max-height: 520px; overflow-y: auto; overscroll-behavior: contain; }
+.journal::-webkit-scrollbar { width: 9px; }
+.journal::-webkit-scrollbar-thumb { background: var(--line); border-radius: 999px; border: 2px solid transparent; background-clip: padding-box; }
+.journal::-webkit-scrollbar-thumb:hover { background: var(--ink-3); background-clip: padding-box; }
+.journal::-webkit-scrollbar-track { background: transparent; }
+.journal { scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
 .jrow { display: grid; grid-template-columns: 64px 56px 1fr auto; gap: 16px; align-items: start; padding: 16px 20px; border-top: 1px solid var(--line-soft); }
 .jrow:first-child { border-top: 0; }
 .jrow .jtime { font-family: var(--font-mono); font-size: var(--t-xs); color: var(--ink-3); }
