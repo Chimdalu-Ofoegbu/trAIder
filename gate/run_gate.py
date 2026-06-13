@@ -649,16 +649,43 @@ def build_live_shared_deps(
     shared_walk = PriceWalk(gate_seed, SessionConfig().starting_prices, gate_drift, gate_volatility)
     snapshot_queues = {m: asyncio.Queue(maxsize=1) for m in _models}
     pusher_stop = asyncio.Event()
+
+    # ── Optional dedicated price-pusher EOA (D-11 nonce-contention fix) ──────
+    # Model trade txs submit via vault.transact() → signing-middleware auto-nonce
+    # (RPC 'pending'), while the pusher uses the NonceManager's in-memory counter.
+    # Two nonce sources on ONE EOA collide whenever both write concurrently (the
+    # pusher races ahead, the trade's 'pending' nonce is then "too low"). Running
+    # the pusher on its OWN funded EOA (setPrice is permissionless) removes the
+    # contention entirely. Defaults to the operator EOA (legacy behavior) when
+    # PRICE_PUSHER_KEY is unset.
+    _pusher_addr = operator_addr
+    _pusher_nonce_mgr = operator_nonce_mgr
+    _pusher_key = os.environ.get("PRICE_PUSHER_KEY", "")
+    if _pusher_key:
+        from web3.middleware import SignAndSendRawMiddlewareBuilder as _MwBuilder  # noqa: PLC0415
+
+        if not _pusher_key.startswith("0x"):
+            _pusher_key = "0x" + _pusher_key
+        _pusher_account = Account.from_key(_pusher_key)
+        web3.middleware_onion.inject(_MwBuilder.build(_pusher_account), layer=0)
+        _pusher_addr = _pusher_account.address
+        _pusher_nonce_mgr = NonceManager(web3, _pusher_addr)
+        logger.info(
+            "build_live_shared_deps: dedicated price-pusher EOA=%s "
+            "(separate nonce lane — no operator-trade contention)",
+            _pusher_addr,
+        )
+
     pusher_task = asyncio.create_task(
         run_price_pusher(
             web3,
             shared_aggregators,
             shared_walk,
-            operator_addr,
+            _pusher_addr,
             gate_cadence,
             pusher_stop,
             snapshot_queues=list(snapshot_queues.values()),
-            nonce_manager=operator_nonce_mgr,
+            nonce_manager=_pusher_nonce_mgr,
         ),
         name="gate-shared-price-pusher",
     )

@@ -1566,9 +1566,42 @@ async def run_session(
     start = time.monotonic()
     cycle = 0
 
-    # Simple NAV/positions state — in production these are read from the vault contract
+    # Capital the model sizes positions against. Read from the LIVE vault when a
+    # vault_contract is wired, so the model sizes to REAL collateral — a hardcoded
+    # $10k against a $2k vault makes every position ~5x oversized and explodes NAV
+    # on any market move. Falls back to the legacy $10k constants when no
+    # vault_contract is present (unit tests) or the read fails.
     nav_table = "| Vault | NAV | mTOKEN Supply |\n|-------|-----|---------------|\n| mock | $10,000 | 10,000 |"
     available_usdc = 10_000.0
+    if vault_contract is not None:
+        try:
+            _ta = await vault_contract.functions.totalAssets().call()
+            _nav = await vault_contract.functions.nav().call()
+            _sup = await vault_contract.functions.totalSupply().call()
+            # RISK_FRACTION: per-position deployment limit as a fraction of vault
+            # capital (standard fund risk control). Defaults to 1.0 (full capital,
+            # no behavior change). The demo sets it < 1 so a single position
+            # deploys only a sane slice of collateral — keeps book NAV believable.
+            _risk_fraction = float(os.environ.get("RISK_FRACTION", "1.0"))
+            available_usdc = (_ta / 1e6) * _risk_fraction
+            nav_table = (
+                "| Vault | NAV/token | mTOKEN Supply |\n"
+                "|-------|-----------|---------------|\n"
+                f"| {str(vault)[:8]} | ${_nav / 1e18:.4f} | {_sup / 1e18:,.0f} |"
+            )
+            logger.info(
+                "run_session: model capital from live vault — available_usdc=%.2f "
+                "(risk_fraction=%.2f) nav=%.4f supply=%.0f",
+                available_usdc,
+                _risk_fraction,
+                _nav / 1e18,
+                _sup / 1e18,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "run_session: vault capital read failed (%s) — using $10k fallback",
+                exc,
+            )
     recent_decisions: list[str] = []
 
     try:
