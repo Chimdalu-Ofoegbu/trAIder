@@ -123,7 +123,7 @@ export function TradePanel({
         : amt * price // USDC out
       : null;
   const minOut = useMemo(() => {
-    if (expectedOut == null) return 0n; // no live quote → no floor (testnet demo)
+    if (expectedOut == null) return 0n; // no live quote → Buy/Sell button is DISABLED below, so this 0n floor is never submitted
     const outDecimals = side === "buy" ? MTOKEN_DECIMALS : USDC_DECIMALS;
     try {
       const raw = parseUnits(expectedOut.toFixed(outDecimals), outDecimals);
@@ -244,6 +244,12 @@ export function TradePanel({
   } else if (needsApproval) {
     btnLabel = side === "buy" ? "Approve USDC" : `Approve ${m.short}`;
     btnAction = doApprove;
+  } else if (minOut === 0n) {
+    // SEC: no live AMM quote → minOut would be 0n (amountOutMinimum=0 = NO slippage
+    // protection, full sandwich/MEV exposure). Block the swap until a price is available
+    // rather than submitting an unprotected order.
+    btnLabel = "Waiting for live price…";
+    // btnAction stays null → button disabled
   } else {
     btnLabel = `${side === "buy" ? "Buy" : "Sell"} ${m.short}`;
     btnAction = doSwap;
