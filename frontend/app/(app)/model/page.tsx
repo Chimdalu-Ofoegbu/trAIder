@@ -17,7 +17,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useMemo } from "react";
 
 import { useModels } from "@/lib/onchain/useModels";
-import { JOURNAL, JOURNAL_CAPTURED } from "@/lib/journal/journal";
+import { useModelJournal } from "@/lib/journal/useModelJournal";
 import { fmtUsd, fmtCompact, fmtInt, sign } from "@/lib/format";
 import { explorerAddress } from "@/lib/onchain/contracts";
 import { ConvergenceChart } from "@/components/charts/ConvergenceChart";
@@ -36,9 +36,17 @@ function ModelDetail() {
     [models, id],
   );
 
-  // Captured reasoning for the viewed model (real model-written rationale,
-  // snapshot from orchestrator.journal_entries — see lib/journal/journal.ts).
-  const entries = JOURNAL[m.id] ?? [];
+  // LIVE per-model trade journal: the SAME on-chain attestations the Verifier
+  // shows (the model's own rationale, pinned to IPFS + attested on-chain),
+  // filtered to this model's vault. Falls back to the baked snapshot only when
+  // nothing has journaled on-chain yet — never stale data during a live session.
+  const {
+    entries,
+    source: journalSource,
+    loading: journalLoading,
+    refresh: refreshJournal,
+    label: journalLabel,
+  } = useModelJournal(m.vault, m.id);
 
   const spread = m.spreadBps;
   const spreadCls =
@@ -188,17 +196,35 @@ function ModelDetail() {
               <div className="panel-hd">
                 <h2>Trade journal</h2>
                 <span className="crumb">
-                  {m.name} · captured reasoning · {JOURNAL_CAPTURED} session
+                  {m.name} · {journalLabel} ·{" "}
+                  <button
+                    onClick={refreshJournal}
+                    style={{
+                      background: "none",
+                      border: 0,
+                      color: "var(--ink-2)",
+                      textDecoration: "underline",
+                      cursor: "pointer",
+                      font: "inherit",
+                    }}
+                  >
+                    refresh
+                  </button>
                 </span>
               </div>
               <div className="journal">
                 {entries.length === 0 ? (
                   <div className="empty">
-                    No journaled decisions captured for {m.name} yet — see the{" "}
+                    {journalLoading
+                      ? "Reading the on-chain journal…"
+                      : journalSource === "empty"
+                        ? `${m.name} hasn’t journaled a trade yet this session — it’s holding. `
+                        : `No journaled decisions for ${m.name} yet. `}
+                    See the{" "}
                     <Link href="/verifier" style={{ color: "var(--ink)" }}>
                       Verifier
                     </Link>{" "}
-                    for the on-chain audit log.
+                    for the full on-chain audit log.
                   </div>
                 ) : (
                   entries.map((e, i) => (
@@ -227,13 +253,27 @@ function ModelDetail() {
                 )}
               </div>
               <div className="journal-foot">
-                Real model-written rationale, captured live to the orchestrator
-                journal during the session. IPFS pin + on-chain attestation
-                finalize on settlement — see the{" "}
-                <Link href="/verifier" style={{ color: "var(--ink)" }}>
-                  Verifier
-                </Link>{" "}
-                for the audit trail.
+                {journalSource === "sample" ? (
+                  <>
+                    Sample of captured reasoning from a prior session — live
+                    entries appear here once {m.name} journals a trade on-chain
+                    this session. See the{" "}
+                    <Link href="/verifier" style={{ color: "var(--ink)" }}>
+                      Verifier
+                    </Link>{" "}
+                    for the audit trail.
+                  </>
+                ) : (
+                  <>
+                    Live on-chain — each entry is {m.name}&rsquo;s own
+                    rationale, pinned to IPFS and attested on the
+                    JournalRegistry before it touches NAV. See the{" "}
+                    <Link href="/verifier" style={{ color: "var(--ink)" }}>
+                      Verifier
+                    </Link>{" "}
+                    for the full audit trail.
+                  </>
+                )}
               </div>
             </section>
           </div>

@@ -74,6 +74,8 @@ export interface JournalAttestation {
   caller: string;
   blockNumber: number;
   txHash: string;
+  /** Block timestamp (unix seconds) — filled best-effort during enrichment. */
+  timestamp?: number;
   /** Best-effort IPFS payload (null if not yet fetched / unavailable). */
   payload?: JournalPayload | null;
   /** True for sample/fixture rows (shown only when no on-chain entries exist). */

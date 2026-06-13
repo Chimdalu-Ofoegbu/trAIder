@@ -61,9 +61,26 @@ export function useJournal(maxEnrich = 20): UseJournalResult {
         setError(null);
         setLoading(false);
 
+        // Fetch block timestamps (batched by unique block) so consumers can show a
+        // wall-clock time per attestation. Best-effort — undefined on RPC failure.
+        const slice = events.slice(0, maxEnrich);
+        const tsByBlock = new Map<number, number>();
+        await Promise.all(
+          [...new Set(slice.map((e) => e.blockNumber))].map(async (bn) => {
+            try {
+              const blk = await publicClient.getBlock({
+                blockNumber: BigInt(bn),
+              });
+              tsByBlock.set(bn, Number(blk.timestamp));
+            } catch {
+              /* leave undefined */
+            }
+          }),
+        );
         const enriched = await Promise.all(
-          events.slice(0, maxEnrich).map(async (e) => ({
+          slice.map(async (e) => ({
             ...e,
+            timestamp: tsByBlock.get(e.blockNumber),
             payload: await fetchJournalPayload(e.cid),
           })),
         );
