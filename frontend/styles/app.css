@@ -126,7 +126,7 @@ td .score-chip { font-family: var(--font-mono); }
 .arb-gap-bar i { display: block; height: 100%; }
 
 /* verifier */
-.vrow { display: grid; grid-template-columns: 116px 1.15fr 1fr 1.15fr 104px; gap: 18px; align-items: center; padding: 15px 20px; border-top: 1px solid var(--line-soft); font-size: var(--t-sm); }
+.vrow { display: grid; grid-template-columns: 116px 150px 140px 1fr 1.6fr 104px; gap: 18px; align-items: center; padding: 15px 20px; border-top: 1px solid var(--line-soft); font-size: var(--t-sm); }
 .vrow:first-of-type { border-top: 0; }
 .vrow > * { min-width: 0; }
 .vrow > .mono { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

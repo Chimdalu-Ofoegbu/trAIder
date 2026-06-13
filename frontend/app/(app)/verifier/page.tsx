@@ -37,32 +37,30 @@ function AttestationRow({ a }: { a: JournalAttestation }) {
 
   return (
     <div className="vrow">
-      <div className="mono faint">
-        {a.isFixture ? (
-          `#${a.blockNumber.toLocaleString()}`
-        ) : (
-          <a
-            href={explorerTx(a.txHash)}
-            target="_blank"
-            rel="noopener noreferrer"
-            style={{ color: "inherit" }}
-          >
-            #{a.blockNumber.toLocaleString()}
-          </a>
-        )}
+      <div className="mono faint">#{a.blockNumber.toLocaleString()}</div>
+
+      <div className="mono" style={{ minWidth: 0 }}>
+        <a
+          href={explorerTx(a.txHash)}
+          target="_blank"
+          rel="noopener noreferrer"
+          style={{ color: "var(--ink-2)" }}
+          title={a.tradeHash}
+        >
+          {shortHash(a.tradeHash)}
+        </a>
       </div>
 
       <div
-        className="flex"
-        style={{ gap: 10, alignItems: "center", minWidth: 0 }}
+        className="faint"
+        style={{
+          minWidth: 0,
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+        }}
       >
-        <span
-          className="mono"
-          style={{ overflow: "hidden", textOverflow: "ellipsis" }}
-        >
-          {shortHash(a.tradeHash)}
-        </span>
-        {p?.model ? <span className="faint">· {p.model}</span> : null}
+        {p?.model ?? "—"}
       </div>
 
       <div className="mono" style={{ minWidth: 0 }}>
@@ -164,7 +162,6 @@ export default function VerifierPage() {
           <div className="panel-hd">
             <h2>Attestation feed</h2>
             <span className="crumb">
-              tradeHash · model · IPFS CID · reasoning ·{" "}
               <button
                 onClick={refresh}
                 style={{
@@ -194,7 +191,8 @@ export default function VerifierPage() {
             }}
           >
             <div>Block</div>
-            <div>Trade · model</div>
+            <div>Trade</div>
+            <div>Model</div>
             <div>IPFS CID</div>
             <div>Reasoning</div>
             <div style={{ textAlign: "right" }}>Status</div>
