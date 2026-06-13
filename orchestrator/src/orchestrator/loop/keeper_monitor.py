@@ -265,8 +265,15 @@ async def execute_ready_orders(
                 # Wired here and NEVER in driver.py (front-running mitigation 9.1 /
                 # D-09 pin scope: trade entries only, gated on the confirmed event).
                 if journal_registry and operator_journal_private_key and pinata_jwt:
-                    # Build the journal payload from the trade snapshot
+                    # Build the journal payload from the trade snapshot, enriched with the
+                    # model's OWN rationale (from decision_snapshot) so the IPFS-pinned
+                    # attestation carries the reasoning the Verifier surfaces — the core
+                    # thesis: the model's own reasoning, pinned + attested on-chain.
+                    # Additive: when no rationale is present the payload is unchanged.
                     journal_payload = dict(trade_payload)
+                    _rationale = decision_snap.get("rationale")
+                    if _rationale:
+                        journal_payload["rationale"] = _rationale
                     try:
                         await publish_journal_entry(
                             web3,

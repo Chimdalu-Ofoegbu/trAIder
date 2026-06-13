@@ -631,6 +631,41 @@ def build_live_shared_deps(
         "SOL": web3.eth.contract(address=manifest["solFeed"], abi=_agg_abi),
     }
 
+    # ── Journal publisher wiring (PERPS-02 / D-08/D-09/D-10) ────────────────
+    # The operator-journal EOA's signing middleware is ALREADY on `web3` (run_gate
+    # Step 2 injects it as the 2nd signer), so recordJournal txs sign + send. Build
+    # the JournalRegistry contract + gather the IPFS/journal creds here so each model's
+    # keeper_monitor pins to Pinata and writes a REAL JournalRecorded attestation on
+    # every OrderExecuted — this is what populates the Verifier's on-chain feed. When
+    # any required cred is missing the driver's keeper silently skips journaling
+    # (backward-compat: dry-run + anvil tests pass None and never journal).
+    _journal_registry = None
+    _journal_key_priv_bytes: bytes | None = None
+    _journal_key_addr: str | None = None
+    _journal_jwt = os.environ.get("PINATA_JWT", "").strip() or None
+    _journal_fb_access = os.environ.get("FILEBASE_ACCESS_KEY", "").strip() or None
+    _journal_fb_secret = os.environ.get("FILEBASE_SECRET_KEY", "").strip() or None
+    _journal_key_hex = os.environ.get("OPERATOR_JOURNAL_KEY_PRIV", "").strip()
+    if manifest.get("journal") and _journal_key_hex and _journal_jwt:
+        _jk = _journal_key_hex if _journal_key_hex.startswith("0x") else "0x" + _journal_key_hex
+        _journal_key_priv_bytes = bytes.fromhex(_jk.removeprefix("0x"))
+        _journal_key_addr = (
+            os.environ.get("OPERATOR_JOURNAL_KEY_ADDR", "").strip() or Account.from_key(_jk).address
+        )
+        _journal_abi = _load_abi_fn(_contracts_out / "JournalRegistry.sol" / "JournalRegistry.json")
+        _journal_registry = web3.eth.contract(address=manifest["journal"], abi=_journal_abi)
+        logger.info(
+            "build_live_shared_deps: journal publisher ENABLED — registry=%s publisher=%s "
+            "(Pinata pin + on-chain JournalRecorded per OrderExecuted → Verifier feed)",
+            manifest["journal"][:10],
+            (_journal_key_addr or "")[:10],
+        )
+    else:
+        logger.warning(
+            "build_live_shared_deps: journal publisher DISABLED (no on-chain attestations) — "
+            "need manifest.journal + OPERATOR_JOURNAL_KEY_PRIV + PINATA_JWT"
+        )
+
     # ── ONE shared DB engine ───────────────────────────────────────────────
     # Build it BEFORE the pusher task so a bad URL raises here (no dangling task to clean
     # up). Each model loop opens its OWN AsyncSession off this engine inside the closure.
@@ -667,7 +702,22 @@ def build_live_shared_deps(
         if not _pusher_key.startswith("0x"):
             _pusher_key = "0x" + _pusher_key
         _pusher_account = Account.from_key(_pusher_key)
-        web3.middleware_onion.inject(_MwBuilder.build(_pusher_account), layer=0)
+        # The pusher EOA only needs to be a SIGNER on web3 + own a NonceManager. When
+        # PRICE_PUSHER_KEY names an EOA whose middleware is ALREADY injected (run_gate
+        # Step 2 loads operator-trade/journal/arb/LP/holder keys), re-injecting raises
+        # web3.py's "can't add the same un-named instance twice" — that's benign: the
+        # account can already sign, so swallow it and reuse the existing middleware. This
+        # lets the operator-LP EOA (idle during trading-only) serve as the separate pusher
+        # nonce lane without provisioning + funding a fresh wallet.
+        try:
+            web3.middleware_onion.inject(_MwBuilder.build(_pusher_account), layer=0)
+        except Exception as _mw_exc:  # noqa: BLE001
+            logger.info(
+                "build_live_shared_deps: price-pusher EOA=%s already a loaded signer — "
+                "reusing existing middleware (%s)",
+                _pusher_account.address[:10],
+                type(_mw_exc).__name__,
+            )
         _pusher_addr = _pusher_account.address
         _pusher_nonce_mgr = NonceManager(web3, _pusher_addr)
         logger.info(
@@ -749,6 +799,15 @@ def build_live_shared_deps(
                 # run_gate (_build_web3_with_signers); each model must NOT re-inject it, or
                 # web3.py raises "can't add the same un-named instance twice" → all 3 crash.
                 inject_signing_middleware=False,
+                # Journal publisher (PERPS-02): real Pinata pin + on-chain JournalRecorded
+                # per OrderExecuted. Enabled when build_live_shared_deps found the creds
+                # (None ⇒ keeper skips journaling, backward-compat). Populates the Verifier.
+                journal_registry=_journal_registry,
+                operator_journal_private_key=_journal_key_priv_bytes,
+                pinata_jwt=_journal_jwt,
+                filebase_access_key=_journal_fb_access,
+                filebase_secret_key=_journal_fb_secret,
+                operator_journal_key_address=_journal_key_addr,
             )
         finally:
             try:

@@ -11,6 +11,7 @@
 
 import { useJournal } from "@/lib/onchain/useJournal";
 import { explorerTx, explorerAddress } from "@/lib/onchain/contracts";
+import { MODEL_NAME_BY_VAULT } from "@/lib/onchain/models";
 import { WalletButton } from "@/components/app/WalletButton";
 import type { JournalAttestation } from "@/lib/onchain/journal";
 
@@ -34,6 +35,12 @@ function AttestationRow({ a }: { a: JournalAttestation }) {
   const p = a.payload;
   const detail = p?.rationale ?? p?.reasoning ?? null;
   const tag = [p?.market, p?.side].filter(Boolean).join(" · ");
+  // Model name: prefer the pinned payload's own `model`, else resolve it from the
+  // payload's vault_address via the registry (real attestations carry vault_address).
+  const vaultAddr = typeof p?.vault_address === "string" ? p.vault_address : "";
+  const modelName =
+    p?.model ??
+    (vaultAddr ? MODEL_NAME_BY_VAULT[vaultAddr.toLowerCase()] : undefined);
 
   return (
     <div className="vrow">
@@ -60,7 +67,7 @@ function AttestationRow({ a }: { a: JournalAttestation }) {
           whiteSpace: "nowrap",
         }}
       >
-        {p?.model ?? "—"}
+        {modelName ?? "—"}
       </div>
 
       <div className="mono" style={{ minWidth: 0 }}>

@@ -92,6 +92,13 @@ export const MODEL_BY_KEY: Record<ModelKey, ModelMeta> = Object.fromEntries(
   MODELS.map((m) => [m.key, m]),
 ) as Record<ModelKey, ModelMeta>;
 
+// Lowercased vault address → full model name. Lets on-chain consumers (e.g. the
+// Verifier attestation feed) resolve a model name from a journal payload's
+// vault_address when the pinned payload itself carries no explicit `model` field.
+export const MODEL_NAME_BY_VAULT: Record<string, string> = Object.fromEntries(
+  MODELS.map((m) => [String(m.vault).toLowerCase(), m.name]),
+);
+
 // ── Display-only Coliseum Score ───────────────────────────────────────────────
 // CLAUDE.md: the Coliseum Score is DISPLAY-ONLY and does NOT drive NAV. This is a
 // transparent composite used only to rank the standings: it rewards NAV growth
