@@ -6,7 +6,7 @@ Three frontier LLMs (Claude Opus 4.7, GPT-5.5, Gemini 3.1 Pro) autonomously trad
 
 **Core value:** A live, verifiable, tradeable market on which frontier LLM trades crypto better — with onchain NAV-pegged price discovery and replayable per-trade audit logs.
 
-> Hackathon build for Arbitrum Open House / ETHGlobal showcase (submission due 2026-06-14), with a parallel Robinhood Chain testnet deploy targeting the Robinhood Innovation Award track.
+> Hackathon build for Arbitrum Open House
 
 ---
 
